@@ -1,0 +1,7 @@
+tokens=512
+seconds=6.4
+perplexity_drift=0.012
+sm_occupancy=62.5
+memory_bandwidth=71.2
+warp_stall_reason=memory_dependency
+sequence_scaling=pass

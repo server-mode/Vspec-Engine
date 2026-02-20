@@ -1,0 +1,7 @@
+# Ignore roadmap document
+ROADMAP.md
+update.md
+now.md
+build/
+.venv/
+.vscode

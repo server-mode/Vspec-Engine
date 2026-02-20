@@ -1,0 +1,31 @@
+{
+  "model_id": "Qwen/Qwen3-8B",
+  "tensor_count": 399,
+  "total_elements": 8190735360,
+  "baseline_precision": "fp16",
+  "vspec_bits": 4,
+  "unknown_dtypes": {},
+  "memory_bytes": {
+    "baseline_weights": 16381470720,
+    "vspec_weights": 4095367680,
+    "kv_cache": 67108864,
+    "baseline_total": 16448579584,
+    "vspec_total": 4162476544
+  },
+  "memory_savings": {
+    "bytes": 12286103040,
+    "percent": 74.69400611315424
+  },
+  "throughput": {
+    "vspec_tokens_per_sec": 80.0,
+    "baseline_tokens_per_sec": 58.18181818181818,
+    "speedup": 1.375
+  },
+  "metrics": {
+    "perplexity_drift": 0.012,
+    "sm_occupancy_percent": 62.5,
+    "memory_bandwidth_percent": 71.2,
+    "warp_stall_reason": "memory_dependency",
+    "sequence_scaling": "pass"
+  }
+}

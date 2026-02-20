@@ -1,0 +1,2 @@
+embed.weight|F16|32000,4096
+lm_head.weight|F16|32000,4096
