@@ -1,87 +1,218 @@
-# Vspec Engine
+# 🚀 Vspec Engine
 
-Vspec Engine is a kernel-first runtime for low-bit LLM and diffusion inference. It targets native under-4-bit execution, modular backend support, and memory-aware scheduling. This project inherits core ideas from PyLittle and evolves them into a standalone runtime. The current codebase includes CPU reference paths, CUDA kernels (when a toolkit is available), a compact IR, and a Python bridge for early integration tests.
+Vspec Engine is a kernel-first runtime for low-bit LLM and diffusion inference.  
+It is designed for native under-4-bit execution, modular backend abstraction, and memory-aware scheduling.
 
-## Key goals
+Vspec evolves core ideas from PyLittle into a standalone runtime layer — not a framework wrapper, not a server engine, but a redefinable inference core.
 
-- Native 2/3/4-bit packed execution with dynamic quant mapping.
-- CUDA-first backend with ROCm and SYCL planned.
-- PyTorch model compatibility via conversion to Vspec IR (no torch runtime).
-- Memory-first design: KV cache controls, pool/arena allocators, streaming attention.
+## 🎯 Why Vspec?
 
-## Capabilities
+Existing inference engines often:
 
-- native mixed-bit
-- runtime IR-centric
-- multi-backend abstraction (CUDA + ROCm + SYCL)
-- KV aware memory system
-- Python API independent of PyTorch
-- dynamic scheduling & graph rewrite
-- kernel level extensibility
+- Depend on framework runtimes (e.g., PyTorch)
+- Focus on specific hardware stacks
+- Optimize scheduling but not kernel abstraction
+- Treat quantization as an afterthought
 
-## Requirements
+Vspec takes a different path:
+
+- 🔬 Kernel-first architecture
+- 🧩 IR-driven execution
+- 🧠 Memory-aware scheduling
+- ⚡ Native mixed 2/3/4-bit packed execution
+- 🌍 Vendor-neutral backend abstraction (CUDA / ROCm / SYCL planned)
+
+The goal is not to wrap models —  
+but to redefine the inference runtime layer itself.
+
+## 🧠 Architecture Overview
+
+Vspec consists of the following layers:
+
+### 1️⃣ IR Layer
+Compact graph representation optimized for low-bit execution.
+
+### 2️⃣ Scheduler
+Memory-first execution planner with:
+
+- KV cache awareness
+- Arena/pool allocation
+- Streaming attention support
+- Graph rewrite capability
+
+### 3️⃣ Kernel Registry
+Backend-specific kernel implementations:
+
+- CPU reference path
+- CUDA optimized kernels
+- Future ROCm / SYCL support
+
+### 4️⃣ Allocator
+Custom memory management:
+
+- Arena allocator
+- Pool allocator
+- Quantized weight packing
+
+### 5️⃣ Python Bridge
+C API boundary enabling:
+
+- PyTorch model conversion → Vspec IR
+- Python-driven benchmarking
+- Integration experiments
+- No torch runtime dependency
+
+## ⚙️ Core Capabilities
+
+- ✅ Native mixed-bit (2/3/4-bit packed)
+- ✅ Runtime IR-centric design
+- ✅ Multi-backend abstraction (CUDA + planned ROCm + SYCL)
+- ✅ KV-aware memory system
+- ✅ Python API independent of PyTorch runtime
+- ✅ Dynamic scheduling & graph rewrite
+- ✅ Kernel-level extensibility
+
+## 📌 Project Status
+
+Current stage: Research / Experimental runtime
+
+- CPU reference path is stable.
+- CUDA backend is functional for core kernels.
+- ROCm and SYCL backends are planned.
+- IR and ABI may evolve.
+- Not production-hardened yet.
+
+This is a runtime architecture project, not a packaged inference product.
+
+## 🛠 Requirements
 
 - CMake 3.20+
-- MSVC toolchain on Windows (or clang/gcc on Linux)
+- MSVC (Windows) or clang/gcc (Linux/macOS)
 - CUDA toolkit (optional, for CUDA targets)
-- Python 3.9+ (optional, for the Python bridge/tools)
+- Python 3.9+ (optional, for bridge & tools)
 
-## Build (Windows)
+## 🏗 Build
 
-- Configure: cmake -S . -B build
-- Build: cmake --build build --config Release
+### 🪟 Windows
+```sh
+cmake -S . -B build
+cmake --build build --config Release
+```
 
-CUDA detection is automatic when the CUDA toolkit is installed. If CMake does not pick it up, configure with explicit paths:
+### 🔍 CUDA Detection
 
-- cmake -S . -B build -DCMAKE_CUDA_COMPILER="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe" -DCUDAToolkit_ROOT="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" -DCMAKE_VS_GLOBALS="CudaToolkitDir=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+CUDA detection is automatic if installed.
 
-## Build (Linux or macOS)
+If needed, specify CUDA manually:
 
-- Configure: cmake -S . -B build
-- Build: cmake --build build -j
+```bat
+cmake -S . -B build ^
+  -DCMAKE_CUDA_COMPILER="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe" ^
+  -DCUDAToolkit_ROOT="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" ^
+  -DCMAKE_VS_GLOBALS="CudaToolkitDir=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+```
 
-## Demos and tools
+### 🐧 Linux / 🍎 macOS
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
 
-- int4 demo: ./build/Release/vspec_int4_demo.exe
-- benchmark: ./build/Release/vspec_benchmark.exe
-- stress test: ./build/Release/vspec_stress_test.exe
-- attention v2 demo: ./build/Release/vspec_attention_v2_demo.exe
-- CUDA fused demo (CUDA only): ./build/Release/vspec_cuda_fused_demo.exe
-- phase 3 demo: ./build/Release/vspec_phase3_demo.exe
-- custom LLM bench (report builder): python tools/benchmark/custom_bench.py --model-id Qwen/Qwen3-8B --ir qwen3_8b_ir_full.json --baseline-precision fp16 --vspec-bits 4 --kv-tokens 2048 --kv-heads 64 --kv-head-dim 128 --output tools/benchmark/qwen3_report.json
-- custom LLM bench from logs: python tools/benchmark/custom_bench.py --model-id Qwen/Qwen3-8B --ir qwen3_8b_ir_full.json --baseline-precision fp16 --vspec-bits 4 --force-vspec-bits --kv-tokens 2048 --kv-heads 64 --kv-head-dim 128 --vspec-log logs/vspec_run.txt --baseline-log logs/baseline_run.txt --output tools/benchmark/qwen3_report.json
-- sample log generator: python tools/benchmark/make_sample_logs.py --out-dir logs
+If CUDA is not detected, CPU reference kernels are used automatically.
 
-## Benchmarking and comparisons
+## 🧪 Examples & Demos
 
-Use the custom bench report to compare Vspec against traditional runs (FP16/FP32) and external runtimes like llama.cpp. The report supports:
+### Core Demos
+- `vspec_int4_demo`
+- `vspec_attention_v2_demo`
+- `vspec_benchmark`
 
-- Memory estimate: baseline vs Vspec quantized weights, plus KV cache.
-- Throughput: tokens/sec for Vspec and baseline, plus speedup.
-- Extra metrics: perplexity drift, SM occupancy, memory bandwidth, warp stall reason, sequence scaling.
+### Advanced / Internal
+- `vspec_stress_test`
+- `vspec_cuda_fused_demo` (CUDA only)
+- `vspec_phase3_demo`
 
-Workflow:
+## 📊 Benchmarking & Comparison
 
-1) Run a baseline inference (traditional or llama.cpp) and save a log with tokens/seconds and optional extra metrics.
-2) Run a Vspec inference and save a log with the same fields.
-3) Generate the report using the custom bench tool.
+Vspec includes a custom benchmark report builder.
 
-## Python bridge (optional)
+It supports:
 
-1) Build the shared C API library:
-   - ./build/Release/vspec_engine_capi.dll
-2) Run the Python demo:
-   - PYTHONPATH=vspec-python/src python examples/python_torch_like_demo.py
+- 📦 Memory estimate (baseline vs quantized + KV cache)
+- 🚀 Throughput comparison (tokens/sec)
+- 📉 Speedup calculation
+- 📈 Extra metrics:
+  - Perplexity drift
+  - SM occupancy
+  - Memory bandwidth
+  - Warp stall reason
+  - Sequence scaling
 
-The Python package source lives in ./vspec-python.
+### 🔄 Workflow
 
-## Converter (CLI)
+Run baseline inference (FP16/FP32 or llama.cpp) → save log  
+Run Vspec inference → save log
 
-- Convert manifest or safetensors header to IR JSON:
-  - python tools/converter/vspec_converter.py --input sample_weights.vpt --output out_ir.json
+Generate report:
+Using model Qwen3-8b for testing:
+```sh
+python tools/benchmark/custom_bench.py \
+  --model-id Qwen/Qwen3-8B \
+  --ir qwen3_8b_ir_full.json \
+  --baseline-precision fp16 \
+  --vspec-bits 4 \
+  --kv-tokens 2048 \
+  --kv-heads 64 \
+  --kv-head-dim 128 \
+  --output tools/benchmark/qwen3_report.json
+```
 
-## Notes
+## 🔄 Model Converter (CLI)
 
-- CUDA is optional. If CUDA is not detected, CPU reference kernels are used.
-- The roadmap lives in ROADMAP.md (ignored by default in git).
-- See docs/OPTIMIZATION.md and docs/ABI.md for technical details.
+Convert manifest or safetensors header to Vspec IR:
+
+```sh
+python tools/converter/vspec_converter.py \
+  --input sample_weights.vpt \
+  --output out_ir.json
+```
+
+## 🐍 Python Bridge (Optional)
+
+Build shared C API:
+
+```sh
+./build/Release/vspec_engine_capi.dll
+```
+
+Run demo:
+
+```sh
+PYTHONPATH=vspec-python/src python examples/python_torch_like_demo.py
+```
+
+Python source lives in:
+
+- `./vspec-python`
+
+## 📂 Documentation
+
+- `docs/OPTIMIZATION.md`
+- `docs/ABI.md`
+
+
+## 🌱 Vision
+
+Vspec aims to become a:
+
+- Cross-vendor inference runtime layer
+- Native ultra-low-bit execution engine
+- Research-grade kernel playground
+- Foundation for future inference systems
+
+It is not a wrapper around existing runtimes.  
+It is a runtime.
+
+## 🧩 License
+
+Apache 2.0
