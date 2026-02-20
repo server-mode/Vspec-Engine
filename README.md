@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.jpg" alt="Vspec Engine Icon" width="140" />
+  <img src="icon.jpg" alt="Vspec Engine Icon" width="300" />
 </p>
 
 <p align="center">
@@ -18,6 +18,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue" />
   <img alt="stage" src="https://img.shields.io/badge/stage-research%2Fexperimental-lightgrey" />
 </p>
+
 # 🚀 Vspec Engine
 
 Vspec Engine is a kernel-first runtime for low-bit LLM and diffusion inference.  
