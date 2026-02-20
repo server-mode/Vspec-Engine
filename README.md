@@ -1,3 +1,23 @@
+<p align="center">
+  <img src="icon.jpg" alt="Vspec Engine Icon" width="140" />
+</p>
+
+<p align="center">
+  <small><b>Vspec Engine</b> — kernel-first runtime for native ultra-low-bit (2/3/4-bit) LLM & diffusion inference, with IR-driven execution and memory-aware scheduling.</small>
+</p>
+
+<p align="center">
+  <img alt="ci" src="https://img.shields.io/badge/CI-passing-brightgreen" />
+  <img alt="build" src="https://img.shields.io/badge/build-CMake-2ea44f" />
+  <img alt="cuda" src="https://img.shields.io/badge/CUDA-optional-76B900" />
+  <img alt="backend" src="https://img.shields.io/badge/backends-CPU%20%7C%20CUDA-blue" />
+  <img alt="quant" src="https://img.shields.io/badge/quant-2%2F3%2F4--bit-purple" />
+  <img alt="ir" src="https://img.shields.io/badge/IR-graph--centric-orange" />
+  <img alt="scheduler" src="https://img.shields.io/badge/scheduler-memory--aware-red" />
+  <img alt="test-model" src="https://img.shields.io/badge/tested%20with-Qwen3--8B-0aa0f7" />
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue" />
+  <img alt="stage" src="https://img.shields.io/badge/stage-research%2Fexperimental-lightgrey" />
+</p>
 # 🚀 Vspec Engine
 
 Vspec Engine is a kernel-first runtime for low-bit LLM and diffusion inference.  
