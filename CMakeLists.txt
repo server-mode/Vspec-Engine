@@ -39,6 +39,7 @@ add_library(vspec_engine
     src/attention/kv_ring.c
     src/attention/streaming.c
     src/attention/fused_graph.c
+    src/model/qwen_ops.c
     src/graph/ir.c
     src/graph/optimizer.c
     src/quant/int4.c
@@ -72,6 +73,11 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/fused_linear_int3.cu
         src/kernel/cuda/attention_fused.cu
         src/kernel/cuda/autotune.cu
+        src/kernel/cuda/cuda_rmsnorm_f32.cu
+        src/kernel/cuda/cuda_linear_f32.cu
+        src/kernel/cuda/cuda_gemm_f32.cu
+        src/kernel/cuda/cuda_attention_f32.cu
+        src/kernel/cuda/cuda_elemwise_f32.cu
     )
     set_target_properties(vspec_engine PROPERTIES CUDA_STANDARD 14)
 endif()
@@ -102,6 +108,31 @@ target_compile_definitions(vspec_engine_capi PRIVATE VSPEC_PYTHON_CAPI_BUILD)
 set_target_properties(vspec_engine_capi PROPERTIES
     OUTPUT_NAME "vspec_engine_capi"
 )
+
+if(VSPEC_HAS_CUDA)
+    add_library(vspec_cuda_bridge SHARED
+        src/python/cuda_bridge.c
+        src/kernel/cuda/cuda_rmsnorm_f32.cu
+        src/kernel/cuda/cuda_linear_f32.cu
+        src/kernel/cuda/cuda_gemm_f32.cu
+        src/kernel/cuda/cuda_attention_f32.cu
+        src/kernel/cuda/cuda_elemwise_f32.cu
+    )
+
+    find_package(CUDAToolkit)
+    if (CUDAToolkit_FOUND)
+        target_link_libraries(vspec_cuda_bridge PRIVATE CUDA::cublas)
+    endif()
+
+    target_include_directories(vspec_cuda_bridge
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    set_target_properties(vspec_cuda_bridge PROPERTIES
+        OUTPUT_NAME "vspec_cuda_bridge"
+    )
+endif()
 
 add_executable(vspec_int4_demo
     examples/int4_demo.c

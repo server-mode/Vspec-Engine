@@ -77,6 +77,14 @@ def _parse_perf_from_text(text: str) -> tuple[int, float]:
 def _parse_extra_metrics(text: str) -> dict:
     metrics: dict = {}
 
+    target_bits_match = re.search(r"target_bits\s*[=:]\s*([0-9.]+)", text, flags=re.IGNORECASE)
+    if target_bits_match:
+        metrics["target_bits"] = float(target_bits_match.group(1))
+
+    effective_bits_match = re.search(r"effective_bits_estimate\s*[=:]\s*([0-9.]+)", text, flags=re.IGNORECASE)
+    if effective_bits_match:
+        metrics["effective_bits_estimate"] = float(effective_bits_match.group(1))
+
     drift_match = re.search(r"perplexity_drift\s*[=:]\s*([0-9.]+)", text, flags=re.IGNORECASE)
     if drift_match:
         metrics["perplexity_drift"] = float(drift_match.group(1))
@@ -130,6 +138,7 @@ def main() -> None:
     parser.add_argument("--warp-stall-reason", help="Override warp stall reason")
     parser.add_argument("--sequence-scaling", help="Override sequence scaling result")
     parser.add_argument("--output", help="Write report to json file")
+    parser.add_argument("--auto-bits-from-log", action="store_true", help="Use target/effective bits parsed from vspec log when available")
     args = parser.parse_args()
 
     ir = json.loads(Path(args.ir).read_text(encoding="utf-8"))
@@ -151,6 +160,12 @@ def main() -> None:
         if tokens > 0 and seconds > 0.0:
             args.vspec_tokens = tokens
             args.vspec_seconds = seconds
+
+        if args.auto_bits_from_log:
+            if "effective_bits_estimate" in vspec_log_metrics:
+                args.vspec_bits = int(round(float(vspec_log_metrics["effective_bits_estimate"])))
+            elif "target_bits" in vspec_log_metrics:
+                args.vspec_bits = int(round(float(vspec_log_metrics["target_bits"])))
 
     if args.baseline_log:
         try:
