@@ -115,10 +115,10 @@ extern "C" void vspec_cuda_attention_single_f32(
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
     if (cudaMemcpy(output, d_out, bytes_out, cudaMemcpyDeviceToHost) != cudaSuccess) goto cleanup;
 
-+cleanup:
-+    if (d_out) cudaFree(d_out);
-+    if (d_scores) cudaFree(d_scores);
-+    if (d_v) cudaFree(d_v);
-+    if (d_k) cudaFree(d_k);
-+    if (d_q) cudaFree(d_q);
-+}
+cleanup:
+    if (d_out) cudaFree(d_out);
+    if (d_scores) cudaFree(d_scores);
+    if (d_v) cudaFree(d_v);
+    if (d_k) cudaFree(d_k);
+    if (d_q) cudaFree(d_q);
+}

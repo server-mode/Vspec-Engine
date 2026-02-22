@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 try:
@@ -21,7 +22,13 @@ except Exception:  # pragma: no cover - optional dependency
 try:
     from vspec_cuda_bridge import (
         attention_single_f32,
+        attention_fused_single_f32,
+        attention_fused_single_f32_available,
         attention_single_f32_available,
+        fused_linear_int3,
+        fused_linear_int3_available,
+        fused_linear_int4,
+        fused_linear_int4_available,
         gemm_f32,
         gemm_f32_available,
         linear_f32,
@@ -39,7 +46,13 @@ except Exception:  # pragma: no cover - optional dependency
     linear_f32 = None
     linear_f32_available = lambda: False
     attention_single_f32 = None
+    attention_fused_single_f32 = None
+    attention_fused_single_f32_available = lambda: False
     attention_single_f32_available = lambda: False
+    fused_linear_int3 = None
+    fused_linear_int3_available = lambda: False
+    fused_linear_int4 = None
+    fused_linear_int4_available = lambda: False
     gemm_f32 = None
     gemm_f32_available = lambda: False
     silu_f32 = None
@@ -128,6 +141,39 @@ def _matmul_with_weight_dtype(x: "torch.Tensor", w_t: "torch.Tensor") -> "torch.
     return torch.matmul(x, w_t)
 
 
+def _pack_signed_rowwise(q: "np.ndarray", bits: int) -> "np.ndarray":
+    n, k = q.shape
+    row_bytes = (k * bits + 7) // 8
+    out = np.zeros((n, row_bytes), dtype=np.uint8)
+    mask = (1 << bits) - 1
+
+    for r in range(n):
+        row = q[r]
+        for i in range(k):
+            code = int(row[i]) & mask
+            bit_pos = i * bits
+            byte_idx = bit_pos >> 3
+            shift = bit_pos & 7
+            out[r, byte_idx] |= np.uint8((code << shift) & 0xFF)
+            if (8 - shift) < bits:
+                out[r, byte_idx + 1] |= np.uint8((code >> (8 - shift)) & 0xFF)
+    return out.reshape(-1)
+
+
+def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarray", "np.ndarray"]:
+    w = weight.astype(np.float32, copy=False)
+    max_q = float((1 << (bits - 1)) - 1)
+    min_q = float(-(1 << (bits - 1)))
+
+    max_abs = np.max(np.abs(w), axis=1)
+    scales = np.where(max_abs > 0.0, max_abs / max_q, 1.0).astype(np.float32)
+    q = np.round(w / scales[:, None])
+    q = np.clip(q, min_q, max_q).astype(np.int8)
+
+    packed = _pack_signed_rowwise(q, bits)
+    return packed, scales
+
+
 @dataclass
 class SimpleRuntime:
     embed: "np.ndarray"
@@ -165,6 +211,7 @@ class LayerWeights:
     b3: Optional["np.ndarray"]
     norm1_bias: Optional["np.ndarray"]
     norm2_bias: Optional["np.ndarray"]
+    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -183,6 +230,8 @@ class GenericTransformerRuntime:
     cache_k: list["np.ndarray"]
     cache_v: list["np.ndarray"]
     use_native_cuda_norm: bool
+    fused_bits: int
+    disable_fused_attention: bool
 
     def _forward_token(self, token_id: int, return_logits: bool) -> Optional[list[float]]:
         if np is None:
@@ -196,14 +245,20 @@ class GenericTransformerRuntime:
             else:
                 x_norm = _rms_norm(x, layer.norm1, self.rms_eps, layer.norm1_bias)
 
-            if self.use_native_cuda_norm and gemm_f32_available():
-                q = gemm_f32(x_norm, layer.wq)[0]
-                k = gemm_f32(x_norm, layer.wk)[0]
-                v = gemm_f32(x_norm, layer.wv)[0]
-            else:
-                q = x_norm @ layer.wq.T
-                k = x_norm @ layer.wk.T
-                v = x_norm @ layer.wv.T
+            def _linear_native(vec: "np.ndarray", w: "np.ndarray", key: str) -> "np.ndarray":
+                if self.use_native_cuda_norm and self.fused_bits in {3, 4} and key in layer.packed:
+                    packed_w, scales, bits, out_n = layer.packed[key]
+                    if bits == 4 and fused_linear_int4_available():
+                        return fused_linear_int4(vec, packed_w, scales, out_n)[0]
+                    if bits == 3 and fused_linear_int3_available():
+                        return fused_linear_int3(vec, packed_w, scales, out_n)[0]
+                if self.use_native_cuda_norm and gemm_f32_available():
+                    return gemm_f32(vec, w)[0]
+                return vec @ w.T
+
+            q = _linear_native(x_norm, layer.wq, "wq")
+            k = _linear_native(x_norm, layer.wk, "wk")
+            v = _linear_native(x_norm, layer.wv, "wv")
 
             if layer.bq is not None:
                 q = q + layer.bq
@@ -238,7 +293,9 @@ class GenericTransformerRuntime:
                 qh = q[h]
                 kh = keys[:, h, :]
                 vh = values[:, h, :]
-                if self.use_native_cuda_norm and attention_single_f32_available():
+                if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
+                    attn_out.append(attention_fused_single_f32(qh, kh, vh))
+                elif self.use_native_cuda_norm and attention_single_f32_available():
                     attn_out.append(attention_single_f32(qh, kh, vh))
                 else:
                     scores = (kh @ qh) / np.sqrt(self.head_dim)
@@ -247,10 +304,7 @@ class GenericTransformerRuntime:
                     attn_out.append(probs @ vh)
 
             attn = np.concatenate(attn_out, axis=0)
-            if self.use_native_cuda_norm and gemm_f32_available():
-                attn = gemm_f32(attn, layer.wo)[0]
-            else:
-                attn = attn @ layer.wo.T
+            attn = _linear_native(attn, layer.wo, "wo")
             if layer.bo is not None:
                 attn = attn + layer.bo
             x = x + attn
@@ -259,10 +313,7 @@ class GenericTransformerRuntime:
                 x_norm = rmsnorm_f32(x[None, :], layer.norm2, self.rms_eps)[0]
             else:
                 x_norm = _rms_norm(x, layer.norm2, self.rms_eps, layer.norm2_bias)
-            if self.use_native_cuda_norm and gemm_f32_available():
-                gate = gemm_f32(x_norm, layer.w1)[0]
-            else:
-                gate = x_norm @ layer.w1.T
+            gate = _linear_native(x_norm, layer.w1, "w1")
             if layer.b1 is not None:
                 gate = gate + layer.b1
             if self.use_native_cuda_norm and silu_f32_available():
@@ -270,10 +321,7 @@ class GenericTransformerRuntime:
             else:
                 gate = _silu(gate)
 
-            if self.use_native_cuda_norm and gemm_f32_available():
-                up = gemm_f32(x_norm, layer.w3)[0]
-            else:
-                up = x_norm @ layer.w3.T
+            up = _linear_native(x_norm, layer.w3, "w3")
             if layer.b3 is not None:
                 up = up + layer.b3
 
@@ -282,10 +330,7 @@ class GenericTransformerRuntime:
             else:
                 fused = gate * up
 
-            if self.use_native_cuda_norm and gemm_f32_available():
-                ff = gemm_f32(fused, layer.w2)[0]
-            else:
-                ff = fused @ layer.w2.T
+            ff = _linear_native(fused, layer.w2, "w2")
             if layer.b2 is not None:
                 ff = ff + layer.b2
             x = x + ff
@@ -564,7 +609,7 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int) -> Optional
     n1_bias = _load_first_available(weight_index, prefix + "input_layernorm.bias")
     n2_bias = _load_first_available(weight_index, prefix + "post_attention_layernorm.bias")
 
-    return LayerWeights(
+    layer = LayerWeights(
         wq=q,
         wk=k,
         wv=v,
@@ -584,6 +629,22 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int) -> Optional
         norm1_bias=n1_bias,
         norm2_bias=n2_bias,
     )
+
+    fused_bits = int(os.getenv("VSPEC_FUSED_BITS", "0") or "0")
+    if fused_bits in {3, 4}:
+        for key, w in {
+            "wq": layer.wq,
+            "wk": layer.wk,
+            "wv": layer.wv,
+            "wo": layer.wo,
+            "w1": layer.w1,
+            "w2": layer.w2,
+            "w3": layer.w3,
+        }.items():
+            packed, scales = _quantize_weight_rowwise(w, fused_bits)
+            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
+
+    return layer
 
 
 def _load_layer_torch(weight_index: dict[str, WeightInfo], layer_idx: int, device: str) -> Optional[LayerWeights]:
@@ -734,6 +795,8 @@ def _load_generic_transformer(
         cache_k=[],
         cache_v=[],
         use_native_cuda_norm=use_native_cuda_norm,
+        fused_bits=int(os.getenv("VSPEC_FUSED_BITS", "0") or "0"),
+        disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
     )
 
 
@@ -839,9 +902,9 @@ def build_generic_runtime(
     device: str,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[object]:
-    if device == "cuda" and torch is not None and torch.cuda.is_available():
+    if device == "torch-cuda" and torch is not None and torch.cuda.is_available():
         runtime = _load_generic_transformer_torch(config, weight_index, max_layers, device, progress_cb)
         if runtime is not None:
             return runtime
-    use_native_cuda_norm = device == "cuda-native"
+    use_native_cuda_norm = device in {"cuda", "cuda-native"}
     return _load_generic_transformer(config, weight_index, max_layers, use_native_cuda_norm, progress_cb)

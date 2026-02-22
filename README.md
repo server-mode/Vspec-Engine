@@ -220,6 +220,7 @@ Python source lives in:
 
 - `docs/OPTIMIZATION.md`
 - `docs/ABI.md`
+- `docs/CLIENT_RUNTIME_INTEGRATION.md`
 
 
 ## 🌱 Vision

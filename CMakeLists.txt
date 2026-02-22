@@ -116,7 +116,10 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/cuda_linear_f32.cu
         src/kernel/cuda/cuda_gemm_f32.cu
         src/kernel/cuda/cuda_attention_f32.cu
+        src/kernel/cuda/attention_fused.cu
         src/kernel/cuda/cuda_elemwise_f32.cu
+        src/kernel/cuda/fused_linear_int4.cu
+        src/kernel/cuda/fused_linear_int3.cu
     )
 
     find_package(CUDAToolkit)
@@ -218,6 +221,12 @@ if(VSPEC_HAS_CUDA)
     )
 
     target_link_libraries(vspec_cuda_fused_demo PRIVATE vspec_engine)
+
+    add_executable(vspec_cuda_fused_benchmark
+        tools/benchmark/cuda_fused_linear_benchmark.c
+    )
+
+    target_link_libraries(vspec_cuda_fused_benchmark PRIVATE vspec_engine)
 endif()
 
 add_executable(vspec_validation_demo

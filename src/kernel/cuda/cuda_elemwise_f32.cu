@@ -36,30 +36,30 @@ extern "C" void vspec_cuda_silu_f32(float* data, size_t count) {
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
     (void)cudaMemcpy(data, d_data, bytes, cudaMemcpyDeviceToHost);
 
-+cleanup:
-+    if (d_data) cudaFree(d_data);
-+}
-+
-+extern "C" void vspec_cuda_mul_f32(float* data, const float* other, size_t count) {
-+    if (!data || !other || count == 0) {
-+        return;
-+    }
-+    const size_t bytes = count * sizeof(float);
-+    float* d_data = NULL;
-+    float* d_other = NULL;
-+    if (cudaMalloc((void**)&d_data, bytes) != cudaSuccess) return;
-+    if (cudaMalloc((void**)&d_other, bytes) != cudaSuccess) goto cleanup;
-+    if (cudaMemcpy(d_data, data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-+    if (cudaMemcpy(d_other, other, bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-+
-+    dim3 block(256);
-+    dim3 grid((unsigned)((count + block.x - 1U) / block.x));
-+    mul_kernel<<<grid, block>>>(d_data, d_other, count);
-+
-+    if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
-+    (void)cudaMemcpy(data, d_data, bytes, cudaMemcpyDeviceToHost);
-+
-+cleanup:
-+    if (d_other) cudaFree(d_other);
-+    if (d_data) cudaFree(d_data);
-+}
+cleanup:
+    if (d_data) cudaFree(d_data);
+}
+
+extern "C" void vspec_cuda_mul_f32(float* data, const float* other, size_t count) {
+    if (!data || !other || count == 0) {
+        return;
+    }
+    const size_t bytes = count * sizeof(float);
+    float* d_data = NULL;
+    float* d_other = NULL;
+    if (cudaMalloc((void**)&d_data, bytes) != cudaSuccess) return;
+    if (cudaMalloc((void**)&d_other, bytes) != cudaSuccess) goto cleanup;
+    if (cudaMemcpy(d_data, data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
+    if (cudaMemcpy(d_other, other, bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
+
+    dim3 block(256);
+    dim3 grid((unsigned)((count + block.x - 1U) / block.x));
+    mul_kernel<<<grid, block>>>(d_data, d_other, count);
+
+    if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
+    (void)cudaMemcpy(data, d_data, bytes, cudaMemcpyDeviceToHost);
+
+cleanup:
+    if (d_other) cudaFree(d_other);
+    if (d_data) cudaFree(d_data);
+}

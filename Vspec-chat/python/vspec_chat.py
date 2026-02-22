@@ -1,7 +1,9 @@
 import argparse
 import math
+import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -19,7 +21,23 @@ from runtime_inference import build_generic_runtime, runtime_load_reason
 from chat_prompt import build_prompt
 from vspec_cuda_bridge import cuda_mem_info
 from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
+from language_stability_guard import LanguageStabilityGuard
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
+
+
+def _configure_console_encoding() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            stream_encoding = getattr(stream, "encoding", None) or "utf-8"
+            reconfigure(encoding=stream_encoding, errors="replace")
+        except Exception:
+            pass
 
 
 def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
@@ -193,6 +211,7 @@ def sample_from_logits(
 
 
 def main() -> None:
+    _configure_console_encoding()
     parser = argparse.ArgumentParser(description="Vspec-chat prototype CLI")
     parser.add_argument("--model-dir", required=True, help="Path to HF cache model dir")
     parser.add_argument("--prompt", required=True, help="Prompt text")
@@ -201,7 +220,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-layers", type=int, default=0, help="0 = use all available layers")
-    parser.add_argument("--device", default="cuda", help="cpu, cuda, or cuda-native")
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda", "cuda-native", "torch-cuda"], help="cuda=default native path; use torch-cuda only for fallback/debug")
     parser.add_argument("--greedy", action="store_true", help="Use greedy decoding")
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
     parser.add_argument("--repeat-window", type=int, default=64)
@@ -213,7 +232,13 @@ def main() -> None:
     parser.add_argument("--no-stream", action="store_true", help="Disable token-by-token streaming output")
     parser.add_argument("--no-progress", action="store_true", help="Disable stage progress logs")
     parser.add_argument("--target-bits", type=int, default=0, choices=[0, 2, 3, 4], help="0=off, policy target bits for benchmark telemetry")
+    parser.add_argument("--fused-bits", type=int, default=0, choices=[0, 3, 4], help="Enable fused low-bit linear kernels for native path")
+    parser.add_argument("--disable-language-guard", action="store_true", help="Disable Language Stability Guard")
+    parser.add_argument("--language-guard-strictness", type=float, default=0.72, help="0..1, higher is stricter against language/script drift")
+    parser.add_argument("--no-prioritize-english", action="store_true", help="Disable English-first fallback when language is ambiguous")
     args = parser.parse_args()
+
+    os.environ["VSPEC_FUSED_BITS"] = str(args.fused_bits)
 
     show_progress = not args.no_progress
 
@@ -258,7 +283,17 @@ def main() -> None:
     effective_repetition_penalty = min(args.repetition_penalty, speed_cfg.repetition_penalty)
     effective_no_repeat_ngram = min(args.no_repeat_ngram, speed_cfg.no_repeat_ngram) if speed_cfg.no_repeat_ngram > 0 else 0
     effective_repeat_window = min(args.repeat_window, speed_cfg.repeat_window)
-    fast_engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=(not args.no_stream))
+
+    guard = None
+    if not args.disable_language_guard:
+        guard = LanguageStabilityGuard(
+            prompt=args.prompt,
+            lang_mode=lang_mode,
+            strictness=args.language_guard_strictness,
+            prioritize_english=(not args.no_prioritize_english),
+        )
+
+    fast_engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=(not args.no_stream), guard=guard)
 
     prompt_for_model = build_prompt(args.prompt, adapter.model_type, tok_cfg, lang_mode, args.chat_format)
 
@@ -274,6 +309,12 @@ def main() -> None:
     print("[vspec-chat] lang_mode=", lang_mode)
     print("[vspec-chat] chat_format=", args.chat_format)
     print("[vspec-chat] speed_preset=", args.speed_preset)
+    print("[vspec-chat] fused_bits=", args.fused_bits)
+    print("[vspec-chat] language_guard=", "on" if guard is not None else "off")
+    if guard is not None:
+        print("[vspec-chat] language_guard_primary_script=", guard.profile.primary_script)
+        print("[vspec-chat] language_guard_strictness=", round(guard.profile.strictness, 3))
+        print("[vspec-chat] language_guard_prioritize_english=", guard.profile.prioritized_english)
     print("[vspec-chat] decode_top_k=", effective_top_k)
     print("[vspec-chat] decode_lang_top_n=", effective_lang_top_n)
 
@@ -281,7 +322,7 @@ def main() -> None:
     generated = []
 
     start_ts = time.perf_counter()
-    vram_before = cuda_mem_info() if args.device in {"cuda", "cuda-native"} else None
+    vram_before = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None
 
     def _runtime_progress(stage: str, current: int, total: int) -> None:
         if not show_progress:
@@ -312,9 +353,9 @@ def main() -> None:
     else:
         print("[vspec-chat] runtime_device=", args.device)
         runtime.eos_token_id = adapter.eos_token_id
-        if args.device == "cuda-native":
+        if args.device in {"cuda", "cuda-native"}:
             runtime_mode = "vspec-native-cuda"
-        elif args.device == "cuda":
+        elif args.device == "torch-cuda":
             runtime_mode = "vspec-torch-cuda"
         else:
             runtime_mode = "vspec-cpu"
@@ -396,7 +437,7 @@ def main() -> None:
         print(text)
 
     elapsed = time.perf_counter() - start_ts
-    vram_after = cuda_mem_info() if args.device in {"cuda", "cuda-native"} else None
+    vram_after = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None
     prompt_tok = len(token_ids) - len(generated)
     gen_tok = len(generated)
     total_tok = prompt_tok + gen_tok

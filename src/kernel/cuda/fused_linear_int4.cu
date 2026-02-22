@@ -41,6 +41,24 @@ extern "C" int vspec_cuda_fused_available(void) {
     return (cudaGetDeviceCount(&count) == cudaSuccess && count > 0) ? 1 : 0;
 }
 
+extern "C" void vspec_cuda_fused_linear_int4_device(
+    const float* d_a,
+    const unsigned char* d_b_packed,
+    const float* d_scales,
+    float* d_c,
+    size_t m,
+    size_t n,
+    size_t k
+) {
+    if (!d_a || !d_b_packed || !d_scales || !d_c || m == 0U || n == 0U || k == 0U) {
+        return;
+    }
+    const size_t packed_k = (k + 1U) / 2U;
+    dim3 block(16, 16);
+    dim3 grid((unsigned)((n + block.x - 1U) / block.x), (unsigned)((m + block.y - 1U) / block.y));
+    fused_int4_kernel<<<grid, block>>>(d_a, d_b_packed, d_scales, d_c, m, n, k, packed_k);
+}
+
 extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     if (!ctx || !ctx->input || !ctx->weight || !ctx->output) {
         return;
@@ -54,9 +72,6 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     const size_t n = ctx->config.n;
     const size_t k = ctx->config.k;
     const size_t packed_k = (k + 1U) / 2U;
-
-    dim3 block(16, 16);
-    dim3 grid((unsigned)((n + block.x - 1U) / block.x), (unsigned)((m + block.y - 1U) / block.y));
 
     const size_t bytes_a = m * k * sizeof(float);
     const size_t bytes_b = n * packed_k * sizeof(uint8_t);
@@ -77,7 +92,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
     if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
 
-    fused_int4_kernel<<<grid, block>>>(d_a, d_b, d_s, d_c, m, n, k, packed_k);
+    vspec_cuda_fused_linear_int4_device(d_a, d_b, d_s, d_c, m, n, k);
 
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);

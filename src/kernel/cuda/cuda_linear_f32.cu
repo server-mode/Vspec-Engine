@@ -70,8 +70,8 @@ extern "C" void vspec_cuda_linear_f32(
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
     if (cudaMemcpy(output, d_out, bytes_out, cudaMemcpyDeviceToHost) != cudaSuccess) goto cleanup;
 
-+cleanup:
-+    if (d_out) cudaFree(d_out);
-+    if (d_w) cudaFree(d_w);
-+    if (d_in) cudaFree(d_in);
-+}
+cleanup:
+    if (d_out) cudaFree(d_out);
+    if (d_w) cudaFree(d_w);
+    if (d_in) cudaFree(d_in);
+}

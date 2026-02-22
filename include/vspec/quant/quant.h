@@ -5,6 +5,8 @@
 
 typedef enum VspecQuantType {
     VSPEC_QUANT_NONE = 0,
+    VSPEC_QUANT_INT2 = 2,
+    VSPEC_QUANT_INT3 = 3,
     VSPEC_QUANT_INT4 = 4
 } VspecQuantType;
 

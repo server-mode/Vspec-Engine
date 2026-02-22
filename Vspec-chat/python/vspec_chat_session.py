@@ -1,10 +1,12 @@
 import argparse
+import os
 import random
 import time
 from pathlib import Path
 
 from chat_prompt import build_prompt
 from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
+from language_stability_guard import LanguageStabilityGuard
 from model_adapters import select_adapter
 from model_loader import (
     build_weight_index,
@@ -46,6 +48,9 @@ def _generate(
     chat_format: str,
     stream: bool,
     show_progress: bool,
+    disable_language_guard: bool,
+    language_guard_strictness: float,
+    prioritize_english: bool,
 ) -> str:
     prompt_for_model = build_prompt(prompt, adapter.model_type, tok_cfg, lang_mode, chat_format)
     encoded = tokenizer.encode(prompt_for_model)
@@ -70,7 +75,16 @@ def _generate(
                     pct = 10 + int((idx / total_prefill) * 35)
                     _progress(show_progress, min(45, pct), "prefill", f"{idx}/{total_prefill}")
 
-    engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=stream)
+    guard = None
+    if not disable_language_guard:
+        guard = LanguageStabilityGuard(
+            prompt=prompt,
+            lang_mode=lang_mode,
+            strictness=language_guard_strictness,
+            prioritize_english=prioritize_english,
+        )
+
+    engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=stream, guard=guard)
     engine.begin_stream()
     generated = []
     start = time.perf_counter()
@@ -101,7 +115,7 @@ def _generate(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Persistent Vspec chat session (loads model once)")
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda", "cuda-native", "torch-cuda"])
     parser.add_argument("--max-layers", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -118,7 +132,13 @@ def main() -> None:
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--target-bits", type=int, default=0, choices=[0, 2, 3, 4])
+    parser.add_argument("--fused-bits", type=int, default=0, choices=[0, 3, 4])
+    parser.add_argument("--disable-language-guard", action="store_true")
+    parser.add_argument("--language-guard-strictness", type=float, default=0.72)
+    parser.add_argument("--no-prioritize-english", action="store_true")
     args = parser.parse_args()
+
+    os.environ["VSPEC_FUSED_BITS"] = str(args.fused_bits)
 
     random.seed(args.seed)
     show_progress = not args.no_progress
@@ -198,6 +218,9 @@ def main() -> None:
             chat_format=args.chat_format,
             stream=(not args.no_stream),
             show_progress=show_progress,
+            disable_language_guard=args.disable_language_guard,
+            language_guard_strictness=args.language_guard_strictness,
+            prioritize_english=(not args.no_prioritize_english),
         )
         if args.no_stream:
             print("assistant>", out)

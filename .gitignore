@@ -3,5 +3,6 @@ ROADMAP.md
 update.md
 now.md
 build/
+logs/
 .venv/
 .vscode

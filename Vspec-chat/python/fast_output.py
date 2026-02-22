@@ -4,6 +4,8 @@ import random
 import re
 from dataclasses import dataclass
 
+from language_stability_guard import LanguageStabilityGuard
+
 try:
     import numpy as np
 except Exception:
@@ -29,10 +31,11 @@ def resolve_speed_preset(name: str) -> SpeedPreset:
 
 
 class FastOutputEngine:
-    def __init__(self, tokenizer, lang_mode: str, stream: bool) -> None:
+    def __init__(self, tokenizer, lang_mode: str, stream: bool, guard: LanguageStabilityGuard | None = None) -> None:
         self.tokenizer = tokenizer
         self.lang_mode = lang_mode
         self.stream = stream
+        self.guard = guard
         self._decoded_cache: dict[int, str] = {}
         self._allowed_cache: dict[int, bool] = {}
 
@@ -61,11 +64,17 @@ class FastOutputEngine:
             print(text, end="", flush=True)
 
     def is_allowed(self, token_id: int) -> bool:
-        if self.lang_mode == "auto" or self.tokenizer is None:
+        if self.tokenizer is None:
             return True
         if token_id in self._allowed_cache:
             return self._allowed_cache[token_id]
         text = self.token_text(token_id)
+        if self.guard is not None and not self.guard.allow_text(text):
+            self._allowed_cache[token_id] = False
+            return False
+        if self.lang_mode == "auto":
+            self._allowed_cache[token_id] = True
+            return True
         ok = _is_allowed_text(text, self.lang_mode)
         self._allowed_cache[token_id] = ok
         return ok
@@ -101,7 +110,10 @@ class FastOutputEngine:
         scored = []
         for tid in allowed_ids:
             scaled = logits[tid] / temperature
-            bonus = _token_quality_bonus(self.token_text(tid), self.lang_mode)
+            text = self.token_text(tid)
+            bonus = _token_quality_bonus(text, self.lang_mode)
+            if self.guard is not None:
+                bonus += self.guard.score_adjustment(text)
             scored.append((tid, scaled + bonus))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -176,9 +188,10 @@ def postprocess_output_text(text: str, prompt: str, lang_mode: str) -> str:
     vi_marks = re.search(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]", lower) is not None
     has_common_vi = any(w in lower for w in ["xin", "chào", "ban", "bạn", "toi", "tôi", "giup", "giúp", "cam", "cảm"])
     looks_weird = re.search(r"\b[a-z]{6,}\b", lower) is not None and not vi_marks and not has_common_vi
+    ascii_only_word = re.fullmatch(r"[a-z\s]{1,8}", lower) is not None and not vi_marks and not has_common_vi
 
     p = (prompt or "").lower()
     is_greeting = any(k in p for k in ["xin chao", "xin chào", "hello", "hi"])
-    if looks_weird and is_greeting:
+    if is_greeting and (looks_weird or ascii_only_word):
         return "Xin chào! Mình có thể giúp gì cho bạn?"
     return out
