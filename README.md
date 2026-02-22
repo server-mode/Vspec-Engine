@@ -88,10 +88,29 @@ C API boundary enabling:
 - ✅ Native mixed-bit (2/3/4-bit packed)
 - ✅ Runtime IR-centric design
 - ✅ Multi-backend abstraction (CUDA + planned ROCm + SYCL)
+- ✅ Runtime hardware performance manager (config-driven)
 - ✅ KV-aware memory system
 - ✅ Python API independent of PyTorch runtime
 - ✅ Dynamic scheduling & graph rewrite
 - ✅ Kernel-level extensibility
+
+## 🧩 Runtime Hardware Performance Manager
+
+Vspec runtime includes a dedicated hardware resource/performance manager module for:
+
+- backend selection policy (CUDA/ROCm/SYCL/CPU)
+- high-throughput tuning hints (batch/stream)
+- low-bit acceleration preference (runtime-level target bits)
+
+Default config file:
+
+- `config/runtime_hardware.conf`
+
+Default mode is `performent` (high performance priority).
+
+Recommended `config/runtime_hardware.conf` key for sub-4bit target:
+
+- `lowbit_target_bits = 3`
 
 ## 📌 Project Status
 

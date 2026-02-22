@@ -5,21 +5,54 @@ void vspec_mixed_bit_runtime_init(VspecMixedBitRuntime* rt) {
         return;
     }
     rt->layer_count = 0U;
+    rt->last_lookup_layer_id = 0U;
+    rt->last_lookup_type = VSPEC_LAYER_UNKNOWN;
+    rt->last_lookup_bits = 0U;
+    rt->has_last_lookup = 0;
 }
 
 void vspec_mixed_bit_runtime_add(VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type, uint8_t bits) {
+    vspec_mixed_bit_runtime_set(rt, layer_id, type, bits);
+}
+
+void vspec_mixed_bit_runtime_set(VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type, uint8_t bits) {
     if (!rt || rt->layer_count >= VSPEC_MIXED_BIT_MAX_LAYERS) {
-        return;
+        if (!rt) {
+            return;
+        }
     }
-    VspecLayerBitConfig* cfg = &rt->layers[rt->layer_count++];
-    cfg->layer_id = layer_id;
-    cfg->type = type;
-    cfg->bits = bits;
+
+    for (size_t i = 0; i < rt->layer_count; ++i) {
+        VspecLayerBitConfig* cfg = &rt->layers[i];
+        if (cfg->layer_id == layer_id && cfg->type == type) {
+            cfg->bits = bits;
+            rt->last_lookup_layer_id = layer_id;
+            rt->last_lookup_type = type;
+            rt->last_lookup_bits = bits;
+            rt->has_last_lookup = 1;
+            return;
+        }
+    }
+
+    if (rt->layer_count < VSPEC_MIXED_BIT_MAX_LAYERS) {
+        VspecLayerBitConfig* cfg = &rt->layers[rt->layer_count++];
+        cfg->layer_id = layer_id;
+        cfg->type = type;
+        cfg->bits = bits;
+        rt->last_lookup_layer_id = layer_id;
+        rt->last_lookup_type = type;
+        rt->last_lookup_bits = bits;
+        rt->has_last_lookup = 1;
+    }
 }
 
 uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type) {
     if (!rt) {
         return 4;
+    }
+
+    if (rt->has_last_lookup && rt->last_lookup_layer_id == layer_id && rt->last_lookup_type == type) {
+        return rt->last_lookup_bits;
     }
 
     for (size_t i = 0; i < rt->layer_count; ++i) {
@@ -44,6 +77,11 @@ uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, u
 int vspec_mixed_bit_runtime_get(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type, uint8_t* out_bits) {
     if (!rt || !out_bits) {
         return 0;
+    }
+
+    if (rt->has_last_lookup && rt->last_lookup_layer_id == layer_id && rt->last_lookup_type == type) {
+        *out_bits = rt->last_lookup_bits;
+        return 1;
     }
 
     for (size_t i = 0; i < rt->layer_count; ++i) {

@@ -51,6 +51,52 @@ static uint8_t vspec_clamp_bits(uint8_t bits, uint8_t min_bits, uint8_t max_bits
     return bits;
 }
 
+static uint8_t vspec_apply_realtime_pressure_downshift(
+    uint8_t bits,
+    const VspecMixedBitPolicy* policy,
+    const VspecMixedBitPressureProfile* pressure,
+    uint8_t min_bits,
+    uint8_t max_bits
+) {
+    if (!policy || !pressure) {
+        return vspec_clamp_bits(bits, min_bits, max_bits);
+    }
+
+    float peak_pressure = pressure->vram_pressure;
+    if (pressure->kv_pressure > peak_pressure) {
+        peak_pressure = pressure->kv_pressure;
+    }
+
+    uint8_t out = bits;
+    if (peak_pressure >= policy->pressure_critical) {
+        const uint8_t step = (uint8_t)(policy->downshift_step * 2U);
+        if (out > step) {
+            out -= step;
+        } else {
+            out = min_bits;
+        }
+    } else if (peak_pressure >= policy->pressure_high) {
+        if (out > policy->downshift_step) {
+            out -= policy->downshift_step;
+        } else {
+            out = min_bits;
+        }
+    }
+
+    if (pressure->kv_fragmentation >= 0.35f && out > min_bits) {
+        out = (out > 1U) ? (uint8_t)(out - 1U) : min_bits;
+    }
+
+    if (pressure->kv_max_tokens > 0U) {
+        float token_pressure = (float)pressure->kv_active_tokens / (float)pressure->kv_max_tokens;
+        if (token_pressure >= 0.92f && out > min_bits) {
+            out = (out > 1U) ? (uint8_t)(out - 1U) : min_bits;
+        }
+    }
+
+    return vspec_clamp_bits(out, min_bits, max_bits);
+}
+
 void vspec_mixed_bit_policy_default(VspecMixedBitPolicy* policy) {
     if (!policy) {
         return;
@@ -118,4 +164,21 @@ uint8_t vspec_mixed_bit_select_bits(
     }
 
     return vspec_clamp_bits(bits, min_bits, max_bits);
+}
+
+uint8_t vspec_mixed_bit_select_bits_realtime(
+    const VspecMixedBitRuntime* runtime,
+    const VspecMixedBitPolicy* policy,
+    uint32_t layer_id,
+    VspecLayerType type,
+    const float* data,
+    size_t count,
+    const VspecMemoryMetrics* metrics,
+    const VspecVramBudget* budget,
+    const VspecMixedBitPressureProfile* pressure
+) {
+    uint8_t bits = vspec_mixed_bit_select_bits(runtime, policy, layer_id, type, data, count, metrics, budget);
+    uint8_t min_bits = policy ? policy->min_bits : 2U;
+    uint8_t max_bits = policy ? policy->max_bits : 8U;
+    return vspec_apply_realtime_pressure_downshift(bits, policy, pressure, min_bits, max_bits);
 }

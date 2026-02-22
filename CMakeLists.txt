@@ -59,6 +59,7 @@ add_library(vspec_engine
     src/memory/memory_metrics.c
     src/memory/vram_scheduler.c
     src/runtime/runtime.c
+    src/runtime/hw_performance_manager.c
     src/runtime/mixed_bit.c
     src/runtime/mixed_bit_runtime.c
     src/runtime/mixed_bit_policy.c
@@ -178,6 +179,12 @@ add_executable(vspec_benchmark
 )
 
 target_link_libraries(vspec_benchmark PRIVATE vspec_engine)
+
+add_executable(vspec_week25_scheduler_stress
+    tools/benchmark/week25_memory_scheduler_stress.c
+)
+
+target_link_libraries(vspec_week25_scheduler_stress PRIVATE vspec_engine)
 
 add_executable(vspec_stress_test
     tools/benchmark/stress_test.c

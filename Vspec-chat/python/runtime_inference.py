@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 try:
@@ -144,19 +146,29 @@ def _matmul_with_weight_dtype(x: "torch.Tensor", w_t: "torch.Tensor") -> "torch.
 def _pack_signed_rowwise(q: "np.ndarray", bits: int) -> "np.ndarray":
     n, k = q.shape
     row_bytes = (k * bits + 7) // 8
-    out = np.zeros((n, row_bytes), dtype=np.uint8)
     mask = (1 << bits) - 1
+    codes = (q.astype(np.int16, copy=False) & mask).astype(np.uint8, copy=False)
+
+    if bits == 4:
+        if (k & 1) != 0:
+            pad = np.zeros((n, 1), dtype=np.uint8)
+            codes = np.concatenate([codes, pad], axis=1)
+        lo = codes[:, 0::2]
+        hi = codes[:, 1::2] << 4
+        packed = (lo | hi).astype(np.uint8, copy=False)
+        return packed.reshape(-1)
+
+    out = np.zeros((n, row_bytes), dtype=np.uint8)
+    shifts = np.arange(bits, dtype=np.uint8)
+    byte_weights = (1 << np.arange(8, dtype=np.uint16)).astype(np.uint16)
 
     for r in range(n):
-        row = q[r]
-        for i in range(k):
-            code = int(row[i]) & mask
-            bit_pos = i * bits
-            byte_idx = bit_pos >> 3
-            shift = bit_pos & 7
-            out[r, byte_idx] |= np.uint8((code << shift) & 0xFF)
-            if (8 - shift) < bits:
-                out[r, byte_idx + 1] |= np.uint8((code >> (8 - shift)) & 0xFF)
+        bit_stream = ((codes[r][:, None] >> shifts) & 1).reshape(-1)
+        pad_bits = (-bit_stream.size) % 8
+        if pad_bits:
+            bit_stream = np.pad(bit_stream, (0, pad_bits), mode="constant")
+        out[r] = (bit_stream.reshape(-1, 8) * byte_weights).sum(axis=1, dtype=np.uint16).astype(np.uint8)
+
     return out.reshape(-1)
 
 
@@ -172,6 +184,44 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
 
     packed = _pack_signed_rowwise(q, bits)
     return packed, scales
+
+
+def _packed_cache_root() -> Path:
+    custom = os.getenv("VSPEC_PACK_CACHE_DIR", "").strip()
+    if custom:
+        return Path(custom)
+    return Path(__file__).resolve().parents[2] / "logs" / "pack_cache"
+
+
+def _packed_cache_key(prefix: str, key: str, bits: int, w: "np.ndarray") -> str:
+    flat = w.reshape(-1)
+    head = np.ascontiguousarray(flat[:512], dtype=np.float32)
+    tail = np.ascontiguousarray(flat[-512:], dtype=np.float32)
+    digest = hashlib.sha1(head.tobytes() + tail.tobytes()).hexdigest()[:16]
+    return f"{prefix}{key}.b{bits}.{w.shape[0]}x{w.shape[1]}.{digest}"
+
+
+def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray"] | None:
+    cache_file = _packed_cache_root() / f"{cache_key}.npz"
+    if not cache_file.exists():
+        return None
+    try:
+        data = np.load(cache_file, allow_pickle=False)
+        packed = data["packed"].astype(np.uint8, copy=False)
+        scales = data["scales"].astype(np.float32, copy=False)
+        return packed, scales
+    except Exception:
+        return None
+
+
+def _save_packed_cache(cache_key: str, packed: "np.ndarray", scales: "np.ndarray") -> None:
+    try:
+        root = _packed_cache_root()
+        root.mkdir(parents=True, exist_ok=True)
+        cache_file = root / f"{cache_key}.npz"
+        np.savez(cache_file, packed=packed, scales=scales)
+    except Exception:
+        return
 
 
 @dataclass
@@ -641,7 +691,13 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int) -> Optional
             "w2": layer.w2,
             "w3": layer.w3,
         }.items():
-            packed, scales = _quantize_weight_rowwise(w, fused_bits)
+            cache_key = _packed_cache_key(prefix, key, fused_bits, w)
+            cached = _load_packed_cache(cache_key)
+            if cached is not None:
+                packed, scales = cached
+            else:
+                packed, scales = _quantize_weight_rowwise(w, fused_bits)
+                _save_packed_cache(cache_key, packed, scales)
             layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
 
     return layer

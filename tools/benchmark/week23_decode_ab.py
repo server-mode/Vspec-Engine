@@ -17,6 +17,7 @@ from model_loader import find_snapshot_dir, read_config, read_tokenizer_config, 
 from model_adapters import select_adapter
 from runtime_inference import build_generic_runtime
 from chat_prompt import build_prompt
+from hardware_telemetry import build_hardware_report, capture_hardware_snapshot, summarize_hardware_usage
 
 
 def _build_runtime(config: dict, weight_index: dict, disable_fused: bool, max_layers: int):
@@ -44,7 +45,7 @@ def _run_decode(runtime, token_ids: list[int], decode_steps: int) -> dict:
     ids = list(token_ids)
     t1 = time.perf_counter()
     for _ in range(decode_steps):
-        logits = runtime.forward_logits(ids)
+        logits = runtime.forward_logits([ids[-1]])
         if not logits:
             break
         next_id = int(np.argmax(np.asarray(logits, dtype=np.float32)))
@@ -90,8 +91,11 @@ def main() -> None:
     if rt_on is None or rt_off is None:
         raise RuntimeError("runtime init failed for one of the A/B cases")
 
+    hw_before = capture_hardware_snapshot(runtime=rt_on, backend_hint="cuda-native")
+
     on_metrics = _run_decode(rt_on, token_ids, args.decode_steps)
     off_metrics = _run_decode(rt_off, token_ids, args.decode_steps)
+    hw_after = capture_hardware_snapshot(runtime=rt_on, backend_hint="cuda-native")
 
     speedup = (off_metrics["decode_sec"] / on_metrics["decode_sec"]) if on_metrics["decode_sec"] > 0 else 0.0
     delta_pct = ((off_metrics["decode_sec"] - on_metrics["decode_sec"]) / off_metrics["decode_sec"] * 100.0) if off_metrics["decode_sec"] > 0 else 0.0
@@ -104,6 +108,7 @@ def main() -> None:
         "max_layers": args.max_layers,
         "fused_on": on_metrics,
         "fused_off": off_metrics,
+        "hardware": build_hardware_report(hw_before, hw_after),
         "speedup_vs_off": speedup,
         "decode_latency_reduction_pct": delta_pct,
         "kpi_week23_pass": bool(on_metrics["decode_sec"] < off_metrics["decode_sec"]),
@@ -113,6 +118,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
+    print(f"[hardware] {summarize_hardware_usage(hw_after)}")
     print(json.dumps(result, indent=2))
 
 

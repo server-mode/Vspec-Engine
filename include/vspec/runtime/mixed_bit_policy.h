@@ -22,6 +22,14 @@ typedef struct VspecMixedBitPolicy {
     VspecDynamicQuantConfig dyn_cfg;
 } VspecMixedBitPolicy;
 
+typedef struct VspecMixedBitPressureProfile {
+    float vram_pressure;
+    float kv_pressure;
+    float kv_fragmentation;
+    size_t kv_active_tokens;
+    size_t kv_max_tokens;
+} VspecMixedBitPressureProfile;
+
 void vspec_mixed_bit_policy_default(VspecMixedBitPolicy* policy);
 uint8_t vspec_mixed_bit_select_bits(
     const VspecMixedBitRuntime* runtime,
@@ -32,6 +40,18 @@ uint8_t vspec_mixed_bit_select_bits(
     size_t count,
     const VspecMemoryMetrics* metrics,
     const VspecVramBudget* budget
+);
+
+uint8_t vspec_mixed_bit_select_bits_realtime(
+    const VspecMixedBitRuntime* runtime,
+    const VspecMixedBitPolicy* policy,
+    uint32_t layer_id,
+    VspecLayerType type,
+    const float* data,
+    size_t count,
+    const VspecMemoryMetrics* metrics,
+    const VspecVramBudget* budget,
+    const VspecMixedBitPressureProfile* pressure
 );
 
 #endif

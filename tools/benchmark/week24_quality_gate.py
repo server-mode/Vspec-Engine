@@ -20,6 +20,7 @@ from language_stability_guard import LanguageStabilityGuard
 from model_adapters import select_adapter
 from model_loader import build_weight_index, collect_tensor_names, find_snapshot_dir, load_tokenizer, read_config, read_tokenizer_config
 from runtime_inference import build_generic_runtime
+from hardware_telemetry import build_hardware_report, capture_hardware_snapshot, summarize_hardware_usage
 
 
 @dataclass
@@ -58,7 +59,7 @@ def _generate_text(runtime, tokenizer, adapter, tok_cfg: dict, prompt: str, lang
 
     generated = []
     for _ in range(max_steps):
-        logits = runtime.forward_logits(ids)
+        logits = runtime.forward_logits([ids[-1]])
         if not logits:
             break
         next_id = int(np.argmax(np.asarray(logits, dtype=np.float32)))
@@ -122,6 +123,8 @@ def main() -> None:
     if runtime_base is None or runtime_3bit is None:
         raise RuntimeError("runtime init failed")
 
+    hw_before = capture_hardware_snapshot(runtime=runtime_base, backend_hint="cuda-native")
+
     cases = [
         ("en", "Summarize this in one short sentence: Vspec runtime focuses on low-bit native inference."),
         ("vi", "Tóm tắt ngắn: Vspec runtime tập trung vào suy luận native low-bit."),
@@ -155,11 +158,13 @@ def main() -> None:
         "pass_count": pass_count,
         "total_cases": len(outputs),
         "kpi_quality_gate_pass": bool(pass_count == len(outputs)),
+        "hardware": build_hardware_report(hw_before, capture_hardware_snapshot(runtime=runtime_3bit, backend_hint="cuda-native")),
     }
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[hardware] {summarize_hardware_usage(report['hardware']['after'])}")
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
