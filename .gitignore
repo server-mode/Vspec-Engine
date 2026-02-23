@@ -6,3 +6,5 @@ build/
 logs/
 .venv/
 .vscode
+docs/
+struc.md

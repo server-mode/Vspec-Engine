@@ -33,5 +33,6 @@ void vspec_mixed_bit_runtime_add(VspecMixedBitRuntime* rt, uint32_t layer_id, Vs
 void vspec_mixed_bit_runtime_set(VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type, uint8_t bits);
 uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type);
 int vspec_mixed_bit_runtime_get(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type, uint8_t* out_bits);
+uint8_t vspec_mixed_bit_enforce_sub4(uint8_t bits);
 
 #endif

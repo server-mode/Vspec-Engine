@@ -9,6 +9,7 @@ typedef enum VspecHwTuningMode {
     VSPEC_HW_TUNING_PERFORMENT = 0,
     VSPEC_HW_TUNING_BALANCED = 1,
     VSPEC_HW_TUNING_ECO = 2,
+    VSPEC_HW_TUNING_ULTIMATE = 3,
 } VspecHwTuningMode;
 
 typedef enum VspecBackendPreference {
@@ -28,6 +29,14 @@ typedef struct VspecRuntimeHwConfig {
     uint32_t stream_count_hint;
     uint8_t lowbit_target_bits;
     int enable_lowbit_boost;
+
+    int enable_ultimate_mode;
+    int enable_outlier_aware;
+    int enable_qlora_adapter;
+    int prefer_tensor_core;
+    float outlier_threshold;
+    float quality_bias;
+    uint32_t qlora_rank;
 } VspecRuntimeHwConfig;
 
 typedef struct VspecRuntimeHwState {

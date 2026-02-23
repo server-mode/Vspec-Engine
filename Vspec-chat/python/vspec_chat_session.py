@@ -7,6 +7,7 @@ from pathlib import Path
 from chat_prompt import build_prompt
 from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
 from language_stability_guard import LanguageStabilityGuard
+from language_structure_guard import LanguageStructureIntegrityManager
 from model_adapters import select_adapter
 from model_loader import (
     build_weight_index,
@@ -51,6 +52,8 @@ def _generate(
     disable_language_guard: bool,
     language_guard_strictness: float,
     prioritize_english: bool,
+    structure_guard_strictness: float,
+    disable_structure_guard: bool,
 ) -> str:
     prompt_for_model = build_prompt(prompt, adapter.model_type, tok_cfg, lang_mode, chat_format)
     encoded = tokenizer.encode(prompt_for_model)
@@ -84,7 +87,17 @@ def _generate(
             prioritize_english=prioritize_english,
         )
 
-    engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=stream, guard=guard)
+    structure_guard = None
+    if not disable_structure_guard:
+        structure_guard = LanguageStructureIntegrityManager(prompt=prompt, strictness=structure_guard_strictness)
+
+    engine = FastOutputEngine(
+        tokenizer=tokenizer,
+        lang_mode=lang_mode,
+        stream=stream,
+        guard=guard,
+        structure_guard=structure_guard,
+    )
     engine.begin_stream()
     generated = []
     start = time.perf_counter()
@@ -109,6 +122,10 @@ def _generate(
     text = postprocess_output_text(text, prompt, lang_mode)
     tps = (len(generated) / elapsed) if elapsed > 0 else 0.0
     _progress(show_progress, 100, "done", f"{len(generated)} tok | {tps:.2f} tok/s")
+    report = engine.structure_report()
+    if report is not None:
+        print("[session] structure_integrity_pass=", report.get("integrity_pass"))
+        print("[session] structure_section_coverage=", round(float(report.get("section_coverage", 0.0)), 4))
     return text
 
 
@@ -136,6 +153,8 @@ def main() -> None:
     parser.add_argument("--disable-language-guard", action="store_true")
     parser.add_argument("--language-guard-strictness", type=float, default=0.72)
     parser.add_argument("--no-prioritize-english", action="store_true")
+    parser.add_argument("--disable-structure-guard", action="store_true")
+    parser.add_argument("--structure-guard-strictness", type=float, default=0.72)
     args = parser.parse_args()
 
     os.environ["VSPEC_FUSED_BITS"] = str(args.fused_bits)
@@ -221,6 +240,8 @@ def main() -> None:
             disable_language_guard=args.disable_language_guard,
             language_guard_strictness=args.language_guard_strictness,
             prioritize_english=(not args.no_prioritize_english),
+            structure_guard_strictness=args.structure_guard_strictness,
+            disable_structure_guard=args.disable_structure_guard,
         )
         if args.no_stream:
             print("assistant>", out)

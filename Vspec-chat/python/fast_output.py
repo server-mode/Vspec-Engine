@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 
 from language_stability_guard import LanguageStabilityGuard
+from language_structure_guard import LanguageStructureIntegrityManager
 
 try:
     import numpy as np
@@ -31,13 +32,22 @@ def resolve_speed_preset(name: str) -> SpeedPreset:
 
 
 class FastOutputEngine:
-    def __init__(self, tokenizer, lang_mode: str, stream: bool, guard: LanguageStabilityGuard | None = None) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        lang_mode: str,
+        stream: bool,
+        guard: LanguageStabilityGuard | None = None,
+        structure_guard: LanguageStructureIntegrityManager | None = None,
+    ) -> None:
         self.tokenizer = tokenizer
         self.lang_mode = lang_mode
         self.stream = stream
         self.guard = guard
+        self.structure_guard = structure_guard
         self._decoded_cache: dict[int, str] = {}
         self._allowed_cache: dict[int, bool] = {}
+        self._emitted_parts: list[str] = []
 
     def begin_stream(self) -> None:
         if self.stream:
@@ -57,9 +67,12 @@ class FastOutputEngine:
         return text
 
     def stream_token(self, token_id: int) -> None:
+        text = self.token_text(token_id)
+        if self.structure_guard is not None:
+            self.structure_guard.observe_text(text)
+        self._emitted_parts.append(text)
         if not self.stream:
             return
-        text = self.token_text(token_id)
         if text:
             print(text, end="", flush=True)
 
@@ -70,6 +83,9 @@ class FastOutputEngine:
             return self._allowed_cache[token_id]
         text = self.token_text(token_id)
         if self.guard is not None and not self.guard.allow_text(text):
+            self._allowed_cache[token_id] = False
+            return False
+        if self.structure_guard is not None and not self.structure_guard.allow_text(text):
             self._allowed_cache[token_id] = False
             return False
         if self.lang_mode == "auto":
@@ -114,6 +130,8 @@ class FastOutputEngine:
             bonus = _token_quality_bonus(text, self.lang_mode)
             if self.guard is not None:
                 bonus += self.guard.score_adjustment(text)
+            if self.structure_guard is not None:
+                bonus += self.structure_guard.score_adjustment(text)
             scored.append((tid, scaled + bonus))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -132,6 +150,11 @@ class FastOutputEngine:
             if r <= acc:
                 return scored[i][0]
         return scored[-1][0]
+
+    def structure_report(self) -> dict | None:
+        if self.structure_guard is None:
+            return None
+        return self.structure_guard.report()
 
 
 def _topn_indices(values: list[float], n: int) -> list[int]:

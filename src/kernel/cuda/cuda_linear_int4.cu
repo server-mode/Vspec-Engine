@@ -1,8 +1,11 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "vspec/kernel/context.h"
+#include "vspec/kernel/cuda_ultimate.h"
 #include "vspec/quant/quant.h"
 
 #ifndef VSPEC_CUDA_BLOCK_X
@@ -63,6 +66,12 @@ extern "C" int vspec_cuda_runtime_available(void) {
 
 extern "C" void vspec_cuda_launch_linear_impl(VspecKernelContext* ctx) {
     if (!ctx || !ctx->input || !ctx->weight || !ctx->output) {
+        return;
+    }
+
+    const char* ultimate_enabled = getenv("VSPEC_ULTIMATE_ENABLE");
+    if (ultimate_enabled && (strcmp(ultimate_enabled, "1") == 0 || strcmp(ultimate_enabled, "true") == 0)) {
+        vspec_cuda_launch_linear_ultimate(ctx);
         return;
     }
 

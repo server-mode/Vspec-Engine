@@ -19,13 +19,13 @@ static uint8_t vspec_base_bits_from_policy(const VspecMixedBitPolicy* policy, Vs
     if (!policy) {
         switch (type) {
             case VSPEC_LAYER_ATTENTION:
-                return 4;
+                return 3;
             case VSPEC_LAYER_MLP:
                 return 3;
             case VSPEC_LAYER_EMBED:
-                return 8;
+                return 3;
             default:
-                return 4;
+                return 3;
         }
     }
 
@@ -101,11 +101,11 @@ void vspec_mixed_bit_policy_default(VspecMixedBitPolicy* policy) {
     if (!policy) {
         return;
     }
-    policy->attention_bits = 4;
+    policy->attention_bits = 3;
     policy->mlp_bits = 3;
-    policy->embed_bits = 8;
+    policy->embed_bits = 3;
     policy->min_bits = 2;
-    policy->max_bits = 8;
+    policy->max_bits = 3;
     policy->downshift_step = 1;
     policy->pressure_high = 0.80f;
     policy->pressure_critical = 0.92f;
@@ -130,7 +130,16 @@ uint8_t vspec_mixed_bit_select_bits(
 
     uint8_t bits = vspec_base_bits_from_policy(policy, type);
     uint8_t min_bits = policy ? policy->min_bits : 2;
-    uint8_t max_bits = policy ? policy->max_bits : 8;
+    uint8_t max_bits = policy ? policy->max_bits : 3;
+    if (min_bits < 2U) {
+        min_bits = 2U;
+    }
+    if (max_bits > 3U) {
+        max_bits = 3U;
+    }
+    if (min_bits > max_bits) {
+        min_bits = max_bits;
+    }
 
     if (data && count > 0U) {
         VspecDynamicQuantConfig cfg = policy ? policy->dyn_cfg : (VspecDynamicQuantConfig){2, 4, 64};
@@ -179,6 +188,15 @@ uint8_t vspec_mixed_bit_select_bits_realtime(
 ) {
     uint8_t bits = vspec_mixed_bit_select_bits(runtime, policy, layer_id, type, data, count, metrics, budget);
     uint8_t min_bits = policy ? policy->min_bits : 2U;
-    uint8_t max_bits = policy ? policy->max_bits : 8U;
+    uint8_t max_bits = policy ? policy->max_bits : 3U;
+    if (min_bits < 2U) {
+        min_bits = 2U;
+    }
+    if (max_bits > 3U) {
+        max_bits = 3U;
+    }
+    if (min_bits > max_bits) {
+        min_bits = max_bits;
+    }
     return vspec_apply_realtime_pressure_downshift(bits, policy, pressure, min_bits, max_bits);
 }

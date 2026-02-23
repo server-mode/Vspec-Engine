@@ -60,6 +60,10 @@ add_library(vspec_engine
     src/memory/vram_scheduler.c
     src/runtime/runtime.c
     src/runtime/hw_performance_manager.c
+    src/runtime/language_structure_guard.c
+    src/runtime/runtime_behavior_monitor.c
+    src/runtime/ultimate_optimizer.c
+    src/runtime/qlora_adapter.c
     src/runtime/mixed_bit.c
     src/runtime/mixed_bit_runtime.c
     src/runtime/mixed_bit_policy.c
@@ -68,10 +72,13 @@ add_library(vspec_engine
 )
 
 if(VSPEC_HAS_CUDA)
+    find_package(CUDAToolkit)
+
     target_sources(vspec_engine PRIVATE
         src/kernel/cuda/cuda_linear_int4.cu
         src/kernel/cuda/fused_linear_int4.cu
         src/kernel/cuda/fused_linear_int3.cu
+        src/kernel/cuda/cuda_ultimate_branch.cu
         src/kernel/cuda/attention_fused.cu
         src/kernel/cuda/autotune.cu
         src/kernel/cuda/cuda_rmsnorm_f32.cu
@@ -81,6 +88,13 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/cuda_elemwise_f32.cu
     )
     set_target_properties(vspec_engine PROPERTIES CUDA_STANDARD 14)
+
+    if (CUDAToolkit_FOUND)
+        target_link_libraries(vspec_engine PRIVATE CUDA::cublas)
+        target_compile_definitions(vspec_engine PRIVATE VSPEC_USE_CUBLAS=1)
+    else()
+        target_compile_definitions(vspec_engine PRIVATE VSPEC_USE_CUBLAS=0)
+    endif()
 endif()
 
 target_compile_definitions(vspec_engine PUBLIC VSPEC_HAS_CUDA=${VSPEC_HAS_CUDA})
@@ -123,7 +137,6 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/fused_linear_int3.cu
     )
 
-    find_package(CUDAToolkit)
     if (CUDAToolkit_FOUND)
         target_link_libraries(vspec_cuda_bridge PRIVATE CUDA::cublas)
     endif()
@@ -180,6 +193,18 @@ add_executable(vspec_benchmark
 
 target_link_libraries(vspec_benchmark PRIVATE vspec_engine)
 
+add_executable(vspec_ultimate_quality_benchmark
+    tools/benchmark/ultimate_quality_benchmark.c
+)
+
+target_link_libraries(vspec_ultimate_quality_benchmark PRIVATE vspec_engine)
+
+add_executable(vspec_qlora_manifest_smoke
+    tools/benchmark/qlora_manifest_smoke.c
+)
+
+target_link_libraries(vspec_qlora_manifest_smoke PRIVATE vspec_engine)
+
 add_executable(vspec_week25_scheduler_stress
     tools/benchmark/week25_memory_scheduler_stress.c
 )
@@ -234,6 +259,12 @@ if(VSPEC_HAS_CUDA)
     )
 
     target_link_libraries(vspec_cuda_fused_benchmark PRIVATE vspec_engine)
+
+    add_executable(vspec_unified_runtime_benchmark
+        tools/benchmark/unified_runtime_benchmark.c
+    )
+
+    target_link_libraries(vspec_unified_runtime_benchmark PRIVATE vspec_engine)
 endif()
 
 add_executable(vspec_validation_demo

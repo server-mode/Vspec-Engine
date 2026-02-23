@@ -22,6 +22,7 @@ from chat_prompt import build_prompt
 from vspec_cuda_bridge import cuda_mem_info
 from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
 from language_stability_guard import LanguageStabilityGuard
+from language_structure_guard import LanguageStructureIntegrityManager
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
 
 
@@ -183,6 +184,11 @@ def sample_from_logits(
     if top_k > 0 and len(allowed_ids) > top_k:
         allowed_ids = allowed_ids[:top_k]
 
+    if greedy:
+        if allowed_ids:
+            return allowed_ids[0]
+        return sorted_ids[0]
+
     scored = []
     for tid in allowed_ids:
         text = tokenizer.decode([tid]) if tokenizer is not None else ""
@@ -191,9 +197,6 @@ def sample_from_logits(
     scored.sort(key=lambda x: x[1], reverse=True)
     allowed_ids = [tid for tid, _ in scored]
     allowed_logits = [score for _, score in scored]
-
-    if greedy:
-        return allowed_ids[0]
 
     max_logit = max(allowed_logits)
     exp_vals = [math.exp(v - max_logit) for v in allowed_logits]
@@ -236,6 +239,8 @@ def main() -> None:
     parser.add_argument("--disable-language-guard", action="store_true", help="Disable Language Stability Guard")
     parser.add_argument("--language-guard-strictness", type=float, default=0.72, help="0..1, higher is stricter against language/script drift")
     parser.add_argument("--no-prioritize-english", action="store_true", help="Disable English-first fallback when language is ambiguous")
+    parser.add_argument("--disable-structure-guard", action="store_true", help="Disable output structure integrity guard")
+    parser.add_argument("--structure-guard-strictness", type=float, default=0.72, help="0..1, higher is stricter for structural integrity")
     args = parser.parse_args()
 
     os.environ["VSPEC_FUSED_BITS"] = str(args.fused_bits)
@@ -293,7 +298,20 @@ def main() -> None:
             prioritize_english=(not args.no_prioritize_english),
         )
 
-    fast_engine = FastOutputEngine(tokenizer=tokenizer, lang_mode=lang_mode, stream=(not args.no_stream), guard=guard)
+    structure_guard = None
+    if not args.disable_structure_guard:
+        structure_guard = LanguageStructureIntegrityManager(
+            prompt=args.prompt,
+            strictness=args.structure_guard_strictness,
+        )
+
+    fast_engine = FastOutputEngine(
+        tokenizer=tokenizer,
+        lang_mode=lang_mode,
+        stream=(not args.no_stream),
+        guard=guard,
+        structure_guard=structure_guard,
+    )
 
     prompt_for_model = build_prompt(args.prompt, adapter.model_type, tok_cfg, lang_mode, args.chat_format)
 
@@ -311,10 +329,14 @@ def main() -> None:
     print("[vspec-chat] speed_preset=", args.speed_preset)
     print("[vspec-chat] fused_bits=", args.fused_bits)
     print("[vspec-chat] language_guard=", "on" if guard is not None else "off")
+    print("[vspec-chat] structure_guard=", "on" if structure_guard is not None else "off")
     if guard is not None:
         print("[vspec-chat] language_guard_primary_script=", guard.profile.primary_script)
         print("[vspec-chat] language_guard_strictness=", round(guard.profile.strictness, 3))
         print("[vspec-chat] language_guard_prioritize_english=", guard.profile.prioritized_english)
+    if structure_guard is not None:
+        print("[vspec-chat] structure_guard_expected_sections=", structure_guard.profile.expected_sections)
+        print("[vspec-chat] structure_guard_strictness=", round(structure_guard.profile.strictness, 3))
     print("[vspec-chat] decode_top_k=", effective_top_k)
     print("[vspec-chat] decode_lang_top_n=", effective_lang_top_n)
 
@@ -435,6 +457,13 @@ def main() -> None:
     if args.no_stream:
         print("[vspec-chat] output:")
         print(text)
+
+    structure_report = fast_engine.structure_report()
+    if structure_report is not None:
+        print("[vspec-chat] structure_guard_integrity_pass=", structure_report.get("integrity_pass"))
+        print("[vspec-chat] structure_guard_section_coverage=", round(float(structure_report.get("section_coverage", 0.0)), 4))
+        print("[vspec-chat] structure_guard_code_fence_balanced=", structure_report.get("code_fence_balanced"))
+        print("[vspec-chat] structure_guard_seen_sections=", structure_report.get("seen_sections"))
 
     elapsed = time.perf_counter() - start_ts
     vram_after = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None

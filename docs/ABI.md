@@ -1,4 +1,6 @@
-# Vspec Backend ABI Contract (Draft)
+# Vspec Backend ABI Contract (Frozen for Phase 4 RC)
+
+Freeze date: 2026-02-22
 
 ## ABI Version
 

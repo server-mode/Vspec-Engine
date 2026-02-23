@@ -1,5 +1,15 @@
 #include "vspec/runtime/mixed_bit_runtime.h"
 
+uint8_t vspec_mixed_bit_enforce_sub4(uint8_t bits) {
+    if (bits > 3U) {
+        return 3U;
+    }
+    if (bits < 2U) {
+        return 2U;
+    }
+    return bits;
+}
+
 void vspec_mixed_bit_runtime_init(VspecMixedBitRuntime* rt) {
     if (!rt) {
         return;
@@ -21,6 +31,8 @@ void vspec_mixed_bit_runtime_set(VspecMixedBitRuntime* rt, uint32_t layer_id, Vs
             return;
         }
     }
+
+    bits = vspec_mixed_bit_enforce_sub4(bits);
 
     for (size_t i = 0; i < rt->layer_count; ++i) {
         VspecLayerBitConfig* cfg = &rt->layers[i];
@@ -48,7 +60,7 @@ void vspec_mixed_bit_runtime_set(VspecMixedBitRuntime* rt, uint32_t layer_id, Vs
 
 uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type) {
     if (!rt) {
-        return 4;
+        return 3;
     }
 
     if (rt->has_last_lookup && rt->last_lookup_layer_id == layer_id && rt->last_lookup_type == type) {
@@ -64,13 +76,13 @@ uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, u
 
     switch (type) {
         case VSPEC_LAYER_ATTENTION:
-            return 4;
+            return 3;
         case VSPEC_LAYER_MLP:
             return 3;
         case VSPEC_LAYER_EMBED:
-            return 8;
+            return 3;
         default:
-            return 4;
+            return 3;
     }
 }
 
@@ -80,14 +92,14 @@ int vspec_mixed_bit_runtime_get(const VspecMixedBitRuntime* rt, uint32_t layer_i
     }
 
     if (rt->has_last_lookup && rt->last_lookup_layer_id == layer_id && rt->last_lookup_type == type) {
-        *out_bits = rt->last_lookup_bits;
+        *out_bits = vspec_mixed_bit_enforce_sub4(rt->last_lookup_bits);
         return 1;
     }
 
     for (size_t i = 0; i < rt->layer_count; ++i) {
         const VspecLayerBitConfig* cfg = &rt->layers[i];
         if (cfg->layer_id == layer_id && cfg->type == type) {
-            *out_bits = cfg->bits;
+            *out_bits = vspec_mixed_bit_enforce_sub4(cfg->bits);
             return 1;
         }
     }

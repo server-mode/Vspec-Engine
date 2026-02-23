@@ -78,29 +78,47 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
 
-    float* d_a = NULL;
-    uint8_t* d_b = NULL;
-    float* d_s = NULL;
-    float* d_c = NULL;
+    static float* d_a = NULL;
+    static uint8_t* d_b = NULL;
+    static float* d_s = NULL;
+    static float* d_c = NULL;
+    static size_t cap_a = 0U;
+    static size_t cap_b = 0U;
+    static size_t cap_s = 0U;
+    static size_t cap_c = 0U;
 
-    if (cudaMalloc((void**)&d_a, bytes_a) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_b, bytes_b) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_s, bytes_s) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_c, bytes_c) != cudaSuccess) goto cleanup;
+    if (cap_a < bytes_a) {
+        if (d_a) cudaFree(d_a);
+        d_a = NULL;
+        if (cudaMalloc((void**)&d_a, bytes_a) != cudaSuccess) return;
+        cap_a = bytes_a;
+    }
+    if (cap_b < bytes_b) {
+        if (d_b) cudaFree(d_b);
+        d_b = NULL;
+        if (cudaMalloc((void**)&d_b, bytes_b) != cudaSuccess) return;
+        cap_b = bytes_b;
+    }
+    if (cap_s < bytes_s) {
+        if (d_s) cudaFree(d_s);
+        d_s = NULL;
+        if (cudaMalloc((void**)&d_s, bytes_s) != cudaSuccess) return;
+        cap_s = bytes_s;
+    }
+    if (cap_c < bytes_c) {
+        if (d_c) cudaFree(d_c);
+        d_c = NULL;
+        if (cudaMalloc((void**)&d_c, bytes_c) != cudaSuccess) return;
+        cap_c = bytes_c;
+    }
 
-    if (cudaMemcpy(d_a, ctx->input, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-    if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-    if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
+    if (cudaMemcpy(d_a, ctx->input, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) return;
+    if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) return;
+    if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) return;
 
     vspec_cuda_fused_linear_int4_device(d_a, d_b, d_s, d_c, m, n, k);
 
-    if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
+    if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);
-
-cleanup:
-    if (d_c) cudaFree(d_c);
-    if (d_s) cudaFree(d_s);
-    if (d_b) cudaFree(d_b);
-    if (d_a) cudaFree(d_a);
 }
 

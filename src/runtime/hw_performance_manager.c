@@ -77,6 +77,8 @@ static void vspec_parse_tuning_mode(const char* value, VspecRuntimeHwConfig* con
         config->tuning_mode = VSPEC_HW_TUNING_BALANCED;
     } else if (vspec_equals_ignore_case(value, "eco")) {
         config->tuning_mode = VSPEC_HW_TUNING_ECO;
+    } else if (vspec_equals_ignore_case(value, "ultimate")) {
+        config->tuning_mode = VSPEC_HW_TUNING_ULTIMATE;
     }
 }
 
@@ -101,12 +103,20 @@ void vspec_runtime_hw_config_default(VspecRuntimeHwConfig* config) {
 
     config->tuning_mode = VSPEC_HW_TUNING_PERFORMENT;
     config->backend_preference = VSPEC_BACKEND_PREFERENCE_AUTO;
-    config->target_gpu_utilization = 0.96f;
-    config->max_vram_utilization = 0.95f;
-    config->dispatch_batch_hint = 8U;
-    config->stream_count_hint = 4U;
+    config->target_gpu_utilization = 0.98f;
+    config->max_vram_utilization = 0.96f;
+    config->dispatch_batch_hint = 12U;
+    config->stream_count_hint = 6U;
     config->lowbit_target_bits = 3U;
     config->enable_lowbit_boost = 1;
+
+    config->enable_ultimate_mode = 0;
+    config->enable_outlier_aware = 1;
+    config->enable_qlora_adapter = 0;
+    config->prefer_tensor_core = 1;
+    config->outlier_threshold = 6.0f;
+    config->quality_bias = 0.75f;
+    config->qlora_rank = 16U;
 }
 
 int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* out_config) {
@@ -154,12 +164,38 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
         } else if (vspec_equals_ignore_case(key, "stream_count_hint")) {
             out_config->stream_count_hint = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 1U, 32U);
         } else if (vspec_equals_ignore_case(key, "lowbit_target_bits")) {
-            out_config->lowbit_target_bits = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 2U, 4U);
+            out_config->lowbit_target_bits = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 2U, 3U);
         } else if (vspec_equals_ignore_case(key, "enable_lowbit_boost")) {
             out_config->enable_lowbit_boost =
                 (vspec_equals_ignore_case(value, "1") ||
                  vspec_equals_ignore_case(value, "true") ||
                  vspec_equals_ignore_case(value, "yes")) ? 1 : 0;
+        } else if (vspec_equals_ignore_case(key, "enable_ultimate_mode")) {
+            out_config->enable_ultimate_mode =
+                (vspec_equals_ignore_case(value, "1") ||
+                 vspec_equals_ignore_case(value, "true") ||
+                 vspec_equals_ignore_case(value, "yes")) ? 1 : 0;
+        } else if (vspec_equals_ignore_case(key, "enable_outlier_aware")) {
+            out_config->enable_outlier_aware =
+                (vspec_equals_ignore_case(value, "1") ||
+                 vspec_equals_ignore_case(value, "true") ||
+                 vspec_equals_ignore_case(value, "yes")) ? 1 : 0;
+        } else if (vspec_equals_ignore_case(key, "enable_qlora_adapter")) {
+            out_config->enable_qlora_adapter =
+                (vspec_equals_ignore_case(value, "1") ||
+                 vspec_equals_ignore_case(value, "true") ||
+                 vspec_equals_ignore_case(value, "yes")) ? 1 : 0;
+        } else if (vspec_equals_ignore_case(key, "prefer_tensor_core")) {
+            out_config->prefer_tensor_core =
+                (vspec_equals_ignore_case(value, "1") ||
+                 vspec_equals_ignore_case(value, "true") ||
+                 vspec_equals_ignore_case(value, "yes")) ? 1 : 0;
+        } else if (vspec_equals_ignore_case(key, "outlier_threshold")) {
+            out_config->outlier_threshold = vspec_clamp_float((float)atof(value), 2.0f, 20.0f);
+        } else if (vspec_equals_ignore_case(key, "quality_bias")) {
+            out_config->quality_bias = vspec_clamp_float((float)atof(value), 0.0f, 1.0f);
+        } else if (vspec_equals_ignore_case(key, "qlora_rank")) {
+            out_config->qlora_rank = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 0U, 256U);
         }
     }
 
@@ -172,8 +208,18 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
         if (out_config->stream_count_hint < 4U) {
             out_config->stream_count_hint = 4U;
         }
-        out_config->lowbit_target_bits = vspec_clamp_u8(out_config->lowbit_target_bits, 2U, 4U);
+        out_config->lowbit_target_bits = vspec_clamp_u8(out_config->lowbit_target_bits, 2U, 3U);
         out_config->target_gpu_utilization = vspec_clamp_float(out_config->target_gpu_utilization, 0.90f, 1.00f);
+    } else if (out_config->tuning_mode == VSPEC_HW_TUNING_ULTIMATE) {
+        out_config->enable_ultimate_mode = 1;
+        out_config->enable_outlier_aware = 1;
+        out_config->prefer_tensor_core = 1;
+        out_config->enable_qlora_adapter = 1;
+        out_config->target_gpu_utilization = vspec_clamp_float(out_config->target_gpu_utilization, 0.85f, 1.00f);
+        out_config->quality_bias = vspec_clamp_float(out_config->quality_bias, 0.60f, 1.00f);
+        if (out_config->qlora_rank < 8U) {
+            out_config->qlora_rank = 8U;
+        }
     }
 
     return 1;
