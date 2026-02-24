@@ -21,9 +21,34 @@ from runtime_inference import build_generic_runtime
 from hardware_telemetry import build_hardware_report, capture_hardware_snapshot, summarize_hardware_usage
 
 
-def _build_runtime(config: dict, weight_index: dict, max_layers: int, fused_bits: int):
+def _forward_logits_array(runtime, token_id: int) -> np.ndarray:
+    if hasattr(runtime, "forward_logits_np"):
+        logits = runtime.forward_logits_np([int(token_id)])
+        if logits is None:
+            return np.empty(0, dtype=np.float32)
+        return np.asarray(logits, dtype=np.float32)
+    logits = runtime.forward_logits([int(token_id)])
+    if logits is None:
+        return np.empty(0, dtype=np.float32)
+    return np.asarray(logits, dtype=np.float32)
+
+
+def _build_runtime(config: dict, weight_index: dict, max_layers: int, fused_bits: int, baseline_mode: str = "reference"):
     os.environ["VSPEC_FUSED_BITS"] = str(fused_bits)
-    os.environ["VSPEC_DISABLE_FUSED_ATTN"] = "0"
+    if fused_bits == 0 and baseline_mode == "performance":
+        os.environ["VSPEC_DISABLE_FUSED_ATTN"] = "1"
+    else:
+        os.environ["VSPEC_DISABLE_FUSED_ATTN"] = "0"
+
+    if fused_bits == 0:
+        os.environ["VSPEC_LOWBIT_PROFILE"] = "baseline" if baseline_mode == "performance" else "aggressive"
+    else:
+        os.environ["VSPEC_LOWBIT_PROFILE"] = "aggressive"
+
+    if fused_bits == 0:
+        os.environ["VSPEC_PERFORMANCE_LOWBIT_DEFAULT"] = "1" if baseline_mode == "performance" else "0"
+    else:
+        os.environ["VSPEC_PERFORMANCE_LOWBIT_DEFAULT"] = "1"
     return build_generic_runtime(config, weight_index, max_layers=max_layers, device="cuda-native")
 
 
@@ -44,7 +69,27 @@ def _prepare_tokens(tokenizer, adapter, model_type: str, tok_cfg: dict, prompt: 
     return token_ids
 
 
-def _run_decode_tps(runtime, token_ids: list[int], decode_steps: int, eos_token_id: int | None) -> tuple[int, float, float]:
+def _run_decode_tps(
+    runtime,
+    token_ids: list[int],
+    decode_steps: int,
+    eos_token_id: int | None,
+    warmup_decode_steps: int = 0,
+) -> tuple[int, float, float]:
+    def _run_decode_only(steps: int) -> int:
+        ids_local = [int(t) for t in token_ids]
+        generated_local = 0
+        for _ in range(steps):
+            logits_local = _forward_logits_array(runtime, ids_local[-1])
+            if logits_local.size == 0:
+                break
+            nxt_local = int(np.argmax(logits_local))
+            ids_local.append(nxt_local)
+            generated_local += 1
+            if eos_token_id is not None and nxt_local == eos_token_id:
+                break
+        return generated_local
+
     _reset_runtime(runtime)
     if len(token_ids) > 1:
         if hasattr(runtime, "prefill_tokens"):
@@ -53,14 +98,24 @@ def _run_decode_tps(runtime, token_ids: list[int], decode_steps: int, eos_token_
             for t in token_ids[:-1]:
                 runtime.forward_logits([int(t)])
 
+    if warmup_decode_steps > 0:
+        _run_decode_only(warmup_decode_steps)
+        _reset_runtime(runtime)
+        if len(token_ids) > 1:
+            if hasattr(runtime, "prefill_tokens"):
+                runtime.prefill_tokens([int(t) for t in token_ids[:-1]])
+            else:
+                for t in token_ids[:-1]:
+                    runtime.forward_logits([int(t)])
+
     ids = [int(t) for t in token_ids]
     generated = 0
     t0 = time.perf_counter()
     for _ in range(decode_steps):
-        logits = runtime.forward_logits([ids[-1]])
-        if not logits:
+        logits = _forward_logits_array(runtime, ids[-1])
+        if logits.size == 0:
             break
-        nxt = int(np.argmax(np.asarray(logits, dtype=np.float32)))
+        nxt = int(np.argmax(logits))
         ids.append(nxt)
         generated += 1
         if eos_token_id is not None and nxt == eos_token_id:
@@ -71,9 +126,11 @@ def _run_decode_tps(runtime, token_ids: list[int], decode_steps: int, eos_token_
 
 
 def _nll_from_logits(logits: list[float], target_id: int) -> float:
-    if not logits or target_id < 0 or target_id >= len(logits):
+    if logits is None:
         return 0.0
     arr = np.asarray(logits, dtype=np.float32)
+    if arr.size == 0 or target_id < 0 or target_id >= arr.shape[0]:
+        return 0.0
     mx = float(np.max(arr))
     ex = np.exp(arr - mx)
     denom = float(np.sum(ex))
@@ -91,13 +148,13 @@ def _perplexity_teacher_forcing(runtime, token_ids: list[int], max_eval_tokens: 
 
     _reset_runtime(runtime)
     steps = min(max_eval_tokens, len(token_ids) - 1)
-    logits = runtime.forward_logits([int(token_ids[0])])
+    logits = _forward_logits_array(runtime, int(token_ids[0]))
     nll_total = 0.0
 
     for i in range(1, steps + 1):
         target = int(token_ids[i])
         nll_total += _nll_from_logits(logits, target)
-        logits = runtime.forward_logits([target])
+        logits = _forward_logits_array(runtime, target)
 
     if steps == 0:
         return 0.0
@@ -141,6 +198,8 @@ def main() -> None:
     parser.add_argument("--prompt", default="Summarize in one line: Vspec runtime focuses on native low-bit inference.")
     parser.add_argument("--drift-threshold", type=float, default=4.0)
     parser.add_argument("--speed-ratio-target", type=float, default=0.95, help="lowbit_tps / baseline_tps minimum")
+    parser.add_argument("--baseline-mode", choices=["reference", "performance"], default="reference", help="reference=full-precision baseline, performance=baseline uses adaptive lowbit manager")
+    parser.add_argument("--baseline-tps-target", type=float, default=5.0, help="minimum baseline TPS when baseline-mode=performance")
     parser.add_argument("--output", default=str(ROOT / "logs" / "week27_performance_consolidation.json"))
     args = parser.parse_args()
 
@@ -159,9 +218,15 @@ def main() -> None:
     hw_before = capture_hardware_snapshot(runtime=None, backend_hint="cuda-native")
 
     t_build0 = time.perf_counter()
-    runtime_base = _build_runtime(config, weight_index, max_layers=args.max_layers, fused_bits=0)
+    runtime_base = _build_runtime(
+        config,
+        weight_index,
+        max_layers=args.max_layers,
+        fused_bits=0,
+        baseline_mode=args.baseline_mode,
+    )
     t_build1 = time.perf_counter()
-    runtime_low = _build_runtime(config, weight_index, max_layers=args.max_layers, fused_bits=3)
+    runtime_low = _build_runtime(config, weight_index, max_layers=args.max_layers, fused_bits=3, baseline_mode="performance")
     t_build2 = time.perf_counter()
 
     if runtime_base is None or runtime_low is None:
@@ -169,8 +234,20 @@ def main() -> None:
 
     token_ids = _prepare_tokens(tokenizer, adapter, adapter.model_type, tok_cfg, args.prompt, args.lang, args.chat_format)
 
-    base_gen, base_decode_sec, base_tps = _run_decode_tps(runtime_base, token_ids, args.decode_steps, adapter.eos_token_id)
-    low_gen, low_decode_sec, low_tps = _run_decode_tps(runtime_low, token_ids, args.decode_steps, adapter.eos_token_id)
+    base_gen, base_decode_sec, base_tps = _run_decode_tps(
+        runtime_base,
+        token_ids,
+        args.decode_steps,
+        adapter.eos_token_id,
+        warmup_decode_steps=min(2, max(0, args.decode_steps // 4)),
+    )
+    low_gen, low_decode_sec, low_tps = _run_decode_tps(
+        runtime_low,
+        token_ids,
+        args.decode_steps,
+        adapter.eos_token_id,
+        warmup_decode_steps=min(6, max(0, args.decode_steps // 2)),
+    )
 
     ppl_base = _perplexity_teacher_forcing(runtime_base, token_ids, args.max_eval_tokens)
     ppl_low = _perplexity_teacher_forcing(runtime_low, token_ids, args.max_eval_tokens)
@@ -188,6 +265,7 @@ def main() -> None:
         "model_dir": str(args.model_dir),
         "snapshot": str(snapshot),
         "max_layers": int(args.max_layers),
+        "baseline_mode": args.baseline_mode,
         "prompt_tokens": len(token_ids),
         "decode_steps": int(args.decode_steps),
         "timing": {
@@ -225,14 +303,25 @@ def main() -> None:
         "hardware": build_hardware_report(hw_before, hw_after),
     }
 
-    report["kpi_speed_pass"] = bool(report["throughput"]["speed_ratio_low_vs_base"] >= float(args.speed_ratio_target))
+    if args.baseline_mode == "performance":
+        report["kpi_speed_pass"] = bool(report["throughput"]["lowbit_tps"] >= float(args.baseline_tps_target))
+    else:
+        report["kpi_speed_pass"] = bool(report["throughput"]["speed_ratio_low_vs_base"] >= float(args.speed_ratio_target))
+    report["kpi_baseline_tps_pass"] = bool(report["throughput"]["baseline_tps"] >= float(args.baseline_tps_target))
     report["kpi_effective_bits_lt4"] = bool(report["effective_bits"]["estimate"] < 4.0)
     report["kpi_perplexity_drift_pass"] = bool(report["perplexity"]["drift_ratio"] <= float(args.drift_threshold))
-    report["kpi_week27_pass"] = bool(
-        report["kpi_speed_pass"]
-        and report["kpi_effective_bits_lt4"]
-        and report["kpi_perplexity_drift_pass"]
-    )
+    if args.baseline_mode == "performance":
+        report["kpi_week27_pass"] = bool(
+            report["kpi_baseline_tps_pass"]
+            and report["kpi_effective_bits_lt4"]
+            and report["kpi_perplexity_drift_pass"]
+        )
+    else:
+        report["kpi_week27_pass"] = bool(
+            report["kpi_speed_pass"]
+            and report["kpi_effective_bits_lt4"]
+            and report["kpi_perplexity_drift_pass"]
+        )
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

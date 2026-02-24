@@ -64,6 +64,8 @@ except Exception:  # pragma: no cover - optional dependency
 
 from model_adapters import ModelAdapter
 from model_loader import WeightInfo
+from runtime_baseline_manager import resolve_runtime_baseline_plan
+from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
 
 
 def _softmax(x: "np.ndarray") -> "np.ndarray":
@@ -230,15 +232,20 @@ class SimpleRuntime:
     lm_head: "np.ndarray"
     eos_token_id: Optional[int]
 
-    def forward_logits(self, token_ids: list[int]) -> list[float]:
+    def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
         if np is None:
-            return []
+            return []  # type: ignore[return-value]
         if not token_ids:
             token_ids = [0]
         embed_tokens = self.embed[token_ids]
         pooled = np.mean(embed_tokens, axis=0)
         logits = pooled @ self.lm_head
-        return logits.astype(float).tolist()
+        return logits.astype(np.float32, copy=False)
+
+    def forward_logits(self, token_ids: list[int]) -> list[float]:
+        if np is None:
+            return []
+        return self.forward_logits_np(token_ids).astype(float, copy=False).tolist()
 
 
 @dataclass
@@ -279,13 +286,16 @@ class GenericTransformerRuntime:
     position: int
     cache_k: list["np.ndarray"]
     cache_v: list["np.ndarray"]
+    cache_len: list[int]
     use_native_cuda_norm: bool
     fused_bits: int
     disable_fused_attention: bool
+    inv_sqrt_head_dim: float
+    lowbit_plan: LowbitModulePlan
 
-    def _forward_token(self, token_id: int, return_logits: bool) -> Optional[list[float]]:
+    def _forward_token(self, token_id: int, return_logits: bool) -> Optional["np.ndarray"]:
         if np is None:
-            return [] if return_logits else None
+            return np.array([], dtype=np.float32) if return_logits else None
 
         x = self.embed[token_id].astype(np.float32)
 
@@ -296,15 +306,15 @@ class GenericTransformerRuntime:
                 x_norm = _rms_norm(x, layer.norm1, self.rms_eps, layer.norm1_bias)
 
             def _linear_native(vec: "np.ndarray", w: "np.ndarray", key: str) -> "np.ndarray":
-                if self.use_native_cuda_norm and self.fused_bits in {3, 4} and key in layer.packed:
-                    packed_w, scales, bits, out_n = layer.packed[key]
-                    if bits == 4 and fused_linear_int4_available():
-                        return fused_linear_int4(vec, packed_w, scales, out_n)[0]
-                    if bits == 3 and fused_linear_int3_available():
-                        return fused_linear_int3(vec, packed_w, scales, out_n)[0]
-                if self.use_native_cuda_norm and gemm_f32_available():
-                    return gemm_f32(vec, w)[0]
-                return vec @ w.T
+                return lowbit_linear_project(
+                    vec=vec,
+                    w=w,
+                    key=key,
+                    layer_idx=idx,
+                    packed=layer.packed,
+                    use_native_cuda_norm=self.use_native_cuda_norm,
+                    lowbit_plan=self.lowbit_plan,
+                )
 
             q = _linear_native(x_norm, layer.wq, "wq")
             k = _linear_native(x_norm, layer.wk, "wk")
@@ -323,32 +333,49 @@ class GenericTransformerRuntime:
 
             q, k = _apply_rotary(q, k, self.position, self.rope_theta)
 
-            if self.num_kv_heads != self.num_heads:
-                repeat = self.num_heads // self.num_kv_heads
-                k = np.repeat(k, repeat, axis=0)
-                v = np.repeat(v, repeat, axis=0)
-
             if len(self.cache_k) <= idx:
-                self.cache_k.append(k[None, ...])
-                self.cache_v.append(v[None, ...])
+                init_cap = 16
+                k_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                v_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                k_buf[0] = k
+                v_buf[0] = v
+                self.cache_k.append(k_buf)
+                self.cache_v.append(v_buf)
+                if len(self.cache_len) <= idx:
+                    self.cache_len.append(1)
+                else:
+                    self.cache_len[idx] = 1
             else:
-                self.cache_k[idx] = np.concatenate([self.cache_k[idx], k[None, ...]], axis=0)
-                self.cache_v[idx] = np.concatenate([self.cache_v[idx], v[None, ...]], axis=0)
+                used = self.cache_len[idx]
+                cap = self.cache_k[idx].shape[0]
+                if used >= cap:
+                    new_cap = cap * 2
+                    k_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                    v_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                    k_new[:used] = self.cache_k[idx][:used]
+                    v_new[:used] = self.cache_v[idx][:used]
+                    self.cache_k[idx] = k_new
+                    self.cache_v[idx] = v_new
+                self.cache_k[idx][used] = k
+                self.cache_v[idx][used] = v
+                self.cache_len[idx] = used + 1
 
-            keys = self.cache_k[idx]
-            values = self.cache_v[idx]
+            used_len = self.cache_len[idx]
+            keys = self.cache_k[idx][:used_len]
+            values = self.cache_v[idx][:used_len]
 
             attn_out = []
             for h in range(self.num_heads):
                 qh = q[h]
-                kh = keys[:, h, :]
-                vh = values[:, h, :]
+                kv_h = h if self.num_kv_heads == self.num_heads else (h % self.num_kv_heads)
+                kh = keys[:, kv_h, :]
+                vh = values[:, kv_h, :]
                 if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
                     attn_out.append(attention_fused_single_f32(qh, kh, vh))
                 elif self.use_native_cuda_norm and attention_single_f32_available():
                     attn_out.append(attention_single_f32(qh, kh, vh))
                 else:
-                    scores = (kh @ qh) / np.sqrt(self.head_dim)
+                    scores = (kh @ qh) * self.inv_sqrt_head_dim
                     scores = scores.reshape(1, -1)
                     probs = _softmax(scores)[0]
                     attn_out.append(probs @ vh)
@@ -398,7 +425,7 @@ class GenericTransformerRuntime:
             logits = gemm_f32(x_last, self.lm_head)[0]
         else:
             logits = x_last @ self.lm_head
-        return logits.astype(float).tolist()
+        return logits.astype(np.float32, copy=False)
 
     def prefill_tokens(self, token_ids: list[int]) -> None:
         if np is None or not token_ids:
@@ -409,7 +436,18 @@ class GenericTransformerRuntime:
     def forward_logits(self, token_ids: list[int]) -> list[float]:
         if np is None or not token_ids:
             return []
-        return self._forward_token(int(token_ids[-1]), return_logits=True) or []
+        logits = self._forward_token(int(token_ids[-1]), return_logits=True)
+        if logits is None or logits.size == 0:
+            return []
+        return logits.astype(float, copy=False).tolist()
+
+    def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
+        if np is None or not token_ids:
+            return np.array([], dtype=np.float32)
+        logits = self._forward_token(int(token_ids[-1]), return_logits=True)
+        if logits is None:
+            return np.array([], dtype=np.float32)
+        return logits
 
 
 @dataclass
@@ -428,9 +466,9 @@ class GenericTransformerRuntimeTorch:
     cache_k: list["torch.Tensor"]
     cache_v: list["torch.Tensor"]
 
-    def _forward_token(self, token_id: int, return_logits: bool) -> Optional[list[float]]:
+    def _forward_token(self, token_id: int, return_logits: bool) -> Optional["torch.Tensor"]:
         if torch is None:
-            return [] if return_logits else None
+            return torch.empty(0, dtype=torch.float32) if return_logits else None
 
         x = self.embed[token_id]
 
@@ -506,7 +544,7 @@ class GenericTransformerRuntimeTorch:
 
         x_last = _rms_norm_torch(x, self.final_norm, self.rms_eps, None)
         logits = _matmul_with_weight_dtype(x_last, self.lm_head)
-        return logits.float().cpu().tolist()
+        return logits.float()
 
     def prefill_tokens(self, token_ids: list[int]) -> None:
         if torch is None or not token_ids:
@@ -519,7 +557,21 @@ class GenericTransformerRuntimeTorch:
         if torch is None or not token_ids:
             return []
         with torch.no_grad():
-            return self._forward_token(int(token_ids[-1]), return_logits=True) or []
+            logits = self._forward_token(int(token_ids[-1]), return_logits=True)
+        if logits is None or logits.numel() == 0:
+            return []
+        return logits.cpu().tolist()
+
+    def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
+        if torch is None or np is None or not token_ids:
+            if np is None:
+                return []  # type: ignore[return-value]
+            return np.array([], dtype=np.float32)
+        with torch.no_grad():
+            logits = self._forward_token(int(token_ids[-1]), return_logits=True)
+        if logits is None or logits.numel() == 0:
+            return np.array([], dtype=np.float32)
+        return logits.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def _load_tensor(info: WeightInfo) -> Optional["np.ndarray"]:
@@ -612,7 +664,7 @@ def _load_first_available_torch(weight_index: dict[str, WeightInfo], name: str, 
     return _load_tensor_torch(info, device)
 
 
-def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int) -> Optional[LayerWeights]:
+def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits: int) -> Optional[LayerWeights]:
     prefix = f"model.layers.{layer_idx}."
 
     q = _load_first_available(weight_index, prefix + "self_attn.q_proj.weight")
@@ -680,7 +732,6 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int) -> Optional
         norm2_bias=n2_bias,
     )
 
-    fused_bits = int(os.getenv("VSPEC_FUSED_BITS", "0") or "0")
     if fused_bits in {3, 4}:
         for key, w in {
             "wq": layer.wq,
@@ -810,11 +861,26 @@ def _load_generic_transformer(
     if max_layers:
         num_layers = min(num_layers, max_layers)
 
+    env_override = int(os.getenv("VSPEC_FUSED_BITS", "0") or "0")
+    if env_override in {3, 4}:
+        fused_bits = env_override
+    else:
+        baseline_plan = resolve_runtime_baseline_plan(
+            config=config,
+            use_native_cuda_norm=use_native_cuda_norm,
+            int3_available=fused_linear_int3_available(),
+            int4_available=fused_linear_int4_available(),
+        )
+        fused_bits = baseline_plan.fused_bits
+
+    lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
+    fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
+
     layers: list[LayerWeights] = []
     if progress_cb is not None:
         progress_cb("layer_load", 0, num_layers)
     for idx in range(num_layers):
-        layer = _load_layer(weight_index, idx)
+        layer = _load_layer(weight_index, idx, fused_bits)
         if layer is None:
             break
         layers.append(layer)
@@ -850,9 +916,12 @@ def _load_generic_transformer(
         position=0,
         cache_k=[],
         cache_v=[],
+        cache_len=[],
         use_native_cuda_norm=use_native_cuda_norm,
-        fused_bits=int(os.getenv("VSPEC_FUSED_BITS", "0") or "0"),
+        fused_bits=fused_bits,
         disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
+        inv_sqrt_head_dim=(1.0 / np.sqrt(float(head_dim))),
+        lowbit_plan=lowbit_plan,
     )
 
 

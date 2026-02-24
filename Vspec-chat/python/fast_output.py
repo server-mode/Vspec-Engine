@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
+from meaningful_output_guard import MeaningfulOutputGuard
+from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 
 try:
     import numpy as np
@@ -45,6 +47,7 @@ class FastOutputEngine:
         self.stream = stream
         self.guard = guard
         self.structure_guard = structure_guard
+        self.meaning_guard = MeaningfulOutputGuard(lang_mode)
         self._decoded_cache: dict[int, str] = {}
         self._allowed_cache: dict[int, bool] = {}
         self._emitted_parts: list[str] = []
@@ -70,6 +73,7 @@ class FastOutputEngine:
         text = self.token_text(token_id)
         if self.structure_guard is not None:
             self.structure_guard.observe_text(text)
+        self.meaning_guard.observe_text(text)
         self._emitted_parts.append(text)
         if not self.stream:
             return
@@ -86,6 +90,9 @@ class FastOutputEngine:
             self._allowed_cache[token_id] = False
             return False
         if self.structure_guard is not None and not self.structure_guard.allow_text(text):
+            self._allowed_cache[token_id] = False
+            return False
+        if not self.meaning_guard.allow_text(text):
             self._allowed_cache[token_id] = False
             return False
         if self.lang_mode == "auto":
@@ -132,6 +139,7 @@ class FastOutputEngine:
                 bonus += self.guard.score_adjustment(text)
             if self.structure_guard is not None:
                 bonus += self.structure_guard.score_adjustment(text)
+            bonus += self.meaning_guard.score_adjustment(text)
             scored.append((tid, scaled + bonus))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -201,11 +209,12 @@ def _token_quality_bonus(text: str, lang_mode: str) -> float:
 
 
 def postprocess_output_text(text: str, prompt: str, lang_mode: str) -> str:
+    assurance = RuntimeMeaningfulResponseAssurance(lang_mode)
     out = (text or "").strip()
     if not out:
-        return out
+        return assurance.repair(out, prompt)
     if lang_mode != "vi":
-        return out
+        return assurance.repair(out, prompt)
 
     lower = out.lower()
     vi_marks = re.search(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]", lower) is not None
@@ -214,7 +223,7 @@ def postprocess_output_text(text: str, prompt: str, lang_mode: str) -> str:
     ascii_only_word = re.fullmatch(r"[a-z\s]{1,8}", lower) is not None and not vi_marks and not has_common_vi
 
     p = (prompt or "").lower()
-    is_greeting = any(k in p for k in ["xin chao", "xin chào", "hello", "hi"])
+    is_greeting = bool(re.search(r"\b(xin\s+chào|xin\s+chao|hello|hi)\b", p, flags=re.IGNORECASE))
     if is_greeting and (looks_weird or ascii_only_word):
         return "Xin chào! Mình có thể giúp gì cho bạn?"
-    return out
+    return assurance.repair(out, prompt)
