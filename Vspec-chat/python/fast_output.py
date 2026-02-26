@@ -52,6 +52,29 @@ class FastOutputEngine:
         self._allowed_cache: dict[int, bool] = {}
         self._emitted_parts: list[str] = []
 
+    def _prime_decode_cache(self, token_ids: list[int]) -> None:
+        if self.tokenizer is None or not token_ids:
+            return
+        missing = [int(tid) for tid in token_ids if int(tid) not in self._decoded_cache]
+        if not missing:
+            return
+
+        decode_batch = getattr(self.tokenizer, "decode_batch", None)
+        if callable(decode_batch):
+            try:
+                decoded = decode_batch([[tid] for tid in missing])
+                for tid, text in zip(missing, decoded):
+                    self._decoded_cache[int(tid)] = text or ""
+                return
+            except Exception:
+                pass
+
+        for tid in missing:
+            try:
+                self._decoded_cache[int(tid)] = self.tokenizer.decode([int(tid)])
+            except Exception:
+                self._decoded_cache[int(tid)] = ""
+
     def begin_stream(self) -> None:
         if self.stream:
             print("[vspec-chat] output:")
@@ -115,6 +138,7 @@ class FastOutputEngine:
 
         candidate_n = max(1, min(len(logits), max(top_k, lang_top_n)))
         candidate_ids = _topn_indices(logits, candidate_n)
+        self._prime_decode_cache(candidate_ids)
 
         allowed_ids = [tid for tid in candidate_ids if self.is_allowed(tid)]
         if not allowed_ids and self.lang_mode in {"vi", "en"}:
@@ -122,6 +146,7 @@ class FastOutputEngine:
             while expand_n < len(logits):
                 expand_n = min(len(logits), max(expand_n * 2, expand_n + 64))
                 candidate_ids = _topn_indices(logits, expand_n)
+                self._prime_decode_cache(candidate_ids)
                 allowed_ids = [tid for tid in candidate_ids if self.is_allowed(tid)]
                 if allowed_ids:
                     break

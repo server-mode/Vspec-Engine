@@ -59,6 +59,8 @@ add_library(vspec_engine
     src/memory/memory_metrics.c
     src/memory/vram_scheduler.c
     src/runtime/runtime.c
+    src/runtime/torch_compat_module.c
+    src/runtime/three_bit_runtime_modules.c
     src/runtime/hw_performance_manager.c
     src/runtime/language_structure_guard.c
     src/runtime/runtime_behavior_monitor.c
@@ -246,6 +248,12 @@ add_executable(vspec_phase3_demo
 )
 
 target_link_libraries(vspec_phase3_demo PRIVATE vspec_engine)
+
+add_executable(vspec_torch_compat_demo
+    examples/torch_compat_demo.c
+)
+
+target_link_libraries(vspec_torch_compat_demo PRIVATE vspec_engine)
 
 if(VSPEC_HAS_CUDA)
     add_executable(vspec_cuda_fused_demo

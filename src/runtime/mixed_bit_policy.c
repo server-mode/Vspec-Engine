@@ -32,10 +32,16 @@ static uint8_t vspec_base_bits_from_policy(const VspecMixedBitPolicy* policy, Vs
     switch (type) {
         case VSPEC_LAYER_ATTENTION:
             return policy->attention_bits;
+        case VSPEC_LAYER_ATTENTION_QK:
+            return policy->attention_qk_bits;
+        case VSPEC_LAYER_ATTENTION_PROJ:
+            return policy->attention_projection_bits;
         case VSPEC_LAYER_MLP:
             return policy->mlp_bits;
         case VSPEC_LAYER_EMBED:
             return policy->embed_bits;
+        case VSPEC_LAYER_LM_HEAD:
+            return policy->lm_head_bits;
         default:
             return policy->attention_bits;
     }
@@ -102,10 +108,13 @@ void vspec_mixed_bit_policy_default(VspecMixedBitPolicy* policy) {
         return;
     }
     policy->attention_bits = 3;
+    policy->attention_qk_bits = 3;
+    policy->attention_projection_bits = 4;
     policy->mlp_bits = 3;
     policy->embed_bits = 3;
+    policy->lm_head_bits = 4;
     policy->min_bits = 2;
-    policy->max_bits = 3;
+    policy->max_bits = 4;
     policy->downshift_step = 1;
     policy->pressure_high = 0.80f;
     policy->pressure_critical = 0.92f;
@@ -129,13 +138,18 @@ uint8_t vspec_mixed_bit_select_bits(
     }
 
     uint8_t bits = vspec_base_bits_from_policy(policy, type);
+
+    if (type == VSPEC_LAYER_ATTENTION_PROJ || type == VSPEC_LAYER_LM_HEAD) {
+        return vspec_clamp_bits(4U, 2U, 4U);
+    }
+
     uint8_t min_bits = policy ? policy->min_bits : 2;
     uint8_t max_bits = policy ? policy->max_bits : 3;
     if (min_bits < 2U) {
         min_bits = 2U;
     }
-    if (max_bits > 3U) {
-        max_bits = 3U;
+    if (max_bits > 4U) {
+        max_bits = 4U;
     }
     if (min_bits > max_bits) {
         min_bits = max_bits;
@@ -192,8 +206,8 @@ uint8_t vspec_mixed_bit_select_bits_realtime(
     if (min_bits < 2U) {
         min_bits = 2U;
     }
-    if (max_bits > 3U) {
-        max_bits = 3U;
+    if (max_bits > 4U) {
+        max_bits = 4U;
     }
     if (min_bits > max_bits) {
         min_bits = max_bits;

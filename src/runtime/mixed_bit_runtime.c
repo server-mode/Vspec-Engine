@@ -1,8 +1,8 @@
 #include "vspec/runtime/mixed_bit_runtime.h"
 
 uint8_t vspec_mixed_bit_enforce_sub4(uint8_t bits) {
-    if (bits > 3U) {
-        return 3U;
+    if (bits > 4U) {
+        return 4U;
     }
     if (bits < 2U) {
         return 2U;
@@ -77,10 +77,16 @@ uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, u
     switch (type) {
         case VSPEC_LAYER_ATTENTION:
             return 3;
+        case VSPEC_LAYER_ATTENTION_QK:
+            return 3;
+        case VSPEC_LAYER_ATTENTION_PROJ:
+            return 4;
         case VSPEC_LAYER_MLP:
             return 3;
         case VSPEC_LAYER_EMBED:
             return 3;
+        case VSPEC_LAYER_LM_HEAD:
+            return 4;
         default:
             return 3;
     }

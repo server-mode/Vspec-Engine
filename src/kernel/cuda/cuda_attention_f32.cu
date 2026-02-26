@@ -3,6 +3,84 @@
 
 #include "vspec/kernel/cuda_ops.h"
 
+__device__ static float clampf_device(float x, float lo, float hi) {
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
+
+__global__ static void clamp_vector_std_kernel(
+    const float* input,
+    float* output,
+    size_t n,
+    float alpha
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    if (!input || !output || n == 0U) {
+        return;
+    }
+
+    float mean = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        mean += input[i];
+    }
+    mean /= (float)n;
+
+    float var = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        float d = input[i] - mean;
+        var += d * d;
+    }
+    var /= (float)n;
+    const float std = sqrtf(fmaxf(var, 0.0f));
+    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
+
+    for (size_t i = 0; i < n; ++i) {
+        output[i] = clampf_device(input[i], -th, th);
+    }
+}
+
+__global__ static void clamp_rows_std_kernel(
+    const float* input,
+    float* output,
+    size_t rows,
+    size_t cols,
+    float alpha
+) {
+    const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const float* in_row = input + row * cols;
+    float* out_row = output + row * cols;
+
+    float mean = 0.0f;
+    for (size_t i = 0; i < cols; ++i) {
+        mean += in_row[i];
+    }
+    mean /= (float)cols;
+
+    float var = 0.0f;
+    for (size_t i = 0; i < cols; ++i) {
+        float d = in_row[i] - mean;
+        var += d * d;
+    }
+    var /= (float)cols;
+    const float std = sqrtf(fmaxf(var, 0.0f));
+    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
+
+    for (size_t i = 0; i < cols; ++i) {
+        out_row[i] = clampf_device(in_row[i], -th, th);
+    }
+}
+
 __global__ static void attention_scores_kernel(
     const float* query,
     const float* keys,
@@ -24,21 +102,41 @@ __global__ static void attention_scores_kernel(
     scores[idx] = acc * inv_sqrt_dim;
 }
 
-__global__ static void attention_softmax_kernel(float* scores, size_t seq_len) {
+__global__ static void attention_softmax_kernel(float* scores, size_t seq_len, float score_clip, float denom_floor, float temp_min) {
     __shared__ float max_val;
     __shared__ float sum_val;
+    __shared__ float adaptive_temp;
 
     if (threadIdx.x == 0) {
-        max_val = scores[0];
+        max_val = clampf_device(scores[0], -score_clip, score_clip);
         for (size_t i = 1; i < seq_len; ++i) {
-            if (scores[i] > max_val) {
-                max_val = scores[i];
+            float v = clampf_device(scores[i], -score_clip, score_clip);
+            scores[i] = v;
+            if (v > max_val) {
+                max_val = v;
             }
         }
+
+        float mean = 0.0f;
+        for (size_t i = 0; i < seq_len; ++i) {
+            mean += scores[i];
+        }
+        mean /= (float)seq_len;
+
+        float var = 0.0f;
+        for (size_t i = 0; i < seq_len; ++i) {
+            float d = scores[i] - mean;
+            var += d * d;
+        }
+        var /= (float)seq_len;
+        float std = sqrtf(fmaxf(var, 0.0f));
+        adaptive_temp = fmaxf(temp_min, fminf(1.0f, 0.60f + 0.20f * std));
+
         sum_val = 0.0f;
         for (size_t i = 0; i < seq_len; ++i) {
-            sum_val += expf(scores[i] - max_val);
+            sum_val += expf((scores[i] - max_val) / adaptive_temp);
         }
+        sum_val = fmaxf(sum_val, denom_floor);
     }
     __syncthreads();
 
@@ -46,7 +144,7 @@ __global__ static void attention_softmax_kernel(float* scores, size_t seq_len) {
     if (idx >= seq_len) {
         return;
     }
-    scores[idx] = expf(scores[idx] - max_val) / sum_val;
+    scores[idx] = expf((scores[idx] - max_val) / adaptive_temp) / sum_val;
 }
 
 __global__ static void attention_output_kernel(
@@ -84,15 +182,23 @@ extern "C" void vspec_cuda_attention_single_f32(
     const size_t bytes_k = seq_len * head_dim * sizeof(float);
     const size_t bytes_scores = seq_len * sizeof(float);
     const size_t bytes_out = head_dim * sizeof(float);
+    const float clamp_alpha = 2.8f;
+    const float softmax_score_clip = 24.0f;
+    const float softmax_denom_floor = 1e-12f;
+    const float softmax_temp_min = 0.70f;
 
     float* d_q = NULL;
+    float* d_q_clamped = NULL;
     float* d_k = NULL;
+    float* d_k_clamped = NULL;
     float* d_v = NULL;
     float* d_scores = NULL;
     float* d_out = NULL;
 
     if (cudaMalloc((void**)&d_q, bytes_q) != cudaSuccess) goto cleanup;
+    if (cudaMalloc((void**)&d_q_clamped, bytes_q) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_k, bytes_k) != cudaSuccess) goto cleanup;
+    if (cudaMalloc((void**)&d_k_clamped, bytes_k) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_v, bytes_k) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_scores, bytes_scores) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_out, bytes_out) != cudaSuccess) goto cleanup;
@@ -101,13 +207,18 @@ extern "C" void vspec_cuda_attention_single_f32(
     if (cudaMemcpy(d_k, keys, bytes_k, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
     if (cudaMemcpy(d_v, values, bytes_k, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
 
+    clamp_vector_std_kernel<<<1, 1>>>(d_q, d_q_clamped, head_dim, clamp_alpha);
+    dim3 clamp_block(128);
+    dim3 clamp_grid((unsigned)((seq_len + clamp_block.x - 1U) / clamp_block.x));
+    clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_k, d_k_clamped, seq_len, head_dim, clamp_alpha);
+
     const float inv_sqrt_dim = 1.0f / sqrtf((float)head_dim);
     dim3 block(256);
     dim3 grid_scores((unsigned)((seq_len + block.x - 1U) / block.x));
-    attention_scores_kernel<<<grid_scores, block>>>(d_q, d_k, d_scores, seq_len, head_dim, inv_sqrt_dim);
+    attention_scores_kernel<<<grid_scores, block>>>(d_q_clamped, d_k_clamped, d_scores, seq_len, head_dim, inv_sqrt_dim);
 
     dim3 grid_softmax(1);
-    attention_softmax_kernel<<<grid_softmax, block>>>(d_scores, seq_len);
+    attention_softmax_kernel<<<grid_softmax, block>>>(d_scores, seq_len, softmax_score_clip, softmax_denom_floor, softmax_temp_min);
 
     dim3 grid_out((unsigned)((head_dim + block.x - 1U) / block.x));
     attention_output_kernel<<<grid_out, block>>>(d_scores, d_v, d_out, seq_len, head_dim);
@@ -119,6 +230,8 @@ cleanup:
     if (d_out) cudaFree(d_out);
     if (d_scores) cudaFree(d_scores);
     if (d_v) cudaFree(d_v);
+    if (d_k_clamped) cudaFree(d_k_clamped);
     if (d_k) cudaFree(d_k);
+    if (d_q_clamped) cudaFree(d_q_clamped);
     if (d_q) cudaFree(d_q);
 }

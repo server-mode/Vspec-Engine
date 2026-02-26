@@ -6,5 +6,8 @@ build/
 logs/
 .venv/
 .vscode
+vspec-2bit-prototype/
 docs/
 struc.md
+3bitproblem.md
+Vspec-Webui/

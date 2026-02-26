@@ -27,6 +27,11 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     char outlier_th_value[16] = {0};
     char quality_bias_value[16] = {0};
     char qlora_rank_value[16] = {0};
+    char runtime_3bit_value[8] = {0};
+    char atn_qk_bits_value[8] = {0};
+    char atn_proj_bits_value[8] = {0};
+    char mlp_bits_value[8] = {0};
+    char lm_head_bits_value[8] = {0};
     (void)snprintf(bits_value, sizeof(bits_value), "%u", (unsigned)cfg->lowbit_target_bits);
     (void)snprintf(batch_value, sizeof(batch_value), "%u", (unsigned)cfg->dispatch_batch_hint);
     (void)snprintf(stream_value, sizeof(stream_value), "%u", (unsigned)cfg->stream_count_hint);
@@ -39,6 +44,11 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)snprintf(outlier_th_value, sizeof(outlier_th_value), "%.3f", cfg->outlier_threshold);
     (void)snprintf(quality_bias_value, sizeof(quality_bias_value), "%.3f", cfg->quality_bias);
     (void)snprintf(qlora_rank_value, sizeof(qlora_rank_value), "%u", (unsigned)cfg->qlora_rank);
+    (void)snprintf(runtime_3bit_value, sizeof(runtime_3bit_value), "%d", (cfg->lowbit_target_bits == 3U) ? 1 : 0);
+    (void)snprintf(atn_qk_bits_value, sizeof(atn_qk_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U));
+    (void)snprintf(atn_proj_bits_value, sizeof(atn_proj_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits == 0U) ? 4U : 4U));
+    (void)snprintf(mlp_bits_value, sizeof(mlp_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U));
+    (void)snprintf(lm_head_bits_value, sizeof(lm_head_bits_value), "%u", 4U);
 
 #if defined(_WIN32)
     (void)_putenv_s("VSPEC_FUSED_BITS", bits_value);
@@ -54,6 +64,11 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)_putenv_s("VSPEC_ULTIMATE_OUTLIER_TH", outlier_th_value);
     (void)_putenv_s("VSPEC_ULTIMATE_QUALITY_BIAS", quality_bias_value);
     (void)_putenv_s("VSPEC_ULTIMATE_QLORA_RANK", qlora_rank_value);
+    (void)_putenv_s("VSPEC_3BIT_RUNTIME_MODULE", runtime_3bit_value);
+    (void)_putenv_s("VSPEC_3BIT_ATTN_QK_BITS", atn_qk_bits_value);
+    (void)_putenv_s("VSPEC_3BIT_ATTN_PROJ_BITS", atn_proj_bits_value);
+    (void)_putenv_s("VSPEC_3BIT_MLP_BITS", mlp_bits_value);
+    (void)_putenv_s("VSPEC_3BIT_LM_HEAD_BITS", lm_head_bits_value);
 #else
     (void)setenv("VSPEC_FUSED_BITS", bits_value, 1);
     (void)setenv("VSPEC_DISABLE_FUSED_ATTN", "0", 1);
@@ -68,6 +83,11 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)setenv("VSPEC_ULTIMATE_OUTLIER_TH", outlier_th_value, 1);
     (void)setenv("VSPEC_ULTIMATE_QUALITY_BIAS", quality_bias_value, 1);
     (void)setenv("VSPEC_ULTIMATE_QLORA_RANK", qlora_rank_value, 1);
+    (void)setenv("VSPEC_3BIT_RUNTIME_MODULE", runtime_3bit_value, 1);
+    (void)setenv("VSPEC_3BIT_ATTN_QK_BITS", atn_qk_bits_value, 1);
+    (void)setenv("VSPEC_3BIT_ATTN_PROJ_BITS", atn_proj_bits_value, 1);
+    (void)setenv("VSPEC_3BIT_MLP_BITS", mlp_bits_value, 1);
+    (void)setenv("VSPEC_3BIT_LM_HEAD_BITS", lm_head_bits_value, 1);
 #endif
 }
 

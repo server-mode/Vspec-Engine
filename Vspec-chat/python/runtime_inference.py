@@ -74,6 +74,43 @@ def _softmax(x: "np.ndarray") -> "np.ndarray":
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
 
+def _dynamic_clamp_std_vec(x: "np.ndarray", alpha: float) -> "np.ndarray":
+    if x.size == 0:
+        return x
+    mean = float(np.mean(x, axis=-1, keepdims=False))
+    var = float(np.mean((x - mean) * (x - mean), axis=-1, keepdims=False))
+    std = float(np.sqrt(max(var, 0.0)))
+    th = max(1e-6, abs(float(alpha)) * std)
+    return np.clip(x, -th, th)
+
+
+def _stabilize_logits(logits: "np.ndarray", logit_clip: float, entropy_target: float, margin_floor: float, margin_gain: float) -> "np.ndarray":
+    if logits.size == 0:
+        return logits
+    centered = logits.astype(np.float32, copy=False)
+    centered = centered - np.mean(centered, dtype=np.float32)
+    if logit_clip > 0.0:
+        centered = np.clip(centered, -logit_clip, logit_clip)
+
+    probs = _softmax(centered.reshape(1, -1))[0]
+    entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), dtype=np.float64)
+    if entropy > entropy_target:
+        scale = min(1.45, 1.0 + 0.08 * float(entropy - entropy_target))
+        centered = centered * np.float32(scale)
+
+    if centered.size >= 2:
+        top2 = np.argpartition(centered, -2)[-2:]
+        a = int(top2[0])
+        b = int(top2[1])
+        if centered[a] < centered[b]:
+            a, b = b, a
+        margin = float(centered[a] - centered[b])
+        if margin < margin_floor:
+            centered[a] = centered[a] + np.float32(margin_gain * (margin_floor - margin))
+
+    return centered.astype(np.float32, copy=False)
+
+
 def _rms_norm(x: "np.ndarray", weight: "np.ndarray", eps: float, bias: Optional["np.ndarray"]) -> "np.ndarray":
     mean_sq = np.mean(x * x, axis=-1, keepdims=True)
     out = x / np.sqrt(mean_sq + eps)
@@ -259,6 +296,8 @@ class LayerWeights:
     w3: "np.ndarray"
     norm1: "np.ndarray"
     norm2: "np.ndarray"
+    q_norm: Optional["np.ndarray"]
+    k_norm: Optional["np.ndarray"]
     bq: Optional["np.ndarray"]
     bk: Optional["np.ndarray"]
     bv: Optional["np.ndarray"]
@@ -292,12 +331,37 @@ class GenericTransformerRuntime:
     disable_fused_attention: bool
     inv_sqrt_head_dim: float
     lowbit_plan: LowbitModulePlan
+    rope_inv_freq: "np.ndarray"
+    rope_cos_cache: list["np.ndarray"]
+    rope_sin_cache: list["np.ndarray"]
+    attention_logit_clip: float
+    attn_tmp_buffers: list["np.ndarray"]
+    residual_error_buffers: list["np.ndarray"]
+    residual_feedback_gain: float
+    residual_clamp_alpha: float
+    logit_entropy_target: float
+    logit_margin_floor: float
+    logit_margin_gain: float
+
+    def _get_rotary_cos_sin(self, position: int) -> tuple["np.ndarray", "np.ndarray"]:
+        while len(self.rope_cos_cache) <= position:
+            pos = len(self.rope_cos_cache)
+            angles = float(pos) * self.rope_inv_freq
+            self.rope_cos_cache.append(np.cos(angles).astype(np.float32, copy=False))
+            self.rope_sin_cache.append(np.sin(angles).astype(np.float32, copy=False))
+        return self.rope_cos_cache[position], self.rope_sin_cache[position]
 
     def _forward_token(self, token_id: int, return_logits: bool) -> Optional["np.ndarray"]:
         if np is None:
             return np.array([], dtype=np.float32) if return_logits else None
 
         x = self.embed[token_id].astype(np.float32)
+        use_rotary_fast = (self.head_dim % 2) == 0
+        if use_rotary_fast:
+            cos, sin = self._get_rotary_cos_sin(self.position)
+            half = self.head_dim // 2
+        kv_heads_equal = self.num_kv_heads == self.num_heads
+        kv_group_size = max(1, self.num_heads // max(1, self.num_kv_heads))
 
         for idx, layer in enumerate(self.layers):
             if self.use_native_cuda_norm and rmsnorm_f32_available():
@@ -331,7 +395,18 @@ class GenericTransformerRuntime:
             k = k.reshape(self.num_kv_heads, self.head_dim)
             v = v.reshape(self.num_kv_heads, self.head_dim)
 
-            q, k = _apply_rotary(q, k, self.position, self.rope_theta)
+            if layer.q_norm is not None:
+                q = _rms_norm(q, layer.q_norm, self.rms_eps, None)
+            if layer.k_norm is not None:
+                k = _rms_norm(k, layer.k_norm, self.rms_eps, None)
+
+            if use_rotary_fast:
+                q1, q2 = q[:, :half], q[:, half:]
+                k1, k2 = k[:, :half], k[:, half:]
+                q = np.concatenate([q1 * cos - q2 * sin, q1 * sin + q2 * cos], axis=-1)
+                k = np.concatenate([k1 * cos - k2 * sin, k1 * sin + k2 * cos], axis=-1)
+            else:
+                q, k = _apply_rotary(q, k, self.position, self.rope_theta)
 
             if len(self.cache_k) <= idx:
                 init_cap = 16
@@ -364,27 +439,38 @@ class GenericTransformerRuntime:
             keys = self.cache_k[idx][:used_len]
             values = self.cache_v[idx][:used_len]
 
-            attn_out = []
+            if len(self.attn_tmp_buffers) <= idx:
+                self.attn_tmp_buffers.append(np.empty((self.num_heads, self.head_dim), dtype=np.float32))
+            attn = self.attn_tmp_buffers[idx]
             for h in range(self.num_heads):
                 qh = q[h]
-                kv_h = h if self.num_kv_heads == self.num_heads else (h % self.num_kv_heads)
+                kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
                 kh = keys[:, kv_h, :]
                 vh = values[:, kv_h, :]
                 if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
-                    attn_out.append(attention_fused_single_f32(qh, kh, vh))
+                    attn[h] = attention_fused_single_f32(qh, kh, vh)
                 elif self.use_native_cuda_norm and attention_single_f32_available():
-                    attn_out.append(attention_single_f32(qh, kh, vh))
+                    attn[h] = attention_single_f32(qh, kh, vh)
                 else:
                     scores = (kh @ qh) * self.inv_sqrt_head_dim
+                    if self.attention_logit_clip > 0:
+                        np.clip(scores, -self.attention_logit_clip, self.attention_logit_clip, out=scores)
                     scores = scores.reshape(1, -1)
                     probs = _softmax(scores)[0]
-                    attn_out.append(probs @ vh)
+                    attn[h] = probs @ vh
 
-            attn = np.concatenate(attn_out, axis=0)
+            attn = attn.reshape(-1)
             attn = _linear_native(attn, layer.wo, "wo")
             if layer.bo is not None:
                 attn = attn + layer.bo
-            x = x + attn
+
+            if len(self.residual_error_buffers) <= idx:
+                self.residual_error_buffers.append(np.zeros_like(x, dtype=np.float32))
+            residual_err = self.residual_error_buffers[idx]
+            attn_stable = _dynamic_clamp_std_vec(attn.astype(np.float32, copy=False), self.residual_clamp_alpha)
+            attn_corrected = attn_stable + (self.residual_feedback_gain * residual_err)
+            self.residual_error_buffers[idx] = (attn.astype(np.float32, copy=False) - attn_stable).astype(np.float32, copy=False)
+            x = x + attn_corrected
 
             if self.use_native_cuda_norm and rmsnorm_f32_available():
                 x_norm = rmsnorm_f32(x[None, :], layer.norm2, self.rms_eps)[0]
@@ -410,7 +496,10 @@ class GenericTransformerRuntime:
             ff = _linear_native(fused, layer.w2, "w2")
             if layer.b2 is not None:
                 ff = ff + layer.b2
-            x = x + ff
+            ff_stable = _dynamic_clamp_std_vec(ff.astype(np.float32, copy=False), self.residual_clamp_alpha)
+            ff_corrected = ff_stable + (self.residual_feedback_gain * self.residual_error_buffers[idx])
+            self.residual_error_buffers[idx] = (ff.astype(np.float32, copy=False) - ff_stable).astype(np.float32, copy=False)
+            x = x + ff_corrected
 
         self.position += 1
 
@@ -425,6 +514,13 @@ class GenericTransformerRuntime:
             logits = gemm_f32(x_last, self.lm_head)[0]
         else:
             logits = x_last @ self.lm_head
+        logits = _stabilize_logits(
+            logits=logits.astype(np.float32, copy=False),
+            logit_clip=self.attention_logit_clip,
+            entropy_target=self.logit_entropy_target,
+            margin_floor=self.logit_margin_floor,
+            margin_gain=self.logit_margin_gain,
+        )
         return logits.astype(np.float32, copy=False)
 
     def prefill_tokens(self, token_ids: list[int]) -> None:
@@ -490,12 +586,17 @@ class GenericTransformerRuntimeTorch:
             k = k.reshape(self.num_kv_heads, self.head_dim)
             v = v.reshape(self.num_kv_heads, self.head_dim)
 
+            if layer.q_norm is not None:
+                q = _rms_norm_torch(q, layer.q_norm, self.rms_eps, None)
+            if layer.k_norm is not None:
+                k = _rms_norm_torch(k, layer.k_norm, self.rms_eps, None)
+
             q, k = _apply_rotary_torch(q, k, self.position, self.rope_theta)
 
             if self.num_kv_heads != self.num_heads:
                 repeat = self.num_heads // self.num_kv_heads
-                k = k.repeat(repeat, 1)
-                v = v.repeat(repeat, 1)
+                k = k.repeat_interleave(repeat, dim=0)
+                v = v.repeat_interleave(repeat, dim=0)
 
             if len(self.cache_k) <= idx:
                 self.cache_k.append(k.unsqueeze(0))
@@ -664,7 +765,7 @@ def _load_first_available_torch(weight_index: dict[str, WeightInfo], name: str, 
     return _load_tensor_torch(info, device)
 
 
-def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits: int) -> Optional[LayerWeights]:
+def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits: int, total_layers: int) -> Optional[LayerWeights]:
     prefix = f"model.layers.{layer_idx}."
 
     q = _load_first_available(weight_index, prefix + "self_attn.q_proj.weight")
@@ -686,6 +787,9 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
     n2 = _load_first_available(weight_index, prefix + "post_attention_layernorm.weight")
     if n2 is None:
         n2 = _load_first_available(weight_index, prefix + "mlp_norm.weight")
+
+    q_norm = _load_first_available(weight_index, prefix + "self_attn.q_norm.weight")
+    k_norm = _load_first_available(weight_index, prefix + "self_attn.k_norm.weight")
 
     w1 = _load_first_available(weight_index, prefix + "mlp.gate_proj.weight")
     w2 = _load_first_available(weight_index, prefix + "mlp.down_proj.weight")
@@ -721,6 +825,8 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
         w3=w3,
         norm1=n1,
         norm2=n2,
+        q_norm=q_norm,
+        k_norm=k_norm,
         bq=bq,
         bk=bk,
         bv=bv,
@@ -733,6 +839,8 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
     )
 
     if fused_bits in {3, 4}:
+        keep_last_at_4 = max(0, int(os.getenv("VSPEC_THREEBIT_KEEP_LAST4", "4") or "4"))
+        sensitive_threebit_keys = {"wq", "wk", "wo", "norm1", "norm2"}
         for key, w in {
             "wq": layer.wq,
             "wk": layer.wk,
@@ -742,14 +850,21 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
             "w2": layer.w2,
             "w3": layer.w3,
         }.items():
-            cache_key = _packed_cache_key(prefix, key, fused_bits, w)
+            matrix_bits = fused_bits
+            if fused_bits == 3:
+                if key in sensitive_threebit_keys:
+                    matrix_bits = 4
+                if keep_last_at_4 > 0 and layer_idx >= max(0, total_layers - keep_last_at_4):
+                    matrix_bits = 4
+
+            cache_key = _packed_cache_key(prefix, key, matrix_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
                 packed, scales = cached
             else:
-                packed, scales = _quantize_weight_rowwise(w, fused_bits)
+                packed, scales = _quantize_weight_rowwise(w, matrix_bits)
                 _save_packed_cache(cache_key, packed, scales)
-            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
+            layer.packed[key] = (packed, scales, matrix_bits, int(w.shape[0]))
 
     return layer
 
@@ -776,6 +891,9 @@ def _load_layer_torch(weight_index: dict[str, WeightInfo], layer_idx: int, devic
     n2 = _load_first_available_torch(weight_index, prefix + "post_attention_layernorm.weight", device)
     if n2 is None:
         n2 = _load_first_available_torch(weight_index, prefix + "mlp_norm.weight", device)
+
+    q_norm = _load_first_available_torch(weight_index, prefix + "self_attn.q_norm.weight", device)
+    k_norm = _load_first_available_torch(weight_index, prefix + "self_attn.k_norm.weight", device)
 
     w1 = _load_first_available_torch(weight_index, prefix + "mlp.gate_proj.weight", device)
     w2 = _load_first_available_torch(weight_index, prefix + "mlp.down_proj.weight", device)
@@ -811,6 +929,8 @@ def _load_layer_torch(weight_index: dict[str, WeightInfo], layer_idx: int, devic
         w3=w3,
         norm1=n1,
         norm2=n2,
+        q_norm=q_norm,
+        k_norm=k_norm,
         bq=bq,
         bk=bk,
         bv=bv,
@@ -861,9 +981,13 @@ def _load_generic_transformer(
     if max_layers:
         num_layers = min(num_layers, max_layers)
 
-    env_override = int(os.getenv("VSPEC_FUSED_BITS", "0") or "0")
-    if env_override in {3, 4}:
-        fused_bits = env_override
+    env_value = os.getenv("VSPEC_FUSED_BITS")
+    if env_value is not None:
+        try:
+            env_override = int(env_value or "0")
+        except Exception:
+            env_override = 0
+        fused_bits = env_override if env_override in {0, 3, 4} else 0
     else:
         baseline_plan = resolve_runtime_baseline_plan(
             config=config,
@@ -880,7 +1004,7 @@ def _load_generic_transformer(
     if progress_cb is not None:
         progress_cb("layer_load", 0, num_layers)
     for idx in range(num_layers):
-        layer = _load_layer(weight_index, idx, fused_bits)
+        layer = _load_layer(weight_index, idx, fused_bits, num_layers)
         if layer is None:
             break
         layers.append(layer)
@@ -922,6 +1046,17 @@ def _load_generic_transformer(
         disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
         inv_sqrt_head_dim=(1.0 / np.sqrt(float(head_dim))),
         lowbit_plan=lowbit_plan,
+        rope_inv_freq=(1.0 / (rope_theta ** (np.arange(head_dim // 2, dtype=np.float32) / max(1, (head_dim // 2))))).astype(np.float32, copy=False),
+        rope_cos_cache=[],
+        rope_sin_cache=[],
+        attention_logit_clip=(24.0 if fused_bits == 3 else 48.0),
+        attn_tmp_buffers=[],
+        residual_error_buffers=[],
+        residual_feedback_gain=0.12,
+        residual_clamp_alpha=2.8,
+        logit_entropy_target=8.2,
+        logit_margin_floor=0.45,
+        logit_margin_gain=0.65,
     )
 
 
@@ -1028,7 +1163,7 @@ def build_generic_runtime(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[object]:
     if device == "torch-cuda" and torch is not None and torch.cuda.is_available():
-        runtime = _load_generic_transformer_torch(config, weight_index, max_layers, device, progress_cb)
+        runtime = _load_generic_transformer_torch(config, weight_index, max_layers, "cuda", progress_cb)
         if runtime is not None:
             return runtime
     use_native_cuda_norm = device in {"cuda", "cuda-native"}

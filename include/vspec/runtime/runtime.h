@@ -5,6 +5,8 @@
 #include "vspec/runtime/hw_performance_manager.h"
 #include "vspec/runtime/language_structure_guard.h"
 #include "vspec/runtime/runtime_behavior_monitor.h"
+#include "vspec/runtime/three_bit_runtime_modules.h"
+#include "vspec/runtime/torch_compat_module.h"
 #include "vspec/runtime/ultimate_optimizer.h"
 #include "vspec/runtime/qlora_adapter.h"
 

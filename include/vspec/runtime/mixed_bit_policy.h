@@ -11,8 +11,11 @@
 
 typedef struct VspecMixedBitPolicy {
     uint8_t attention_bits;
+    uint8_t attention_qk_bits;
+    uint8_t attention_projection_bits;
     uint8_t mlp_bits;
     uint8_t embed_bits;
+    uint8_t lm_head_bits;
     uint8_t min_bits;
     uint8_t max_bits;
     uint8_t downshift_step;

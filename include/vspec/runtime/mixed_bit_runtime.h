@@ -10,7 +10,10 @@ typedef enum VspecLayerType {
     VSPEC_LAYER_UNKNOWN = 0,
     VSPEC_LAYER_ATTENTION = 1,
     VSPEC_LAYER_MLP = 2,
-    VSPEC_LAYER_EMBED = 3
+    VSPEC_LAYER_EMBED = 3,
+    VSPEC_LAYER_ATTENTION_QK = 4,
+    VSPEC_LAYER_ATTENTION_PROJ = 5,
+    VSPEC_LAYER_LM_HEAD = 6
 } VspecLayerType;
 
 typedef struct VspecLayerBitConfig {
