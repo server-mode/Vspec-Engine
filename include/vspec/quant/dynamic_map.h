@@ -8,6 +8,7 @@ typedef struct VspecDynamicQuantConfig {
     uint8_t min_bits;
     uint8_t max_bits;
     size_t group_size;
+    float percentile;
 } VspecDynamicQuantConfig;
 
 typedef struct VspecDynamicQuantDecision {

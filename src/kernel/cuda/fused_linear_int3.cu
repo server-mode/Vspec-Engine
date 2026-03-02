@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include "vspec/kernel/cuda_fused.h"
 #include "vspec/quant/quant.h"
@@ -64,6 +65,20 @@ __device__ static int8_t decode_int3_at(const uint8_t* packed, size_t index) {
     return (code & 0x4U) ? (int8_t)(code - 8U) : (int8_t)code;
 }
 
+__device__ static float prng_uniform_01(uint32_t state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return (float)(state & 0x00FFFFFFU) / 16777216.0f;
+}
+
+__device__ static float stochastic_roundf_device(float x, uint32_t seed) {
+    float lo = floorf(x);
+    float frac = x - lo;
+    float u = prng_uniform_01(seed);
+    return (u < frac) ? (lo + 1.0f) : lo;
+}
+
 __global__ static void fused_int3_kernel(
     const float* a,
     const uint8_t* b_packed,
@@ -72,7 +87,8 @@ __global__ static void fused_int3_kernel(
     size_t m,
     size_t n,
     size_t k,
-    size_t packed_k
+    size_t packed_k,
+    int stochastic_rounding
 ) {
     const size_t j = (size_t)(blockIdx.x * blockDim.x + threadIdx.x);
     const size_t i = (size_t)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -84,7 +100,7 @@ __global__ static void fused_int3_kernel(
     const float scale = scales[j];
     float acc = 0.0f;
 
-    const size_t block_k = 64U;
+    const size_t block_k = 32U;
     for (size_t base = 0; base < k; base += block_k) {
         size_t end = base + block_k;
         if (end > k) {
@@ -111,7 +127,17 @@ __global__ static void fused_int3_kernel(
         for (size_t t = base; t < end; ++t) {
             const float av = a[i * k + t] / block_scale;
             const int8_t wq = decode_int3_at(b_row, t);
-            const float wv = ((float)wq * scale) / block_scale;
+            float wv = ((float)wq * scale) / block_scale;
+            if (stochastic_rounding) {
+                uint32_t seed = (uint32_t)(
+                    (uint32_t)(i * 2654435761U) ^
+                    (uint32_t)(j * 2246822519U) ^
+                    (uint32_t)(t * 3266489917U) ^
+                    0x9E3779B9U
+                );
+                float quant_steps = wv * 16.0f;
+                wv = stochastic_roundf_device(quant_steps, seed) / 16.0f;
+            }
             block_acc += av * wv;
         }
         acc += block_acc * block_scale * block_scale;
@@ -127,7 +153,8 @@ extern "C" void vspec_cuda_fused_linear_int3_device(
     float* d_c,
     size_t m,
     size_t n,
-    size_t k
+    size_t k,
+    int stochastic_rounding
 ) {
     if (!d_a || !d_b_packed || !d_scales || !d_c || m == 0U || n == 0U || k == 0U) {
         return;
@@ -135,7 +162,7 @@ extern "C" void vspec_cuda_fused_linear_int3_device(
     const size_t packed_k = (k * 3U + 7U) / 8U;
     dim3 block(16, 16);
     dim3 grid((unsigned)((n + block.x - 1U) / block.x), (unsigned)((m + block.y - 1U) / block.y));
-    fused_int3_kernel<<<grid, block>>>(d_a, d_b_packed, d_scales, d_c, m, n, k, packed_k);
+    fused_int3_kernel<<<grid, block>>>(d_a, d_b_packed, d_scales, d_c, m, n, k, packed_k, stochastic_rounding);
 }
 
 extern "C" void vspec_cuda_launch_fused_linear_int3(VspecKernelContext* ctx) {
@@ -157,6 +184,13 @@ extern "C" void vspec_cuda_launch_fused_linear_int3(VspecKernelContext* ctx) {
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
     const float clamp_alpha = 2.8f;
+    int stochastic_rounding = 1;
+    const char* sr_env = getenv("VSPEC_3BIT_STOCHASTIC_ROUNDING");
+    if (sr_env && sr_env[0] != '\0') {
+        if (sr_env[0] == '0' || sr_env[0] == 'n' || sr_env[0] == 'N' || sr_env[0] == 'f' || sr_env[0] == 'F') {
+            stochastic_rounding = 0;
+        }
+    }
 
     static float* d_a = NULL;
     static float* d_a_clamped = NULL;
@@ -208,7 +242,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int3(VspecKernelContext* ctx) {
     dim3 clamp_grid((unsigned)((m + clamp_block.x - 1U) / clamp_block.x));
     clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_a, d_a_clamped, m, k, clamp_alpha);
 
-    vspec_cuda_fused_linear_int3_device(d_a_clamped, d_b, d_s, d_c, m, n, k);
+    vspec_cuda_fused_linear_int3_device(d_a_clamped, d_b, d_s, d_c, m, n, k, stochastic_rounding);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);

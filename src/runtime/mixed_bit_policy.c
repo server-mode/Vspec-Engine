@@ -1,5 +1,7 @@
 #include "vspec/runtime/mixed_bit_policy.h"
 
+#include <math.h>
+
 static float vspec_pressure_from_metrics(
     const VspecMemoryMetrics* metrics,
     const VspecVramBudget* budget,
@@ -156,7 +158,10 @@ uint8_t vspec_mixed_bit_select_bits(
     }
 
     if (data && count > 0U) {
-        VspecDynamicQuantConfig cfg = policy ? policy->dyn_cfg : (VspecDynamicQuantConfig){2, 4, 64};
+        VspecDynamicQuantConfig cfg = policy ? policy->dyn_cfg : (VspecDynamicQuantConfig){2, 4, 32, 99.5f};
+        if (type == VSPEC_LAYER_MLP || type == VSPEC_LAYER_ATTENTION_QK) {
+            cfg.group_size = 32U;
+        }
         if (cfg.min_bits < min_bits) {
             cfg.min_bits = min_bits;
         }
@@ -165,6 +170,23 @@ uint8_t vspec_mixed_bit_select_bits(
         }
         VspecDynamicQuantDecision decision = vspec_dynamic_quant_decide(data, count, &cfg);
         bits = decision.bits;
+
+        if (type == VSPEC_LAYER_ATTENTION_QK && cfg.max_bits >= 4U) {
+            float max_abs = 0.0f;
+            float rms_acc = 0.0f;
+            for (size_t i = 0; i < count; ++i) {
+                float v = fabsf(data[i]);
+                if (v > max_abs) {
+                    max_abs = v;
+                }
+                rms_acc += data[i] * data[i];
+            }
+            float rms = sqrtf(rms_acc / (float)count);
+            float outlier_ratio = (rms > 1e-6f) ? (max_abs / rms) : max_abs;
+            if (outlier_ratio >= 5.5f) {
+                bits = 4U;
+            }
+        }
     }
 
     bits = vspec_clamp_bits(bits, min_bits, max_bits);

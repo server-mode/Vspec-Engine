@@ -254,7 +254,7 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int3_bridge(
   }
 
   if (cudaMemcpy(d_in, input, bytes_in, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  vspec_cuda_fused_linear_int3_device(d_in, entry->d_w, entry->d_s, d_out, m, n, k);
+  vspec_cuda_fused_linear_int3_device(d_in, entry->d_w, entry->d_s, d_out, m, n, k, 1);
   if (cudaDeviceSynchronize() != cudaSuccess) return 0;
   if (cudaMemcpy(output, d_out, bytes_out, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
   return 1;

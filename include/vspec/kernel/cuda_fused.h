@@ -37,7 +37,8 @@ void vspec_cuda_fused_linear_int3_device(
 	float* d_c,
 	size_t m,
 	size_t n,
-	size_t k
+	size_t k,
+	int stochastic_rounding
 );
 
 #ifdef __cplusplus

@@ -45,7 +45,13 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)snprintf(quality_bias_value, sizeof(quality_bias_value), "%.3f", cfg->quality_bias);
     (void)snprintf(qlora_rank_value, sizeof(qlora_rank_value), "%u", (unsigned)cfg->qlora_rank);
     (void)snprintf(runtime_3bit_value, sizeof(runtime_3bit_value), "%d", (cfg->lowbit_target_bits == 3U) ? 1 : 0);
-    (void)snprintf(atn_qk_bits_value, sizeof(atn_qk_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U));
+    {
+        unsigned qk_bits = (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U);
+        if (cfg->lowbit_target_bits == 3U && cfg->quality_bias >= 0.70f) {
+            qk_bits = 4U;
+        }
+        (void)snprintf(atn_qk_bits_value, sizeof(atn_qk_bits_value), "%u", qk_bits);
+    }
     (void)snprintf(atn_proj_bits_value, sizeof(atn_proj_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits == 0U) ? 4U : 4U));
     (void)snprintf(mlp_bits_value, sizeof(mlp_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U));
     (void)snprintf(lm_head_bits_value, sizeof(lm_head_bits_value), "%u", 4U);
