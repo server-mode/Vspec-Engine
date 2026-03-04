@@ -26,11 +26,11 @@ except Exception:  # pragma: no cover
     gemm_f32_available = lambda: False
 
 
-def _clamp_sub4(bits: int) -> int:
+def _clamp_lowbit(bits: int) -> int:
     if bits < 2:
         return 2
-    if bits > 3:
-        return 3
+    if bits > 4:
+        return 4
     return bits
 
 
@@ -59,7 +59,9 @@ def build_lowbit_module_plan(config: dict, use_native_cuda_norm: bool, requested
     if hidden <= 0 or heads <= 0 or (hidden % heads) != 0:
         return LowbitModulePlan(enabled=False, bits=0, compatible=False, reason="incompatible_shape", profile=profile)
 
-    bits = _clamp_sub4(int(requested_bits))
+    bits = _clamp_lowbit(int(requested_bits))
+    if bits == 4 and fused_linear_int4_available():
+        return LowbitModulePlan(enabled=True, bits=4, compatible=True, reason="int4_fused", profile=profile)
     if bits == 3 and fused_linear_int3_available():
         return LowbitModulePlan(enabled=True, bits=3, compatible=True, reason="int3_fused", profile=profile)
 

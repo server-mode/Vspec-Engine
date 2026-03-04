@@ -69,6 +69,7 @@ add_library(vspec_engine
     src/runtime/mixed_bit.c
     src/runtime/mixed_bit_runtime.c
     src/runtime/mixed_bit_policy.c
+    src/runtime/adaptive_precision_engine.c
     src/scheduler/dynamic.c
     src/parallel/multi_gpu.c
 )
@@ -212,6 +213,14 @@ add_executable(vspec_week25_scheduler_stress
 )
 
 target_link_libraries(vspec_week25_scheduler_stress PRIVATE vspec_engine)
+
+if(VSPEC_HAS_CUDA)
+    add_executable(vspec_job3_storage_compute_benchmark
+        tools/benchmark/job3_int3_storage_compute_benchmark.c
+    )
+
+    target_link_libraries(vspec_job3_storage_compute_benchmark PRIVATE vspec_engine)
+endif()
 
 add_executable(vspec_stress_test
     tools/benchmark/stress_test.c

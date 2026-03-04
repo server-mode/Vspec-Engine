@@ -37,6 +37,10 @@ typedef struct VspecRuntimeHwConfig {
     float outlier_threshold;
     float quality_bias;
     uint32_t qlora_rank;
+
+    float precision_downgrade_trigger;
+    float cache_compression_trigger;
+    uint8_t per_model_adaptive_bit_cap;
 } VspecRuntimeHwConfig;
 
 typedef struct VspecRuntimeHwState {

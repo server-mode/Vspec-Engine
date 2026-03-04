@@ -21,6 +21,10 @@ typedef struct VspecMixedBitPolicy {
     uint8_t downshift_step;
     float pressure_high;
     float pressure_critical;
+    int enable_bit_escalation;
+    float residual_rms_escalate_threshold;
+    float attention_entropy_escalate_threshold;
+    float activation_norm_drift_threshold;
     size_t memory_target_bytes;
     VspecDynamicQuantConfig dyn_cfg;
 } VspecMixedBitPolicy;

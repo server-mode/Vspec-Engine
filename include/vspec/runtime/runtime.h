@@ -5,6 +5,7 @@
 #include "vspec/runtime/hw_performance_manager.h"
 #include "vspec/runtime/language_structure_guard.h"
 #include "vspec/runtime/runtime_behavior_monitor.h"
+#include "vspec/runtime/adaptive_precision_engine.h"
 #include "vspec/runtime/three_bit_runtime_modules.h"
 #include "vspec/runtime/torch_compat_module.h"
 #include "vspec/runtime/ultimate_optimizer.h"
@@ -27,9 +28,22 @@ void vspec_runtime_behavior_observe(
 	float observed_vram_utilization,
 	float observed_effective_bits
 );
+void vspec_runtime_behavior_observe_quality(
+	float residual_rms,
+	float attention_entropy_collapse,
+	float activation_norm_drift
+);
 void vspec_runtime_behavior_set_workload_scale(float workload_scale);
 void vspec_runtime_behavior_set_integrity_pass(int integrity_pass);
 void vspec_runtime_behavior_report(VspecRuntimeBehaviorReport* report);
+
+void vspec_runtime_set_model_precision_profile(
+	uint16_t model_id,
+	uint8_t bit_cap,
+	int storage_heavy_mode,
+	float precision_downgrade_trigger,
+	float cache_compression_trigger
+);
 
 VspecQuantType vspec_runtime_ultimate_recommend_quant_for_input(
 	const float* input,

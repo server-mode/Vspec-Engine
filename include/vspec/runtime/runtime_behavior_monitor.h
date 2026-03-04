@@ -12,6 +12,7 @@ typedef enum VspecRuntimeBehaviorIssue {
     VSPEC_RUNTIME_ISSUE_BITS_OVER_TARGET = 1 << 2,
     VSPEC_RUNTIME_ISSUE_INTEGRITY_FAIL = 1 << 3,
     VSPEC_RUNTIME_ISSUE_CPU_FALLBACK = 1 << 4,
+    VSPEC_RUNTIME_ISSUE_QUALITY_DRIFT = 1 << 5,
 } VspecRuntimeBehaviorIssue;
 
 typedef enum VspecRuntimeBehaviorSeverity {
@@ -27,6 +28,9 @@ typedef struct VspecRuntimeBehaviorSnapshot {
     float observed_vram_utilization;
     float observed_effective_bits;
     float workload_scale;
+    float residual_rms;
+    float attention_entropy_collapse;
+    float activation_norm_drift;
     int integrity_pass;
     int using_gpu_backend;
 } VspecRuntimeBehaviorSnapshot;
@@ -58,6 +62,9 @@ typedef struct VspecRuntimeBehaviorReport {
     float observed_vram_utilization;
     float observed_effective_bits;
     float workload_scale;
+    float residual_rms;
+    float attention_entropy_collapse;
+    float activation_norm_drift;
     int integrity_pass;
     int using_gpu_backend;
 } VspecRuntimeBehaviorReport;

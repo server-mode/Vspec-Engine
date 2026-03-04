@@ -155,6 +155,17 @@ int vspec_torch_compat_kv_cache_append(
     return vspec_kv_cache_append(cache, key_token, value_token);
 }
 
+int vspec_torch_compat_kv_cache_enable_int3_compression(
+    VspecKVCache* cache,
+    size_t block_size
+) {
+    return vspec_kv_cache_enable_int3_compression(cache, block_size);
+}
+
+void vspec_torch_compat_kv_cache_disable_int3_compression(VspecKVCache* cache) {
+    vspec_kv_cache_disable_int3_compression(cache);
+}
+
 void vspec_torch_compat_kv_cache_reset(VspecKVCache* cache) {
     vspec_kv_cache_reset(cache);
 }

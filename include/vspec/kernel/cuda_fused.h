@@ -41,6 +41,15 @@ void vspec_cuda_fused_linear_int3_device(
 	int stochastic_rounding
 );
 
+void vspec_cuda_expand_int3_to_int4_device(
+	const unsigned char* d_b_int3,
+	unsigned char* d_b_int4,
+	size_t n,
+	size_t k
+);
+
+void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -95,6 +95,13 @@ int vspec_torch_compat_kv_cache_append(
     const float* value_token
 );
 
+int vspec_torch_compat_kv_cache_enable_int3_compression(
+    VspecKVCache* cache,
+    size_t block_size
+);
+
+void vspec_torch_compat_kv_cache_disable_int3_compression(VspecKVCache* cache);
+
 void vspec_torch_compat_kv_cache_reset(VspecKVCache* cache);
 
 void vspec_torch_compat_rmsnorm_f32(

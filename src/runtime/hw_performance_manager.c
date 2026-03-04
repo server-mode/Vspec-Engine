@@ -117,6 +117,9 @@ void vspec_runtime_hw_config_default(VspecRuntimeHwConfig* config) {
     config->outlier_threshold = 6.0f;
     config->quality_bias = 0.75f;
     config->qlora_rank = 16U;
+    config->precision_downgrade_trigger = 0.88f;
+    config->cache_compression_trigger = 0.90f;
+    config->per_model_adaptive_bit_cap = 4U;
 }
 
 int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* out_config) {
@@ -164,7 +167,7 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
         } else if (vspec_equals_ignore_case(key, "stream_count_hint")) {
             out_config->stream_count_hint = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 1U, 32U);
         } else if (vspec_equals_ignore_case(key, "lowbit_target_bits")) {
-            out_config->lowbit_target_bits = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 2U, 3U);
+            out_config->lowbit_target_bits = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 3U, 4U);
         } else if (vspec_equals_ignore_case(key, "enable_lowbit_boost")) {
             out_config->enable_lowbit_boost =
                 (vspec_equals_ignore_case(value, "1") ||
@@ -196,6 +199,12 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
             out_config->quality_bias = vspec_clamp_float((float)atof(value), 0.0f, 1.0f);
         } else if (vspec_equals_ignore_case(key, "qlora_rank")) {
             out_config->qlora_rank = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 0U, 256U);
+        } else if (vspec_equals_ignore_case(key, "precision_downgrade_trigger")) {
+            out_config->precision_downgrade_trigger = vspec_clamp_float((float)atof(value), 0.50f, 1.00f);
+        } else if (vspec_equals_ignore_case(key, "cache_compression_trigger")) {
+            out_config->cache_compression_trigger = vspec_clamp_float((float)atof(value), 0.50f, 1.00f);
+        } else if (vspec_equals_ignore_case(key, "per_model_adaptive_bit_cap")) {
+            out_config->per_model_adaptive_bit_cap = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 3U, 4U);
         }
     }
 
@@ -208,7 +217,7 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
         if (out_config->stream_count_hint < 4U) {
             out_config->stream_count_hint = 4U;
         }
-        out_config->lowbit_target_bits = vspec_clamp_u8(out_config->lowbit_target_bits, 2U, 3U);
+        out_config->lowbit_target_bits = vspec_clamp_u8(out_config->lowbit_target_bits, 3U, 4U);
         out_config->target_gpu_utilization = vspec_clamp_float(out_config->target_gpu_utilization, 0.90f, 1.00f);
     } else if (out_config->tuning_mode == VSPEC_HW_TUNING_ULTIMATE) {
         out_config->enable_ultimate_mode = 1;

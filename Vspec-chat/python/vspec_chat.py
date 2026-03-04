@@ -128,9 +128,19 @@ def _token_quality_bonus(text: str, lang_mode: str) -> float:
         bonus -= 1.0
     if any(ch in text for ch in ["_", "=", "\\", "/", "@"]) or "http" in text:
         bonus -= 1.5
+    if re.search(r"\b(path|size|state|windows|println|return|case|break|if|else|switch|class|public|private|void)\b", text.lower()):
+        bonus -= 1.6
+    if "\t" in text or "\r" in text or "\n" in text:
+        bonus -= 1.2
+    if re.search(r"[{}();]", text):
+        bonus -= 0.7
     if lang_mode == "vi":
+        if re.search(r"\b(path|size|state|windows|println|return|case|break|if|else)\b", text.lower()):
+            bonus -= 0.8
         if re.search(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]", text.lower()):
             bonus += 0.35
+        if re.search(r"\b(và|là|của|bạn|tôi|được|không|xin|chào)\b", text.lower()):
+            bonus += 0.25
     return bonus
 
 
@@ -212,8 +222,26 @@ def _apply_generation_controls(
     repetition_penalty: float,
     repeat_window: int,
     no_repeat_ngram: int,
+    entropy_floor: float = 0.45,
+    tail_flatten_std_floor: float = 0.85,
+    top12_margin_cap: float = 7.5,
 ) -> list[float]:
     adjusted = list(logits)
+
+    if not adjusted:
+        return adjusted
+
+    mean_v = sum(adjusted) / float(len(adjusted))
+    var_v = 0.0
+    for value in adjusted:
+        d = value - mean_v
+        var_v += d * d
+    var_v /= float(max(1, len(adjusted)))
+    std_v = math.sqrt(max(var_v, 1e-12))
+
+    if std_v < tail_flatten_std_floor:
+        sharpen = min(2.5, tail_flatten_std_floor / max(std_v, 1e-6))
+        adjusted = [mean_v + (value - mean_v) * sharpen for value in adjusted]
 
     if repetition_penalty > 1.0 and token_ids and repeat_window > 0:
         for tid in set(token_ids[-repeat_window:]):
@@ -233,6 +261,42 @@ def _apply_generation_controls(
         for tid in banned:
             if 0 <= tid < len(adjusted):
                 adjusted[tid] = -1e9
+
+    candidate_n = min(64, len(adjusted))
+    if candidate_n >= 2:
+        sorted_ids = sorted(range(len(adjusted)), key=lambda i: adjusted[i], reverse=True)
+        top_ids = sorted_ids[:candidate_n]
+        top_logits = [adjusted[i] for i in top_ids]
+        max_logit = max(top_logits)
+
+        exp_vals = [math.exp(v - max_logit) for v in top_logits]
+        total = sum(exp_vals)
+        if total > 0.0:
+            probs = [v / total for v in exp_vals]
+            entropy = 0.0
+            for p in probs:
+                if p > 1e-12:
+                    entropy += -p * math.log(p)
+            max_entropy = math.log(float(candidate_n)) if candidate_n > 1 else 1.0
+            norm_entropy = entropy / max(max_entropy, 1e-6)
+
+            if norm_entropy < entropy_floor:
+                relax = min(0.35, entropy_floor - norm_entropy)
+                for idx in top_ids:
+                    adjusted[idx] *= (1.0 - relax)
+
+            first = top_ids[0]
+            second = top_ids[1]
+            margin = adjusted[first] - adjusted[second]
+            if margin > top12_margin_cap:
+                adjusted[first] -= (margin - top12_margin_cap)
+
+    if len(token_ids) >= 3:
+        recent = token_ids[-3:]
+        if recent[0] == recent[1] == recent[2]:
+            tid = recent[-1]
+            if 0 <= tid < len(adjusted):
+                adjusted[tid] -= 2.5
 
     return adjusted
 

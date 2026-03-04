@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "vspec/kernel/context.h"
+#include "vspec/kernel/cuda_fused.h"
 #include "vspec/kernel/cuda_ultimate.h"
 #include "vspec/quant/quant.h"
 
@@ -22,6 +23,17 @@ __device__ static int8_t decode_int4(uint8_t nibble) {
         return (int8_t)(nibble - 16);
     }
     return (int8_t)nibble;
+}
+
+static int vspec_env_enabled_host(const char* key, int default_value) {
+    const char* v = getenv(key);
+    if (!v || v[0] == '\0') {
+        return default_value;
+    }
+    if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "TRUE") == 0 || strcmp(v, "yes") == 0) {
+        return 1;
+    }
+    return 0;
 }
 
 __global__ __launch_bounds__(VSPEC_CUDA_BLOCK_X * VSPEC_CUDA_BLOCK_Y) static void int4_linear_kernel(
@@ -75,47 +87,24 @@ extern "C" void vspec_cuda_launch_linear_impl(VspecKernelContext* ctx) {
         return;
     }
 
-    if (ctx->qmeta.type != VSPEC_QUANT_INT4 || !ctx->qmeta.scales) {
+    if (!ctx->qmeta.scales) {
         return;
     }
 
-    const size_t m = ctx->config.m;
-    const size_t n = ctx->config.n;
-    const size_t k = ctx->config.k;
-    const size_t packed_k = (k + 1U) / 2U;
+    if (ctx->qmeta.type == VSPEC_QUANT_INT4 && vspec_env_enabled_host("VSPEC_FORCE_TENSORCORE_4BIT", 0)) {
+        vspec_cuda_launch_linear_ultimate(ctx);
+        return;
+    }
 
-    dim3 block(VSPEC_CUDA_BLOCK_X, VSPEC_CUDA_BLOCK_Y);
-    dim3 grid((unsigned)((n + block.x - 1U) / block.x), (unsigned)((m + block.y - 1U) / block.y));
+    if (ctx->qmeta.type == VSPEC_QUANT_INT4) {
+        vspec_cuda_launch_fused_linear_int4(ctx);
+        return;
+    }
 
-    const size_t bytes_a = m * k * sizeof(float);
-    const size_t bytes_b = n * packed_k * sizeof(uint8_t);
-    const size_t bytes_s = n * sizeof(float);
-    const size_t bytes_c = m * n * sizeof(float);
-
-    float* d_a = NULL;
-    uint8_t* d_b = NULL;
-    float* d_s = NULL;
-    float* d_c = NULL;
-
-    if (cudaMalloc((void**)&d_a, bytes_a) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_b, bytes_b) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_s, bytes_s) != cudaSuccess) goto cleanup;
-    if (cudaMalloc((void**)&d_c, bytes_c) != cudaSuccess) goto cleanup;
-
-    if (cudaMemcpy(d_a, ctx->input, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-    if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-    if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
-
-    int4_linear_kernel<<<grid, block>>>(d_a, d_b, d_s, d_c, m, n, k, packed_k);
-
-    if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
-    if (cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost) != cudaSuccess) goto cleanup;
-
-cleanup:
-    if (d_c) cudaFree(d_c);
-    if (d_s) cudaFree(d_s);
-    if (d_b) cudaFree(d_b);
-    if (d_a) cudaFree(d_a);
+    if (ctx->qmeta.type == VSPEC_QUANT_INT3) {
+        vspec_cuda_launch_fused_linear_int3_storage(ctx);
+        return;
+    }
 }
 
 extern "C" void vspec_cuda_launch_attention_impl(VspecKernelContext* ctx) {

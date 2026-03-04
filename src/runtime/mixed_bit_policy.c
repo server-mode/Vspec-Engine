@@ -1,6 +1,124 @@
 #include "vspec/runtime/mixed_bit_policy.h"
+#include "vspec/runtime/adaptive_precision_engine.h"
 
 #include <math.h>
+#include <stdlib.h>
+
+typedef struct VspecLayerSignalState {
+    uint32_t layer_id;
+    VspecLayerType type;
+    float last_rms;
+    int used;
+} VspecLayerSignalState;
+
+static VspecLayerSignalState g_layer_signal_state[256];
+
+static float vspec_env_float_or_default(const char* name, float fallback) {
+    const char* value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    return (float)atof(value);
+}
+
+static uint8_t vspec_env_u8_or_default(const char* name, uint8_t fallback) {
+    const char* value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    int parsed = atoi(value);
+    if (parsed < 2) {
+        parsed = 2;
+    }
+    if (parsed > 4) {
+        parsed = 4;
+    }
+    return (uint8_t)parsed;
+}
+
+static float vspec_layer_rms(const float* data, size_t count) {
+    if (!data || count == 0U) {
+        return 0.0f;
+    }
+    double acc = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double v = (double)data[i];
+        acc += v * v;
+    }
+    return (float)sqrt(acc / (double)count);
+}
+
+static float vspec_attention_entropy_collapse_score(const float* data, size_t count) {
+    if (!data || count < 2U) {
+        return 0.0f;
+    }
+
+    const size_t n = (count > 128U) ? 128U : count;
+    float max_v = data[0];
+    for (size_t i = 1U; i < n; ++i) {
+        if (data[i] > max_v) {
+            max_v = data[i];
+        }
+    }
+
+    double sum_exp = 0.0;
+    for (size_t i = 0U; i < n; ++i) {
+        const double x = (double)data[i] - (double)max_v;
+        sum_exp += exp(x);
+    }
+    if (sum_exp <= 1e-18) {
+        return 0.0f;
+    }
+
+    double entropy = 0.0;
+    for (size_t i = 0U; i < n; ++i) {
+        const double x = (double)data[i] - (double)max_v;
+        const double p = exp(x) / sum_exp;
+        if (p > 1e-18) {
+            entropy += -p * log(p);
+        }
+    }
+
+    const double max_entropy = log((double)n);
+    if (max_entropy <= 1e-18) {
+        return 0.0f;
+    }
+    const double normalized = entropy / max_entropy;
+    double collapse = 1.0 - normalized;
+    if (collapse < 0.0) collapse = 0.0;
+    if (collapse > 1.0) collapse = 1.0;
+    return (float)collapse;
+}
+
+static float vspec_activation_norm_drift(uint32_t layer_id, VspecLayerType type, float current_rms) {
+    int free_idx = -1;
+    for (size_t i = 0U; i < 256U; ++i) {
+        if (g_layer_signal_state[i].used) {
+            if (g_layer_signal_state[i].layer_id == layer_id && g_layer_signal_state[i].type == type) {
+                const float prev = g_layer_signal_state[i].last_rms;
+                g_layer_signal_state[i].last_rms = current_rms;
+                if (prev <= 1e-6f) {
+                    return 0.0f;
+                }
+                return fabsf(current_rms - prev) / prev;
+            }
+        } else if (free_idx < 0) {
+            free_idx = (int)i;
+        }
+    }
+
+    if (free_idx >= 0) {
+        g_layer_signal_state[free_idx].used = 1;
+        g_layer_signal_state[free_idx].layer_id = layer_id;
+        g_layer_signal_state[free_idx].type = type;
+        g_layer_signal_state[free_idx].last_rms = current_rms;
+    }
+    return 0.0f;
+}
+
+static uint16_t vspec_model_id_from_layer_id(uint32_t layer_id) {
+    return (uint16_t)((layer_id >> 16U) & 0xFFFFU);
+}
 
 static float vspec_pressure_from_metrics(
     const VspecMemoryMetrics* metrics,
@@ -109,17 +227,21 @@ void vspec_mixed_bit_policy_default(VspecMixedBitPolicy* policy) {
     if (!policy) {
         return;
     }
-    policy->attention_bits = 3;
-    policy->attention_qk_bits = 3;
+    policy->attention_bits = 4;
+    policy->attention_qk_bits = 4;
     policy->attention_projection_bits = 4;
-    policy->mlp_bits = 3;
-    policy->embed_bits = 3;
+    policy->mlp_bits = 4;
+    policy->embed_bits = 4;
     policy->lm_head_bits = 4;
-    policy->min_bits = 2;
+    policy->min_bits = 3;
     policy->max_bits = 4;
     policy->downshift_step = 1;
     policy->pressure_high = 0.80f;
     policy->pressure_critical = 0.92f;
+    policy->enable_bit_escalation = 1;
+    policy->residual_rms_escalate_threshold = 1.35f;
+    policy->attention_entropy_escalate_threshold = 0.65f;
+    policy->activation_norm_drift_threshold = 0.30f;
     policy->memory_target_bytes = 0U;
     vspec_dynamic_quant_default(&policy->dyn_cfg);
 }
@@ -141,12 +263,12 @@ uint8_t vspec_mixed_bit_select_bits(
 
     uint8_t bits = vspec_base_bits_from_policy(policy, type);
 
-    if (type == VSPEC_LAYER_ATTENTION_PROJ || type == VSPEC_LAYER_LM_HEAD) {
+    if (type == VSPEC_LAYER_ATTENTION_QK || type == VSPEC_LAYER_ATTENTION_PROJ || type == VSPEC_LAYER_LM_HEAD) {
         return vspec_clamp_bits(4U, 2U, 4U);
     }
 
-    uint8_t min_bits = policy ? policy->min_bits : 2;
-    uint8_t max_bits = policy ? policy->max_bits : 3;
+    uint8_t min_bits = policy ? policy->min_bits : 3;
+    uint8_t max_bits = policy ? policy->max_bits : 4;
     if (min_bits < 2U) {
         min_bits = 2U;
     }
@@ -157,42 +279,72 @@ uint8_t vspec_mixed_bit_select_bits(
         min_bits = max_bits;
     }
 
-    if (data && count > 0U) {
-        VspecDynamicQuantConfig cfg = policy ? policy->dyn_cfg : (VspecDynamicQuantConfig){2, 4, 32, 99.5f};
-        if (type == VSPEC_LAYER_MLP || type == VSPEC_LAYER_ATTENTION_QK) {
+    const float pressure = vspec_pressure_from_metrics(metrics, budget, policy ? policy->memory_target_bytes : 0U);
+    const uint16_t model_id = vspec_model_id_from_layer_id(layer_id);
+    const float precision_downgrade_trigger_fallback = vspec_env_float_or_default(
+        "VSPEC_PRECISION_DOWNGRADE_TRIGGER",
+        policy ? policy->pressure_high : 0.80f
+    );
+    const float precision_downgrade_trigger = vspec_adaptive_precision_resolve_precision_downgrade_trigger(
+        model_id,
+        precision_downgrade_trigger_fallback
+    );
+    const float cache_compression_trigger = vspec_env_float_or_default(
+        "VSPEC_CACHE_COMPRESSION_TRIGGER",
+        policy ? policy->pressure_critical : 0.92f
+    );
+    const uint8_t per_model_env_cap = vspec_env_u8_or_default("VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP", 4U);
+    const uint8_t per_model_bit_cap = vspec_adaptive_precision_resolve_bit_cap(model_id, per_model_env_cap);
+
+    if (per_model_bit_cap < max_bits) {
+        max_bits = per_model_bit_cap;
+        if (min_bits > max_bits) {
+            min_bits = max_bits;
+        }
+    }
+
+    const int kv_compress = vspec_adaptive_precision_should_compress_kv(model_id, pressure, cache_compression_trigger);
+#if defined(_WIN32)
+    _putenv_s("VSPEC_KV_CACHE_COMPRESS_INT3", kv_compress ? "1" : "0");
+#else
+    setenv("VSPEC_KV_CACHE_COMPRESS_INT3", kv_compress ? "1" : "0", 1);
+#endif
+
+    if (data && count > 0U && pressure >= precision_downgrade_trigger) {
+        VspecDynamicQuantConfig cfg = policy ? policy->dyn_cfg : (VspecDynamicQuantConfig){3, 4, 32, 99.5f};
+        if (type == VSPEC_LAYER_MLP || type == VSPEC_LAYER_EMBED || type == VSPEC_LAYER_ATTENTION) {
             cfg.group_size = 32U;
         }
-        if (cfg.min_bits < min_bits) {
-            cfg.min_bits = min_bits;
+        if (cfg.min_bits < 3U) {
+            cfg.min_bits = 3U;
         }
-        if (cfg.max_bits > max_bits) {
-            cfg.max_bits = max_bits;
+        if (cfg.max_bits > 4U) {
+            cfg.max_bits = 4U;
         }
         VspecDynamicQuantDecision decision = vspec_dynamic_quant_decide(data, count, &cfg);
-        bits = decision.bits;
-
-        if (type == VSPEC_LAYER_ATTENTION_QK && cfg.max_bits >= 4U) {
-            float max_abs = 0.0f;
-            float rms_acc = 0.0f;
-            for (size_t i = 0; i < count; ++i) {
-                float v = fabsf(data[i]);
-                if (v > max_abs) {
-                    max_abs = v;
-                }
-                rms_acc += data[i] * data[i];
-            }
-            float rms = sqrtf(rms_acc / (float)count);
-            float outlier_ratio = (rms > 1e-6f) ? (max_abs / rms) : max_abs;
-            if (outlier_ratio >= 5.5f) {
-                bits = 4U;
-            }
-        }
+        bits = vspec_clamp_bits(decision.bits, 3U, 4U);
+    } else {
+        bits = 4U;
     }
 
     bits = vspec_clamp_bits(bits, min_bits, max_bits);
 
+    if (policy && policy->enable_bit_escalation && data && count > 0U) {
+        const float rms = vspec_layer_rms(data, count);
+        const float drift = vspec_activation_norm_drift(layer_id, type, rms);
+        float entropy_collapse = 0.0f;
+        if (type == VSPEC_LAYER_ATTENTION || type == VSPEC_LAYER_ATTENTION_QK) {
+            entropy_collapse = vspec_attention_entropy_collapse_score(data, count);
+        }
+
+        if (rms >= policy->residual_rms_escalate_threshold ||
+            drift >= policy->activation_norm_drift_threshold ||
+            entropy_collapse >= policy->attention_entropy_escalate_threshold) {
+            bits = 4U;
+        }
+    }
+
     if (policy) {
-        float pressure = vspec_pressure_from_metrics(metrics, budget, policy->memory_target_bytes);
         if (pressure >= policy->pressure_critical) {
             if (bits > policy->downshift_step * 2U) {
                 bits -= (uint8_t)(policy->downshift_step * 2U);
@@ -223,8 +375,8 @@ uint8_t vspec_mixed_bit_select_bits_realtime(
     const VspecMixedBitPressureProfile* pressure
 ) {
     uint8_t bits = vspec_mixed_bit_select_bits(runtime, policy, layer_id, type, data, count, metrics, budget);
-    uint8_t min_bits = policy ? policy->min_bits : 2U;
-    uint8_t max_bits = policy ? policy->max_bits : 3U;
+    uint8_t min_bits = policy ? policy->min_bits : 3U;
+    uint8_t max_bits = policy ? policy->max_bits : 4U;
     if (min_bits < 2U) {
         min_bits = 2U;
     }

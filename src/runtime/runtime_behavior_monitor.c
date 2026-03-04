@@ -52,7 +52,10 @@ void vspec_runtime_behavior_monitor_init(
 
     monitor->latest.integrity_pass = 1;
     monitor->latest.using_gpu_backend = using_gpu_backend ? 1 : 0;
-        monitor->latest.workload_scale = 1.0f;
+    monitor->latest.workload_scale = 1.0f;
+    monitor->latest.residual_rms = 0.0f;
+    monitor->latest.attention_entropy_collapse = 0.0f;
+    monitor->latest.activation_norm_drift = 0.0f;
 
     if (!monitor->latest.using_gpu_backend) {
         monitor->issue_mask |= VSPEC_RUNTIME_ISSUE_CPU_FALLBACK;
@@ -72,7 +75,14 @@ void vspec_runtime_behavior_monitor_update(
     monitor->latest = *snapshot;
     monitor->latest.observed_gpu_utilization = vspec_clamp01(monitor->latest.observed_gpu_utilization);
     monitor->latest.observed_vram_utilization = vspec_clamp01(monitor->latest.observed_vram_utilization);
-        monitor->latest.workload_scale = vspec_clamp01(monitor->latest.workload_scale);
+    monitor->latest.workload_scale = vspec_clamp01(monitor->latest.workload_scale);
+    monitor->latest.attention_entropy_collapse = vspec_clamp01(monitor->latest.attention_entropy_collapse);
+    if (monitor->latest.residual_rms < 0.0f) {
+        monitor->latest.residual_rms = 0.0f;
+    }
+    if (monitor->latest.activation_norm_drift < 0.0f) {
+        monitor->latest.activation_norm_drift = 0.0f;
+    }
 
     uint32_t issues_this_update = 0U;
     VspecRuntimeBehaviorSeverity severity_this_update = VSPEC_RUNTIME_SEVERITY_NONE;
@@ -132,6 +142,13 @@ void vspec_runtime_behavior_monitor_update(
         severity_this_update = vspec_merge_severity(severity_this_update, VSPEC_RUNTIME_SEVERITY_HIGH);
     }
 
+    if (monitor->latest.residual_rms >= 1.35f ||
+        monitor->latest.activation_norm_drift >= 0.30f ||
+        monitor->latest.attention_entropy_collapse >= 0.65f) {
+        issues_this_update |= VSPEC_RUNTIME_ISSUE_QUALITY_DRIFT;
+        severity_this_update = vspec_merge_severity(severity_this_update, VSPEC_RUNTIME_SEVERITY_HIGH);
+    }
+
     if (issues_this_update != 0U) {
         monitor->breach_updates += 1U;
         monitor->issue_mask |= issues_this_update;
@@ -160,7 +177,10 @@ void vspec_runtime_behavior_monitor_report(
     report->observed_gpu_utilization = monitor->latest.observed_gpu_utilization;
     report->observed_vram_utilization = monitor->latest.observed_vram_utilization;
     report->observed_effective_bits = monitor->latest.observed_effective_bits;
+    report->residual_rms = monitor->latest.residual_rms;
+    report->attention_entropy_collapse = monitor->latest.attention_entropy_collapse;
+    report->activation_norm_drift = monitor->latest.activation_norm_drift;
     report->integrity_pass = monitor->latest.integrity_pass;
     report->using_gpu_backend = monitor->latest.using_gpu_backend;
-        report->workload_scale = monitor->latest.workload_scale;
+    report->workload_scale = monitor->latest.workload_scale;
 }

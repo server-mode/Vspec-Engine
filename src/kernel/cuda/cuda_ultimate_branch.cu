@@ -207,6 +207,7 @@ void vspec_cuda_launch_linear_ultimate(VspecKernelContext* ctx) {
 
     const int enable_outlier = vspec_env_enabled("VSPEC_ULTIMATE_OUTLIER_AWARE", 1);
     const int enable_tensor_core = vspec_env_enabled("VSPEC_ULTIMATE_TENSORCORE", 1);
+    const int force_tensorcore_4bit = vspec_env_enabled("VSPEC_FORCE_TENSORCORE_4BIT", 0);
     const int enable_qlora = vspec_env_enabled("VSPEC_ULTIMATE_QLORA", 1);
     const float outlier_threshold = vspec_env_float("VSPEC_ULTIMATE_OUTLIER_TH", 6.0f);
     const float quality_bias = vspec_env_float("VSPEC_ULTIMATE_QUALITY_BIAS", 0.8f);
@@ -227,6 +228,9 @@ void vspec_cuda_launch_linear_ultimate(VspecKernelContext* ctx) {
 
     int prefer_high_precision = 0;
     if (outlier_ratio >= 0.02f || quality_bias >= 0.85f || ctx->qmeta.type == VSPEC_QUANT_NONE) {
+        prefer_high_precision = 1;
+    }
+    if (force_tensorcore_4bit && ctx->qmeta.type == VSPEC_QUANT_INT4) {
         prefer_high_precision = 1;
     }
 
@@ -255,7 +259,7 @@ void vspec_cuda_launch_linear_ultimate(VspecKernelContext* ctx) {
         free(w_kxn);
     } else {
         if (ctx->qmeta.type == VSPEC_QUANT_INT3) {
-            vspec_cuda_launch_fused_linear_int3(ctx);
+            vspec_cuda_launch_fused_linear_int3_storage(ctx);
         } else {
             vspec_cuda_launch_fused_linear_int4(ctx);
         }

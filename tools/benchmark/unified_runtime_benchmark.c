@@ -258,12 +258,12 @@ int main(void) {
     ctx.weight = w3;
     ctx.qmeta.type = VSPEC_QUANT_INT3;
     for (size_t it = 0; it < warmup; ++it) {
-        vspec_cuda_launch_fused_linear_int3(&ctx);
+        vspec_cuda_launch_fused_linear_int3_storage(&ctx);
     }
 
     const double gpu3_t0 = now_ms();
     for (size_t it = 0; it < iters; ++it) {
-        vspec_cuda_launch_fused_linear_int3(&ctx);
+        vspec_cuda_launch_fused_linear_int3_storage(&ctx);
     }
     const double gpu3_t1 = now_ms();
     const double gpu3_avg_ms = (gpu3_t1 - gpu3_t0) / (double)iters;

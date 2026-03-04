@@ -27,12 +27,15 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     char outlier_th_value[16] = {0};
     char quality_bias_value[16] = {0};
     char qlora_rank_value[16] = {0};
+    char precision_downgrade_trigger_value[16] = {0};
+    char cache_compression_trigger_value[16] = {0};
+    char per_model_adaptive_bit_cap_value[8] = {0};
     char runtime_3bit_value[8] = {0};
     char atn_qk_bits_value[8] = {0};
     char atn_proj_bits_value[8] = {0};
     char mlp_bits_value[8] = {0};
     char lm_head_bits_value[8] = {0};
-    (void)snprintf(bits_value, sizeof(bits_value), "%u", (unsigned)cfg->lowbit_target_bits);
+    (void)snprintf(bits_value, sizeof(bits_value), "%u", 4U);
     (void)snprintf(batch_value, sizeof(batch_value), "%u", (unsigned)cfg->dispatch_batch_hint);
     (void)snprintf(stream_value, sizeof(stream_value), "%u", (unsigned)cfg->stream_count_hint);
     (void)snprintf(gpu_util_value, sizeof(gpu_util_value), "%.2f", cfg->target_gpu_utilization);
@@ -44,16 +47,13 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)snprintf(outlier_th_value, sizeof(outlier_th_value), "%.3f", cfg->outlier_threshold);
     (void)snprintf(quality_bias_value, sizeof(quality_bias_value), "%.3f", cfg->quality_bias);
     (void)snprintf(qlora_rank_value, sizeof(qlora_rank_value), "%u", (unsigned)cfg->qlora_rank);
+    (void)snprintf(precision_downgrade_trigger_value, sizeof(precision_downgrade_trigger_value), "%.3f", cfg->precision_downgrade_trigger);
+    (void)snprintf(cache_compression_trigger_value, sizeof(cache_compression_trigger_value), "%.3f", cfg->cache_compression_trigger);
+    (void)snprintf(per_model_adaptive_bit_cap_value, sizeof(per_model_adaptive_bit_cap_value), "%u", (unsigned)cfg->per_model_adaptive_bit_cap);
     (void)snprintf(runtime_3bit_value, sizeof(runtime_3bit_value), "%d", (cfg->lowbit_target_bits == 3U) ? 1 : 0);
-    {
-        unsigned qk_bits = (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U);
-        if (cfg->lowbit_target_bits == 3U && cfg->quality_bias >= 0.70f) {
-            qk_bits = 4U;
-        }
-        (void)snprintf(atn_qk_bits_value, sizeof(atn_qk_bits_value), "%u", qk_bits);
-    }
+    (void)snprintf(atn_qk_bits_value, sizeof(atn_qk_bits_value), "%u", 4U);
     (void)snprintf(atn_proj_bits_value, sizeof(atn_proj_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits == 0U) ? 4U : 4U));
-    (void)snprintf(mlp_bits_value, sizeof(mlp_bits_value), "%u", (unsigned)((cfg->lowbit_target_bits <= 2U) ? 2U : 3U));
+    (void)snprintf(mlp_bits_value, sizeof(mlp_bits_value), "%u", (unsigned)((cfg->max_vram_utilization >= cfg->precision_downgrade_trigger) ? 3U : 4U));
     (void)snprintf(lm_head_bits_value, sizeof(lm_head_bits_value), "%u", 4U);
 
 #if defined(_WIN32)
@@ -70,6 +70,9 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)_putenv_s("VSPEC_ULTIMATE_OUTLIER_TH", outlier_th_value);
     (void)_putenv_s("VSPEC_ULTIMATE_QUALITY_BIAS", quality_bias_value);
     (void)_putenv_s("VSPEC_ULTIMATE_QLORA_RANK", qlora_rank_value);
+    (void)_putenv_s("VSPEC_PRECISION_DOWNGRADE_TRIGGER", precision_downgrade_trigger_value);
+    (void)_putenv_s("VSPEC_CACHE_COMPRESSION_TRIGGER", cache_compression_trigger_value);
+    (void)_putenv_s("VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP", per_model_adaptive_bit_cap_value);
     (void)_putenv_s("VSPEC_3BIT_RUNTIME_MODULE", runtime_3bit_value);
     (void)_putenv_s("VSPEC_3BIT_ATTN_QK_BITS", atn_qk_bits_value);
     (void)_putenv_s("VSPEC_3BIT_ATTN_PROJ_BITS", atn_proj_bits_value);
@@ -89,6 +92,9 @@ static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     (void)setenv("VSPEC_ULTIMATE_OUTLIER_TH", outlier_th_value, 1);
     (void)setenv("VSPEC_ULTIMATE_QUALITY_BIAS", quality_bias_value, 1);
     (void)setenv("VSPEC_ULTIMATE_QLORA_RANK", qlora_rank_value, 1);
+    (void)setenv("VSPEC_PRECISION_DOWNGRADE_TRIGGER", precision_downgrade_trigger_value, 1);
+    (void)setenv("VSPEC_CACHE_COMPRESSION_TRIGGER", cache_compression_trigger_value, 1);
+    (void)setenv("VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP", per_model_adaptive_bit_cap_value, 1);
     (void)setenv("VSPEC_3BIT_RUNTIME_MODULE", runtime_3bit_value, 1);
     (void)setenv("VSPEC_3BIT_ATTN_QK_BITS", atn_qk_bits_value, 1);
     (void)setenv("VSPEC_3BIT_ATTN_PROJ_BITS", atn_proj_bits_value, 1);
@@ -103,6 +109,7 @@ void vspec_runtime_init_default(void) {
 
 void vspec_runtime_init_with_hw_config(const char* config_path) {
     vspec_runtime_hw_config_default(&g_hw_state.config);
+    vspec_adaptive_precision_reset();
     g_hw_state.config_loaded_from_file = vspec_runtime_hw_config_load_file(config_path, &g_hw_state.config);
     vspec_runtime_apply_hw_env_hints(&g_hw_state.config);
     vspec_runtime_ultimate_init(&g_ultimate_state, &g_hw_state.config);
@@ -208,6 +215,25 @@ void vspec_runtime_behavior_observe(
     vspec_runtime_behavior_monitor_update(&g_behavior_monitor, &snapshot);
 }
 
+void vspec_runtime_behavior_observe_quality(
+    float residual_rms,
+    float attention_entropy_collapse,
+    float activation_norm_drift
+) {
+    VspecRuntimeBehaviorSnapshot snapshot = g_behavior_monitor.latest;
+    snapshot.residual_rms = residual_rms;
+    snapshot.attention_entropy_collapse = attention_entropy_collapse;
+    snapshot.activation_norm_drift = activation_norm_drift;
+    snapshot.using_gpu_backend =
+        (g_hw_state.active_backend_name && strcmp(g_hw_state.active_backend_name, "cpu") != 0) ? 1 : 0;
+
+    if (!g_language_guard_enabled) {
+        snapshot.integrity_pass = 1;
+    }
+
+    vspec_runtime_behavior_monitor_update(&g_behavior_monitor, &snapshot);
+}
+
 void vspec_runtime_behavior_set_workload_scale(float workload_scale) {
     if (workload_scale < 0.0f) {
         workload_scale = 0.0f;
@@ -224,6 +250,22 @@ void vspec_runtime_behavior_set_integrity_pass(int integrity_pass) {
 
 void vspec_runtime_behavior_report(VspecRuntimeBehaviorReport* report) {
     vspec_runtime_behavior_monitor_report(&g_behavior_monitor, report);
+}
+
+void vspec_runtime_set_model_precision_profile(
+    uint16_t model_id,
+    uint8_t bit_cap,
+    int storage_heavy_mode,
+    float precision_downgrade_trigger,
+    float cache_compression_trigger
+) {
+    VspecAdaptiveModelProfile profile;
+    profile.model_id = model_id;
+    profile.bit_cap = bit_cap;
+    profile.storage_heavy_mode = storage_heavy_mode ? 1 : 0;
+    profile.precision_downgrade_trigger = precision_downgrade_trigger;
+    profile.cache_compression_trigger = cache_compression_trigger;
+    vspec_adaptive_precision_set_profile(&profile);
 }
 
 VspecQuantType vspec_runtime_ultimate_recommend_quant_for_input(
