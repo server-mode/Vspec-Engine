@@ -39,6 +39,7 @@ add_library(vspec_engine
     src/attention/kv_ring.c
     src/attention/streaming.c
     src/attention/fused_graph.c
+    src/attention/kv_paged_cache.c
     src/model/qwen_ops.c
     src/graph/ir.c
     src/graph/optimizer.c
@@ -71,6 +72,7 @@ add_library(vspec_engine
     src/runtime/mixed_bit_policy.c
     src/runtime/adaptive_precision_engine.c
     src/scheduler/dynamic.c
+    src/scheduler/request_scheduler.c
     src/parallel/multi_gpu.c
 )
 
@@ -228,11 +230,23 @@ add_executable(vspec_stress_test
 
 target_link_libraries(vspec_stress_test PRIVATE vspec_engine)
 
+add_executable(vspec_request_scheduler_benchmark
+    tools/benchmark/runtime_request_scheduler_benchmark.c
+)
+
+target_link_libraries(vspec_request_scheduler_benchmark PRIVATE vspec_engine)
+
 add_executable(vspec_memory_profiler
     tools/profiler/memory_profiler.c
 )
 
 target_link_libraries(vspec_memory_profiler PRIVATE vspec_engine)
+
+add_executable(vspec_kv_paged_cache_profiler
+    tools/profiler/kv_paged_cache_profiler.c
+)
+
+target_link_libraries(vspec_kv_paged_cache_profiler PRIVATE vspec_engine)
 
 add_executable(vspec_missing_features_demo
     examples/missing_features_demo.c
