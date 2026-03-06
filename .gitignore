@@ -15,3 +15,5 @@ kernel.md
 Roadmap2.md
 benchmark.md
 job/
+qwen3_8b_ir_full.json
+qwen3_8b_ir.json

@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--target-bits", type=int, choices=[0, 2, 3, 4], default=None)
     parser.add_argument("--max-layers", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-decode-seconds", type=float, default=-1.0, help="<0 auto, =0 disable timeout, >0 fixed")
+    parser.add_argument("--max-retry-seconds", type=float, default=-1.0, help="<0 auto, =0 disable retry, >0 fixed")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
@@ -25,6 +27,7 @@ def main() -> None:
     parser.add_argument("--no-repeat-ngram", type=int, default=3)
     parser.add_argument("--speed-preset", default="fast", choices=["normal", "fast", "ultra"])
     parser.add_argument("--lang", default="auto", choices=["auto", "vi", "en"])
+    parser.add_argument("--unsafe-low-layers", action="store_true", help="Allow very low max-layers even if response quality may collapse")
     parser.add_argument("--stream", action="store_true", help="Stream tokens for single prompt mode")
     parser.add_argument("--json", action="store_true", help="Emit JSON output for automation")
 
@@ -42,6 +45,8 @@ def main() -> None:
         target_bits=args.target_bits,
         max_layers=args.max_layers,
         max_tokens=args.max_tokens,
+        max_decode_seconds=args.max_decode_seconds,
+        max_retry_seconds=args.max_retry_seconds,
         temperature=args.temperature,
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
@@ -50,6 +55,7 @@ def main() -> None:
         speed_preset=args.speed_preset,
         lang=args.lang,
         stream=args.stream,
+        unsafe_low_layers=bool(args.unsafe_low_layers),
     )
 
     if args.chat:

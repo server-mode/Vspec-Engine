@@ -18,6 +18,8 @@ class VspecRunArgs:
     target_bits: int | None = None
     max_layers: int = 0
     max_tokens: int = 128
+    max_decode_seconds: float = -1.0
+    max_retry_seconds: float = -1.0
     temperature: float = 0.8
     top_k: int = 40
     repetition_penalty: float = 1.15
@@ -26,6 +28,7 @@ class VspecRunArgs:
     speed_preset: str = "fast"
     lang: str = "auto"
     stream: bool = False
+    unsafe_low_layers: bool = False
 
 
 def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
@@ -50,6 +53,10 @@ def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
         str(int(args.max_layers)),
         "--max-tokens",
         str(int(args.max_tokens)),
+        "--max-decode-seconds",
+        str(float(args.max_decode_seconds)),
+        "--max-retry-seconds",
+        str(float(args.max_retry_seconds)),
         "--temperature",
         str(float(args.temperature)),
         "--top-k",
@@ -67,8 +74,12 @@ def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
         "--no-progress",
     ]
 
+    if args.unsafe_low_layers:
+        cmd.append("--unsafe-low-layers")
+
     if interactive:
         cmd.append("--interactive")
+        cmd.append("--no-stream")
     else:
         cmd.extend(["--prompt", args.prompt])
         if not args.stream:

@@ -346,6 +346,13 @@ def _run_interactive_session(args) -> int:
         str(args.language_guard_strictness),
         "--structure-guard-strictness",
         str(args.structure_guard_strictness),
+        "--decode-opt-mode",
+        str(args.decode_opt_mode),
+        "--max-decode-seconds",
+        str(args.max_decode_seconds),
+        "--max-retry-seconds",
+        str(args.max_retry_seconds),
+        "--allow-semantic-rescue",
     ]
 
     if args.greedy:
@@ -360,9 +367,37 @@ def _run_interactive_session(args) -> int:
         cmd.append("--no-prioritize-english")
     if args.disable_structure_guard:
         cmd.append("--disable-structure-guard")
-
+    if args.enable_3bit_runtime_module:
+        cmd.append("--enable-3bit-runtime-module")
+    if args.unsafe_low_layers:
+        cmd.append("--unsafe-low-layers")
     completed = subprocess.run(cmd)
     return int(completed.returncode)
+
+
+def _resolve_quality_layer_floor(config: dict, requested_max_layers: int, device: str, unsafe_low_layers: bool) -> int:
+    try:
+        total_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
+    except Exception:
+        total_layers = 0
+    if total_layers <= 0:
+        return requested_max_layers
+    if requested_max_layers <= 0:
+        return requested_max_layers
+    if unsafe_low_layers:
+        return requested_max_layers
+    if device not in {"cuda", "cuda-native", "torch-cuda"}:
+        return requested_max_layers
+
+    floor = 8
+    if total_layers >= 40:
+        floor = 12
+    if total_layers >= 56:
+        floor = 16
+
+    if requested_max_layers < floor:
+        return floor
+    return requested_max_layers
 
 
 def _extract_output_block(stdout_text: str) -> str:
@@ -392,6 +427,11 @@ def _looks_gibberish_output(text: str) -> bool:
     out = (text or "").strip()
     if not out:
         return True
+    if len(out) >= 32 and out.count("\n") <= 1:
+        quote_ratio = (out.count("\"") + out.count("'")) / max(1, len(out))
+        comma_ratio = out.count(",") / max(1, len(out))
+        if quote_ratio > 0.08 or comma_ratio > 0.10:
+            return True
     letters = sum(1 for ch in out if ch.isalpha())
     if len(out) >= 40 and (letters / max(1, len(out))) < 0.45:
         return True
@@ -399,6 +439,19 @@ def _looks_gibberish_output(text: str) -> bool:
     if len(out) >= 40 and (punct / max(1, len(out))) > 0.22:
         return True
     words = re.findall(r"[A-Za-z]{2,}", out)
+    if len(words) >= 16:
+        normalized = [w.lower() for w in words]
+        unique_ratio = len(set(normalized)) / max(1, len(normalized))
+        if unique_ratio < 0.45:
+            return True
+        short_words = [w for w in normalized if len(w) <= 5]
+        if short_words:
+            counts = {}
+            for w in short_words:
+                counts[w] = counts.get(w, 0) + 1
+            top_freq = max(counts.values()) if counts else 0
+            if top_freq / max(1, len(short_words)) > 0.22:
+                return True
     if len(words) == 1 and len(words[0]) >= 20:
         return True
     if 1 <= len(words) <= 3 and max(len(w) for w in words) >= 14:
@@ -535,17 +588,20 @@ def main() -> None:
     parser.add_argument("--no-prioritize-english", action="store_true", help="Disable English-first fallback when language is ambiguous")
     parser.add_argument("--disable-structure-guard", action="store_true", help="Disable output structure integrity guard")
     parser.add_argument("--structure-guard-strictness", type=float, default=0.72, help="0..1, higher is stricter for structural integrity")
-    parser.add_argument("--decode-opt-mode", default="stable", choices=["stable", "optimized"], help="Decode optimization module mode")
+    parser.add_argument("--decode-opt-mode", default="optimized", choices=["stable", "optimized"], help="Decode optimization module mode")
+    parser.add_argument("--max-decode-seconds", type=float, default=-1.0, help="<0 auto, =0 disable timeout, >0 fixed decode budget")
+    parser.add_argument("--max-retry-seconds", type=float, default=-1.0, help="Interactive retry budget: <0 auto, =0 disable, >0 fixed")
     parser.add_argument("--runtime-mix-mode", default="native-only", choices=["native-only", "hybrid-verify"], help="native-only=single runtime, hybrid-verify=native then torch verifier on fallback")
     parser.add_argument("--hybrid-verifier-policy", default="auto", choices=["auto", "off", "on"], help="auto=skip verifier in 3-bit mode to protect speed/VRAM")
     parser.add_argument("--hybrid-verifier-device", default="torch-cuda", choices=["torch-cuda", "cpu"], help="Verifier device when hybrid verifier runs")
     parser.add_argument("--hybrid-verifier-timeout-sec", type=float, default=8.0, help="Timeout for verifier subprocess")
     parser.add_argument("--enable-3bit-runtime-module", action="store_true", help="Enable dedicated 3-bit noise and sampling module")
-    parser.add_argument("--allow-semantic-rescue", action="store_true", help="Allow intent-based synthetic rescue response when decode fails")
+    parser.add_argument("--allow-semantic-rescue", action="store_true", help="Deprecated no-op: synthetic rescue responses are disabled by integrity policy")
     parser.add_argument("--threebit-test-boost", action="store_true", help="Boost test run with deeper layers and more tokens for 3-bit validation")
     parser.add_argument("--prototype-2bit", action="store_true", help="Enable non-invasive 2-bit prototype module")
     parser.add_argument("--prototype-2bit-mode", default="balanced", choices=["safe", "balanced", "aggressive"], help="2-bit prototype policy profile")
     parser.add_argument("--prototype-2bit-protect-last", type=int, default=2, help="Number of final layers kept at original precision")
+    parser.add_argument("--unsafe-low-layers", action="store_true", help="Allow very low max-layers even if quality may collapse")
     args = parser.parse_args()
 
     if args.interactive:
@@ -578,6 +634,10 @@ def main() -> None:
     snapshot_dir = find_snapshot_dir(model_dir)
     _progress(show_progress, 15, "config", "loading model and tokenizer config")
     config = read_config(snapshot_dir)
+    requested_layers = int(args.max_layers)
+    args.max_layers = _resolve_quality_layer_floor(config, requested_layers, str(args.device), bool(args.unsafe_low_layers))
+    if requested_layers > 0 and args.max_layers != requested_layers:
+        print(f"[vspec-chat] quality_guard_max_layers_adjusted= {requested_layers} -> {args.max_layers}")
     tok_cfg = read_tokenizer_config(snapshot_dir)
     tokenizer = load_tokenizer(snapshot_dir)
     _progress(show_progress, 35, "weights", "indexing safetensors headers")
@@ -801,7 +861,23 @@ def main() -> None:
     _progress(show_progress, 82, "decode", f"max_steps={max_steps}")
     fast_engine.begin_stream()
     stream_buffer = []
+    decode_start_ts = time.perf_counter()
+    if float(args.max_decode_seconds) > 0.0:
+        decode_budget_seconds = max(0.5, float(args.max_decode_seconds))
+    elif float(args.max_decode_seconds) == 0.0:
+        decode_budget_seconds = 0.0
+    else:
+        prompt_chars = len(str(args.prompt or "").strip())
+        auto_budget = 14.0 + (0.12 * float(max_steps)) + (0.02 * float(prompt_chars))
+        if max_steps <= 64:
+            auto_budget = max(auto_budget, 22.0)
+        decode_budget_seconds = min(90.0, max(14.0, auto_budget))
+    print(f"[vspec-chat] decode_budget_seconds= {decode_budget_seconds:.1f}")
     for step in range(max_steps):
+        decode_elapsed = time.perf_counter() - decode_start_ts
+        if decode_budget_seconds > 0.0 and decode_elapsed >= decode_budget_seconds:
+            print(f"[vspec-chat] decode_timeout= True (budget={decode_budget_seconds:.1f}s)")
+            break
         if runtime is None:
             logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
         else:

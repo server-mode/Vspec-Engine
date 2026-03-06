@@ -240,15 +240,4 @@ def postprocess_output_text(text: str, prompt: str, lang_mode: str) -> str:
         return assurance.repair(out, prompt)
     if lang_mode != "vi":
         return assurance.repair(out, prompt)
-
-    lower = out.lower()
-    vi_marks = re.search(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]", lower) is not None
-    has_common_vi = any(w in lower for w in ["xin", "chào", "ban", "bạn", "toi", "tôi", "giup", "giúp", "cam", "cảm"])
-    looks_weird = re.search(r"\b[a-z]{6,}\b", lower) is not None and not vi_marks and not has_common_vi
-    ascii_only_word = re.fullmatch(r"[a-z\s]{1,8}", lower) is not None and not vi_marks and not has_common_vi
-
-    p = (prompt or "").lower()
-    is_greeting = bool(re.search(r"\b(xin\s+chào|xin\s+chao|hello|hi)\b", p, flags=re.IGNORECASE))
-    if is_greeting and (looks_weird or ascii_only_word):
-        return "Xin chào! Mình có thể giúp gì cho bạn?"
     return assurance.repair(out, prompt)
