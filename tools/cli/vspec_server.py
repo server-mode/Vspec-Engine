@@ -162,7 +162,7 @@ def main() -> None:
 
     parser.add_argument("--device", default="", choices=["", "cpu", "cuda", "cuda-native", "torch-cuda"])
     parser.add_argument("--fused-bits", type=int, choices=[0, 3, 4], default=None)
-    parser.add_argument("--target-bits", type=int, choices=[0, 2, 3, 4], default=None)
+    parser.add_argument("--target-bits", type=int, choices=[0, 2, 3, 4, 8, 16], default=None)
     parser.add_argument("--max-layers", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.8)

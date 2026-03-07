@@ -19,7 +19,7 @@ from model_loader import (
     read_tokenizer_config,
     summarize_weight_dtypes,
 )
-from runtime_inference import build_generic_runtime, runtime_load_reason
+from runtime_inference import build_generic_runtime, runtime_load_reason, runtime_matrix_bits_summary
 from chat_prompt import build_prompt
 from vspec_cuda_bridge import cuda_mem_info
 from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
@@ -28,6 +28,7 @@ from language_structure_guard import LanguageStructureIntegrityManager
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
 from decode_optimization_module import DecodeOptimizationModule
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
+from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projection_stats_snapshot
 from runtime_threebit_module import ThreeBitRuntimeModule
 
 
@@ -581,8 +582,8 @@ def main() -> None:
     parser.add_argument("--speed-preset", default="fast", choices=["normal", "fast", "ultra"], help="Decoding speed profile")
     parser.add_argument("--no-stream", action="store_true", help="Disable token-by-token streaming output")
     parser.add_argument("--no-progress", action="store_true", help="Disable stage progress logs")
-    parser.add_argument("--target-bits", type=int, default=3, choices=[0, 2, 3, 4], help="Policy target bits for benchmark telemetry (default: 3)")
-    parser.add_argument("--fused-bits", type=int, default=3, choices=[0, 3, 4], help="Enable fused low-bit linear kernels for native path (default: 3)")
+    parser.add_argument("--target-bits", type=int, default=3, choices=[0, 2, 3, 4, 8, 16], help="Policy target bits for telemetry (3/4=low-bit, 8/16=high-precision)")
+    parser.add_argument("--fused-bits", type=int, default=3, choices=[0, 3, 4, 16], help="Enable fused low-bit linear kernels (16 = high-precision passthrough diagnostic)")
     parser.add_argument("--disable-language-guard", action="store_true", help="Disable Language Stability Guard")
     parser.add_argument("--language-guard-strictness", type=float, default=0.72, help="0..1, higher is stricter against language/script drift")
     parser.add_argument("--no-prioritize-english", action="store_true", help="Disable English-first fallback when language is ambiguous")
@@ -621,7 +622,10 @@ def main() -> None:
     if int(args.fused_bits) == 3 and int(args.max_layers) > 0 and int(args.max_layers) < 8:
         args.max_layers = 8
 
-    os.environ["VSPEC_FUSED_BITS"] = str(args.fused_bits)
+    fused_bits_env = int(args.fused_bits)
+    if fused_bits_env not in {0, 3, 4}:
+        fused_bits_env = 0
+    os.environ["VSPEC_FUSED_BITS"] = str(fused_bits_env)
     if int(args.fused_bits) == 3 or int(args.target_bits) == 3:
         os.environ["VSPEC_3BIT_RUNTIME_MODULE"] = "1"
 
@@ -859,6 +863,7 @@ def main() -> None:
         max_steps = max(1, min(4096, max_ctx - len(token_ids)))
 
     _progress(show_progress, 82, "decode", f"max_steps={max_steps}")
+    lowbit_projection_stats_reset()
     fast_engine.begin_stream()
     stream_buffer = []
     decode_start_ts = time.perf_counter()
@@ -984,16 +989,24 @@ def main() -> None:
     print("[vspec-chat] tokens_total=", total_tok)
     print("[vspec-chat] tokens_per_sec=", round(tps, 4))
 
-    if args.target_bits > 0 and runtime is not None and hasattr(runtime, "layers"):
-        layer_bits = build_layer_bits(len(runtime.layers), args.target_bits)
-        est_bits = effective_bits(layer_bits)
-        print("[vspec-chat] lowbit_mode=policy")
-        print("[vspec-chat] target_bits=", args.target_bits)
-        print("[vspec-chat] layer_bits=", summarize_layer_bits(layer_bits))
-        print("[vspec-chat] effective_bits_estimate=", round(est_bits, 4))
-    low_bit = all(("int4" in k or "int3" in k or "int2" in k) for k in dtype_stats.keys()) if dtype_stats else False
-    if args.target_bits in {2, 3, 4}:
-        low_bit = True
+    low_bit = False
+    if runtime is not None and hasattr(runtime, "layers"):
+        try:
+            matrix_bits, exec_eff_bits, has_lowbit, lowbit_coverage = runtime_matrix_bits_summary(runtime.layers)
+            print("[vspec-chat] lowbit_mode=runtime")
+            print("[vspec-chat] target_bits=", args.target_bits)
+            print("[vspec-chat] matrix_bits=", matrix_bits)
+            print("[vspec-chat] effective_bits_estimate=", round(exec_eff_bits, 4))
+            print("[vspec-chat] lowbit_coverage=", round(lowbit_coverage, 4))
+            low_bit = bool(has_lowbit)
+        except Exception:
+            layer_bits = build_layer_bits(len(runtime.layers), args.target_bits)
+            est_bits = effective_bits(layer_bits)
+            print("[vspec-chat] lowbit_mode=policy-fallback")
+            print("[vspec-chat] target_bits=", args.target_bits)
+            print("[vspec-chat] layer_bits=", summarize_layer_bits(layer_bits))
+            print("[vspec-chat] effective_bits_estimate=", round(est_bits, 4))
+            low_bit = any(v <= 4 for v in layer_bits)
     print("[vspec-chat] processing_leq_4bit=", low_bit)
     if not low_bit:
         print("[vspec-chat] note=weights are not <=4-bit in this path (mostly fp16/bf16/fp32)")
@@ -1009,6 +1022,12 @@ def main() -> None:
         print("[vspec-chat] vram_used_before_bytes=", used_before)
         print("[vspec-chat] vram_used_after_bytes=", used_after)
         print("[vspec-chat] vram_delta_bytes=", used_after - used_before)
+
+    lowbit_stats = lowbit_projection_stats_snapshot()
+    print("[vspec-chat] lowbit_exec_calls=", int(lowbit_stats.get("calls", 0)))
+    print("[vspec-chat] lowbit_exec_lowbit_calls=", int(lowbit_stats.get("lowbit_calls", 0)))
+    print("[vspec-chat] lowbit_exec_fallback_gemm_calls=", int(lowbit_stats.get("fallback_gemm_calls", 0)))
+    print("[vspec-chat] lowbit_exec_fallback_matmul_calls=", int(lowbit_stats.get("fallback_matmul_calls", 0)))
 
 
 if __name__ == "__main__":

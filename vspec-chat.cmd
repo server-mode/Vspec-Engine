@@ -1,4 +1,9 @@
 @echo off
 set SCRIPT_DIR=%~dp0
-python "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+set VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe
+if exist "%VENV_PY%" (
+	"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+) else (
+	python "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+)
 exit /b %ERRORLEVEL%

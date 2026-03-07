@@ -14,8 +14,8 @@ def main() -> None:
     parser.add_argument("--chat", action="store_true", help="Interactive terminal chat mode")
 
     parser.add_argument("--device", default="", choices=["", "cpu", "cuda", "cuda-native", "torch-cuda"])
-    parser.add_argument("--fused-bits", type=int, choices=[0, 3, 4], default=None)
-    parser.add_argument("--target-bits", type=int, choices=[0, 2, 3, 4], default=None)
+    parser.add_argument("--fused-bits", type=int, choices=[0, 3, 4, 16], default=None)
+    parser.add_argument("--target-bits", type=int, choices=[0, 2, 3, 4, 8, 16], default=None)
     parser.add_argument("--max-layers", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--max-decode-seconds", type=float, default=-1.0, help="<0 auto, =0 disable timeout, >0 fixed")

@@ -68,6 +68,32 @@ from runtime_baseline_manager import resolve_runtime_baseline_plan
 from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
 
 
+_NP_SAFEOPEN_CACHE: dict[str, object] = {}
+_PT_SAFEOPEN_CACHE: dict[str, object] = {}
+
+
+def _get_safe_open_handle(path: Path, framework: str):
+    if safe_open is None:
+        return None
+    key = str(path)
+    if framework == "np":
+        handle = _NP_SAFEOPEN_CACHE.get(key)
+        if handle is None:
+            handle = safe_open(key, framework="np", device="cpu")
+            _NP_SAFEOPEN_CACHE[key] = handle
+        return handle
+    handle = _PT_SAFEOPEN_CACHE.get(key)
+    if handle is None:
+        handle = safe_open(key, framework="pt", device="cpu")
+        _PT_SAFEOPEN_CACHE[key] = handle
+    return handle
+
+
+def _clear_safe_open_caches() -> None:
+    _NP_SAFEOPEN_CACHE.clear()
+    _PT_SAFEOPEN_CACHE.clear()
+
+
 def _softmax(x: "np.ndarray") -> "np.ndarray":
     x = x - np.max(x, axis=-1, keepdims=True)
     exp_x = np.exp(x)
@@ -216,8 +242,20 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
     max_q = float((1 << (bits - 1)) - 1)
     min_q = float(-(1 << (bits - 1)))
 
-    max_abs = np.max(np.abs(w), axis=1)
-    scales = np.where(max_abs > 0.0, max_abs / max_q, 1.0).astype(np.float32)
+    percentile_env = os.getenv("VSPEC_QUANT_ROW_PERCENTILE", "0.995").strip()
+    try:
+        percentile = float(percentile_env)
+    except Exception:
+        percentile = 0.995
+    percentile = max(0.90, min(1.0, percentile))
+
+    abs_w = np.abs(w)
+    if percentile >= 0.9999:
+        rep_abs = np.max(abs_w, axis=1)
+    else:
+        rep_abs = np.quantile(abs_w, percentile, axis=1)
+    rep_abs = np.maximum(rep_abs, 1e-8)
+    scales = (rep_abs / max_q).astype(np.float32)
     q = np.round(w / scales[:, None])
     q = np.clip(q, min_q, max_q).astype(np.int8)
 
@@ -678,24 +716,27 @@ class GenericTransformerRuntimeTorch:
 def _load_tensor(info: WeightInfo) -> Optional["np.ndarray"]:
     if np is None or safe_open is None:
         return None
-    with safe_open(str(info.path), framework="np", device="cpu") as f:
-        try:
-            return f.get_tensor(info.name)
-        except TypeError:
-            if torch is None:
-                return None
+    f = _get_safe_open_handle(info.path, "np")
+    try:
+        return f.get_tensor(info.name)
+    except TypeError:
+        if torch is None:
+            return None
+    except Exception:
+        if torch is None:
+            return None
     if torch is None:
         return None
-    with safe_open(str(info.path), framework="pt", device="cpu") as f:
-        tensor = f.get_tensor(info.name)
+    f_pt = _get_safe_open_handle(info.path, "pt")
+    tensor = f_pt.get_tensor(info.name)
     return tensor.float().cpu().numpy()
 
 
 def _load_tensor_torch(info: WeightInfo, device: str) -> Optional["torch.Tensor"]:
     if torch is None or safe_open is None:
         return None
-    with safe_open(str(info.path), framework="pt", device="cpu") as f:
-        tensor = f.get_tensor(info.name)
+    f = _get_safe_open_handle(info.path, "pt")
+    tensor = f.get_tensor(info.name)
     return tensor.to(device=device)
 
 
@@ -841,6 +882,14 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
     if fused_bits in {3, 4}:
         keep_last_at_4 = max(0, int(os.getenv("VSPEC_THREEBIT_KEEP_LAST4", "4") or "4"))
         sensitive_threebit_keys = {"wq", "wk", "wo", "norm1", "norm2"}
+        int4_keys_raw = os.getenv("VSPEC_INT4_MATRIX_KEYS", "w1,w2,w3")
+        int4_allowed_keys = {k.strip().lower() for k in int4_keys_raw.split(",") if k.strip()}
+        if not int4_allowed_keys:
+            int4_allowed_keys = {"w1", "w2", "w3"}
+        int4_keep_first = max(0, int(os.getenv("VSPEC_INT4_KEEP_FIRST_FP", "2") or "2"))
+        int4_keep_last = max(0, int(os.getenv("VSPEC_INT4_KEEP_LAST_FP", "6") or "6"))
+        int4_keep_sensitive = (os.getenv("VSPEC_INT4_KEEP_SENSITIVE_FP", "1").strip().lower() not in {"0", "false", "no", "off"})
+        sensitive_int4_keys = {"wq", "wk", "wo"}
         for key, w in {
             "wq": layer.wq,
             "wk": layer.wk,
@@ -856,6 +905,18 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
                     matrix_bits = 4
                 if keep_last_at_4 > 0 and layer_idx >= max(0, total_layers - keep_last_at_4):
                     matrix_bits = 4
+            elif fused_bits == 4:
+                in_first_window = (int4_keep_first > 0 and layer_idx < int4_keep_first)
+                in_last_window = (int4_keep_last > 0 and layer_idx >= max(0, total_layers - int4_keep_last))
+                if key.lower() not in int4_allowed_keys:
+                    matrix_bits = 0
+                elif in_first_window or in_last_window:
+                    matrix_bits = 0
+                elif int4_keep_sensitive and (key in sensitive_int4_keys):
+                    matrix_bits = 0
+
+            if matrix_bits <= 0:
+                continue
 
             cache_key = _packed_cache_key(prefix, key, matrix_bits, w)
             cached = _load_packed_cache(cache_key)
@@ -950,114 +1011,117 @@ def _load_generic_transformer(
     use_native_cuda_norm: bool,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[GenericTransformerRuntime]:
-    embed = _load_pair(
-        weight_index,
-        [
-            "model.embed_tokens.weight",
-            "tok_embeddings.weight",
-            "transformer.wte.weight",
-        ],
-        [
-            "lm_head.weight",
-            "output.weight",
-            "transformer.lm_head.weight",
-        ],
-    )
-    if embed is None:
-        return None
-
-    embed_weight = embed.embed
-    lm_head = embed.lm_head
-
-    final_norm = _load_first_available(weight_index, "model.norm.weight")
-    if final_norm is None:
-        final_norm = _load_first_available(weight_index, "norm.weight")
-    if final_norm is None:
-        return None
-
-    num_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
-    if num_layers == 0:
-        num_layers = 1
-    if max_layers:
-        num_layers = min(num_layers, max_layers)
-
-    env_value = os.getenv("VSPEC_FUSED_BITS")
-    if env_value is not None:
-        try:
-            env_override = int(env_value or "0")
-        except Exception:
-            env_override = 0
-        fused_bits = env_override if env_override in {0, 3, 4} else 0
-    else:
-        baseline_plan = resolve_runtime_baseline_plan(
-            config=config,
-            use_native_cuda_norm=use_native_cuda_norm,
-            int3_available=fused_linear_int3_available(),
-            int4_available=fused_linear_int4_available(),
+    try:
+        embed = _load_pair(
+            weight_index,
+            [
+                "model.embed_tokens.weight",
+                "tok_embeddings.weight",
+                "transformer.wte.weight",
+            ],
+            [
+                "lm_head.weight",
+                "output.weight",
+                "transformer.lm_head.weight",
+            ],
         )
-        fused_bits = baseline_plan.fused_bits
+        if embed is None:
+            return None
 
-    lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
-    fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
+        embed_weight = embed.embed
+        lm_head = embed.lm_head
 
-    layers: list[LayerWeights] = []
-    if progress_cb is not None:
-        progress_cb("layer_load", 0, num_layers)
-    for idx in range(num_layers):
-        layer = _load_layer(weight_index, idx, fused_bits, num_layers)
-        if layer is None:
-            break
-        layers.append(layer)
+        final_norm = _load_first_available(weight_index, "model.norm.weight")
+        if final_norm is None:
+            final_norm = _load_first_available(weight_index, "norm.weight")
+        if final_norm is None:
+            return None
+
+        num_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
+        if num_layers == 0:
+            num_layers = 1
+        if max_layers:
+            num_layers = min(num_layers, max_layers)
+
+        env_value = os.getenv("VSPEC_FUSED_BITS")
+        if env_value is not None:
+            try:
+                env_override = int(env_value or "0")
+            except Exception:
+                env_override = 0
+            fused_bits = env_override if env_override in {0, 3, 4} else 0
+        else:
+            baseline_plan = resolve_runtime_baseline_plan(
+                config=config,
+                use_native_cuda_norm=use_native_cuda_norm,
+                int3_available=fused_linear_int3_available(),
+                int4_available=fused_linear_int4_available(),
+            )
+            fused_bits = baseline_plan.fused_bits
+
+        lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
+        fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
+
+        layers: list[LayerWeights] = []
         if progress_cb is not None:
-            progress_cb("layer_load", idx + 1, num_layers)
+            progress_cb("layer_load", 0, num_layers)
+        for idx in range(num_layers):
+            layer = _load_layer(weight_index, idx, fused_bits, num_layers)
+            if layer is None:
+                break
+            layers.append(layer)
+            if progress_cb is not None:
+                progress_cb("layer_load", idx + 1, num_layers)
 
-    if not layers:
-        return None
+        if not layers:
+            return None
 
-    hidden = embed_weight.shape[1]
-    num_heads = int(config.get("num_attention_heads", 0) or config.get("n_head", 0) or 0)
-    num_kv_heads = int(config.get("num_key_value_heads", 0) or config.get("n_kv_head", 0) or num_heads)
-    if num_heads <= 0:
-        num_heads = 32
-    if num_kv_heads <= 0:
-        num_kv_heads = num_heads
-    head_dim = hidden // num_heads
+        hidden = embed_weight.shape[1]
+        num_heads = int(config.get("num_attention_heads", 0) or config.get("n_head", 0) or 0)
+        num_kv_heads = int(config.get("num_key_value_heads", 0) or config.get("n_kv_head", 0) or num_heads)
+        if num_heads <= 0:
+            num_heads = 32
+        if num_kv_heads <= 0:
+            num_kv_heads = num_heads
+        head_dim = hidden // num_heads
 
-    rms_eps = float(config.get("rms_norm_eps", 1e-6))
-    rope_theta = float(config.get("rope_theta", 10000.0))
+        rms_eps = float(config.get("rms_norm_eps", 1e-6))
+        rope_theta = float(config.get("rope_theta", 10000.0))
 
-    return GenericTransformerRuntime(
-        embed=embed_weight,
-        lm_head=lm_head,
-        final_norm=final_norm,
-        layers=layers,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        rms_eps=rms_eps,
-        eos_token_id=None,
-        rope_theta=rope_theta,
-        position=0,
-        cache_k=[],
-        cache_v=[],
-        cache_len=[],
-        use_native_cuda_norm=use_native_cuda_norm,
-        fused_bits=fused_bits,
-        disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
-        inv_sqrt_head_dim=(1.0 / np.sqrt(float(head_dim))),
-        lowbit_plan=lowbit_plan,
-        rope_inv_freq=(1.0 / (rope_theta ** (np.arange(head_dim // 2, dtype=np.float32) / max(1, (head_dim // 2))))).astype(np.float32, copy=False),
-        rope_cos_cache=[],
-        rope_sin_cache=[],
-        attention_logit_clip=(24.0 if fused_bits == 3 else 48.0),
-        attn_tmp_buffers=[],
-        residual_error_buffers=[],
-        residual_feedback_gain=0.12,
-        residual_clamp_alpha=2.8,
-        logit_entropy_target=8.2,
-        logit_margin_floor=0.45,
-        logit_margin_gain=0.65,
-    )
+        return GenericTransformerRuntime(
+            embed=embed_weight,
+            lm_head=lm_head,
+            final_norm=final_norm,
+            layers=layers,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rms_eps=rms_eps,
+            eos_token_id=None,
+            rope_theta=rope_theta,
+            position=0,
+            cache_k=[],
+            cache_v=[],
+            cache_len=[],
+            use_native_cuda_norm=use_native_cuda_norm,
+            fused_bits=fused_bits,
+            disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
+            inv_sqrt_head_dim=(1.0 / np.sqrt(float(head_dim))),
+            lowbit_plan=lowbit_plan,
+            rope_inv_freq=(1.0 / (rope_theta ** (np.arange(head_dim // 2, dtype=np.float32) / max(1, (head_dim // 2))))).astype(np.float32, copy=False),
+            rope_cos_cache=[],
+            rope_sin_cache=[],
+            attention_logit_clip=(24.0 if fused_bits == 3 else 48.0),
+            attn_tmp_buffers=[],
+            residual_error_buffers=[],
+            residual_feedback_gain=0.12,
+            residual_clamp_alpha=2.8,
+            logit_entropy_target=8.2,
+            logit_margin_floor=0.45,
+            logit_margin_gain=0.65,
+        )
+    finally:
+        _clear_safe_open_caches()
 
 
 def _load_generic_transformer_torch(
@@ -1069,90 +1133,129 @@ def _load_generic_transformer_torch(
 ) -> Optional[GenericTransformerRuntimeTorch]:
     if torch is None:
         return None
+    try:
+        embed_info = _select_weight(weight_index, [
+            "model.embed_tokens.weight",
+            "tok_embeddings.weight",
+            "transformer.wte.weight",
+        ])
+        lm_info = _select_weight(weight_index, [
+            "lm_head.weight",
+            "output.weight",
+            "transformer.lm_head.weight",
+        ])
+        if embed_info is None or lm_info is None:
+            return None
 
-    embed_info = _select_weight(weight_index, [
-        "model.embed_tokens.weight",
-        "tok_embeddings.weight",
-        "transformer.wte.weight",
-    ])
-    lm_info = _select_weight(weight_index, [
-        "lm_head.weight",
-        "output.weight",
-        "transformer.lm_head.weight",
-    ])
-    if embed_info is None or lm_info is None:
-        return None
+        embed_weight = _load_tensor_torch(embed_info, device)
+        lm_head = _load_tensor_torch(lm_info, device)
+        if embed_weight is None or lm_head is None:
+            return None
 
-    embed_weight = _load_tensor_torch(embed_info, device)
-    lm_head = _load_tensor_torch(lm_info, device)
-    if embed_weight is None or lm_head is None:
-        return None
+        embed_vocab, embed_dim = embed_weight.shape
+        if lm_head.shape[0] == embed_dim:
+            pass
+        elif lm_head.shape[1] == embed_dim:
+            lm_head = lm_head.t()
+        else:
+            return None
 
-    embed_vocab, embed_dim = embed_weight.shape
-    if lm_head.shape[0] == embed_dim:
-        pass
-    elif lm_head.shape[1] == embed_dim:
-        lm_head = lm_head.t()
-    else:
-        return None
+        final_norm = _load_first_available_torch(weight_index, "model.norm.weight", device)
+        if final_norm is None:
+            final_norm = _load_first_available_torch(weight_index, "norm.weight", device)
+        if final_norm is None:
+            return None
 
-    final_norm = _load_first_available_torch(weight_index, "model.norm.weight", device)
-    if final_norm is None:
-        final_norm = _load_first_available_torch(weight_index, "norm.weight", device)
-    if final_norm is None:
-        return None
+        num_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
+        if num_layers == 0:
+            num_layers = 1
+        if max_layers:
+            num_layers = min(num_layers, max_layers)
 
-    num_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
-    if num_layers == 0:
-        num_layers = 1
-    if max_layers:
-        num_layers = min(num_layers, max_layers)
-
-    layers: list[LayerWeights] = []
-    if progress_cb is not None:
-        progress_cb("layer_load", 0, num_layers)
-    for idx in range(num_layers):
-        layer = _load_layer_torch(weight_index, idx, device)
-        if layer is None:
-            break
-        layers.append(layer)
+        layers: list[LayerWeights] = []
         if progress_cb is not None:
-            progress_cb("layer_load", idx + 1, num_layers)
+            progress_cb("layer_load", 0, num_layers)
+        for idx in range(num_layers):
+            layer = _load_layer_torch(weight_index, idx, device)
+            if layer is None:
+                break
+            layers.append(layer)
+            if progress_cb is not None:
+                progress_cb("layer_load", idx + 1, num_layers)
 
-    if not layers:
-        return None
+        if not layers:
+            return None
 
-    hidden = embed_weight.shape[1]
-    num_heads = int(config.get("num_attention_heads", 0) or config.get("n_head", 0) or 0)
-    num_kv_heads = int(config.get("num_key_value_heads", 0) or config.get("n_kv_head", 0) or num_heads)
-    if num_heads <= 0:
-        num_heads = 32
-    if num_kv_heads <= 0:
-        num_kv_heads = num_heads
-    head_dim = hidden // num_heads
+        hidden = embed_weight.shape[1]
+        num_heads = int(config.get("num_attention_heads", 0) or config.get("n_head", 0) or 0)
+        num_kv_heads = int(config.get("num_key_value_heads", 0) or config.get("n_kv_head", 0) or num_heads)
+        if num_heads <= 0:
+            num_heads = 32
+        if num_kv_heads <= 0:
+            num_kv_heads = num_heads
+        head_dim = hidden // num_heads
 
-    rms_eps = float(config.get("rms_norm_eps", 1e-6))
-    rope_theta = float(config.get("rope_theta", 10000.0))
+        rms_eps = float(config.get("rms_norm_eps", 1e-6))
+        rope_theta = float(config.get("rope_theta", 10000.0))
 
-    return GenericTransformerRuntimeTorch(
-        embed=embed_weight,
-        lm_head=lm_head,
-        final_norm=final_norm,
-        layers=layers,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        rms_eps=rms_eps,
-        eos_token_id=None,
-        rope_theta=rope_theta,
-        position=0,
-        cache_k=[],
-        cache_v=[],
-    )
+        return GenericTransformerRuntimeTorch(
+            embed=embed_weight,
+            lm_head=lm_head,
+            final_norm=final_norm,
+            layers=layers,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rms_eps=rms_eps,
+            eos_token_id=None,
+            rope_theta=rope_theta,
+            position=0,
+            cache_k=[],
+            cache_v=[],
+        )
+    finally:
+        _clear_safe_open_caches()
 
 
 def build_runtime(adapter: ModelAdapter, weight_index: dict[str, WeightInfo]) -> Optional[SimpleRuntime]:
     return None
+
+
+def runtime_matrix_bits_summary(layers: list[LayerWeights]) -> tuple[str, float, bool, float]:
+    if not layers:
+        return "none", 0.0, False, 0.0
+
+    matrix_order = ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
+    per_layer_values: list[float] = []
+    has_lowbit = False
+    packed_total = 0
+    packed_lowbit = 0
+
+    for layer in layers:
+        vals: list[float] = []
+        for key in matrix_order:
+            packed_entry = layer.packed.get(key)
+            if packed_entry is None:
+                vals.append(16.0)
+            else:
+                bit_val = float(int(packed_entry[2]))
+                vals.append(bit_val)
+                packed_total += 1
+                if bit_val <= 4.0:
+                    has_lowbit = True
+                    packed_lowbit += 1
+        per_layer_values.append(sum(vals) / float(len(vals)))
+
+    if len(per_layer_values) <= 8:
+        summary = ",".join(f"{v:.1f}" for v in per_layer_values)
+    else:
+        head = ",".join(f"{v:.1f}" for v in per_layer_values[:4])
+        tail = ",".join(f"{v:.1f}" for v in per_layer_values[-4:])
+        summary = f"{head},...,{tail}"
+
+    eff = float(sum(per_layer_values) / float(len(per_layer_values)))
+    coverage = float(packed_lowbit) / float(max(1, packed_total)) if packed_total > 0 else 0.0
+    return summary, eff, has_lowbit, coverage
 
 
 def build_generic_runtime(

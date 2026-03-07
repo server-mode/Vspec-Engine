@@ -5,6 +5,9 @@ def build_layer_bits(num_layers: int, target_bits: int) -> list[int]:
     if num_layers <= 0 or target_bits <= 0:
         return []
 
+    if target_bits >= 8:
+        return [int(target_bits)] * num_layers
+
     target = max(2, min(4, int(target_bits)))
     bits = [target] * num_layers
 
