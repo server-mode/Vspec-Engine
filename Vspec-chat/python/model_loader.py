@@ -1,12 +1,51 @@
 import json
+import importlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
+
+from runtime_core_bridge import canonical_weight_name
 
 try:
     from tokenizers import Tokenizer
 except Exception:  # pragma: no cover - optional dependency
     Tokenizer = None
+
+try:
+    _transformers_mod = importlib.import_module("transformers")
+    AutoTokenizer = getattr(_transformers_mod, "AutoTokenizer", None)
+except Exception:  # pragma: no cover - optional dependency
+    AutoTokenizer = None
+
+
+class _EncodeResult:
+    def __init__(self, ids: list[int]) -> None:
+        self.ids = ids
+
+
+class _TransformersTokenizerAdapter:
+    def __init__(self, tokenizer) -> None:
+        self._tokenizer = tokenizer
+
+    def encode(self, text: str):
+        ids = self._tokenizer.encode(str(text), add_special_tokens=False)
+        return _EncodeResult([int(v) for v in ids])
+
+    def decode(self, ids: list[int]) -> str:
+        return self._tokenizer.decode(
+            [int(v) for v in ids],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def decode_batch(self, ids_batch: list[list[int]]) -> list[str]:
+        out: list[str] = []
+        for ids in ids_batch:
+            out.append(self.decode(ids))
+        return out
+
+    def get_vocab_size(self) -> int:
+        return int(len(self._tokenizer))
 
 
 def find_snapshot_dir(model_dir: Path) -> Path:
@@ -38,12 +77,19 @@ def read_tokenizer_config(snapshot_dir: Path) -> dict:
 
 
 def load_tokenizer(snapshot_dir: Path) -> Optional[object]:
-    if Tokenizer is None:
+    if Tokenizer is not None:
+        tok_path = snapshot_dir / "tokenizer.json"
+        if tok_path.exists():
+            return Tokenizer.from_file(str(tok_path))
+
+    if AutoTokenizer is None:
         return None
-    tok_path = snapshot_dir / "tokenizer.json"
-    if tok_path.exists():
-        return Tokenizer.from_file(str(tok_path))
-    return None
+
+    try:
+        hf_tok = AutoTokenizer.from_pretrained(str(snapshot_dir), use_fast=True, trust_remote_code=True)
+        return _TransformersTokenizerAdapter(hf_tok)
+    except Exception:
+        return None
 
 
 def _parse_safetensors_header(path: Path) -> dict:
@@ -93,7 +139,11 @@ def build_weight_index(snapshot_dir: Path) -> dict[str, WeightInfo]:
                 continue
             dtype = str(info.get("dtype", ""))
             shape = [int(x) for x in info.get("shape", [])]
-            index[name] = WeightInfo(name=name, dtype=dtype, shape=shape, path=path)
+            weight = WeightInfo(name=name, dtype=dtype, shape=shape, path=path)
+            index[name] = weight
+            mapped = canonical_weight_name(name)
+            if mapped and mapped not in index:
+                index[mapped] = WeightInfo(name=name, dtype=dtype, shape=shape, path=path)
     return index
 
 

@@ -78,6 +78,7 @@ def _unwrap_single_batch(output):
 
 _INT4_KERNEL_SELFTEST_DONE = False
 _INT4_KERNEL_SELFTEST_OK = False
+_INT4_DEBUG_COMPARE_SEEN: set[tuple[int, str]] = set()
 
 
 def _pack_signed_rowwise_int4(q: "np.ndarray") -> "np.ndarray":
@@ -89,6 +90,71 @@ def _pack_signed_rowwise_int4(q: "np.ndarray") -> "np.ndarray":
     lo = codes[:, 0::2]
     hi = codes[:, 1::2] << 4
     return (lo | hi).astype(np.uint8, copy=False).reshape(-1)
+
+
+def _unpack_int4_rowwise(packed: "np.ndarray", scales: "np.ndarray", out_n: int, k: int) -> "np.ndarray":
+    packed_flat = np.ascontiguousarray(packed.reshape(-1), dtype=np.uint8)
+    scales_flat = np.ascontiguousarray(scales.reshape(-1), dtype=np.float32)
+    packed_k = (k + 1) // 2
+    expected = out_n * packed_k
+    if packed_flat.size < expected or scales_flat.size < out_n:
+        raise ValueError("invalid packed/scales shape for int4 unpack")
+
+    w = np.zeros((out_n, k), dtype=np.float32)
+    for j in range(out_n):
+        base = j * packed_k
+        scale = float(scales_flat[j])
+        for t in range(k):
+            byte = int(packed_flat[base + (t >> 1)])
+            nibble = ((byte >> 4) & 0x0F) if (t & 1) else (byte & 0x0F)
+            if nibble >= 8:
+                nibble -= 16
+            w[j, t] = float(nibble) * scale
+    return w
+
+
+def _debug_compare_int4_kernel(
+    vec,
+    packed_w: "np.ndarray",
+    scales: "np.ndarray",
+    out_n: int,
+    layer_idx: int,
+    key: str,
+) -> None:
+    if np is None or not fused_linear_int4_available():
+        return
+    flag = os.getenv("VSPEC_INT4_DEBUG_COMPARE", "0").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return
+
+    max_checks_env = os.getenv("VSPEC_INT4_DEBUG_MAX_CHECKS", "12").strip()
+    try:
+        max_checks = max(1, int(max_checks_env))
+    except Exception:
+        max_checks = 12
+
+    marker = (int(layer_idx), str(key))
+    if marker in _INT4_DEBUG_COMPARE_SEEN:
+        return
+    if len(_INT4_DEBUG_COMPARE_SEEN) >= max_checks:
+        return
+
+    _INT4_DEBUG_COMPARE_SEEN.add(marker)
+
+    try:
+        vec_np = np.ascontiguousarray(vec.astype(np.float32, copy=False))
+        if vec_np.ndim == 1:
+            vec_np = vec_np[None, :]
+        k = int(vec_np.shape[-1])
+        w_deq = _unpack_int4_rowwise(packed_w, scales, int(out_n), k)
+        ref = np.ascontiguousarray(vec_np @ w_deq.T, dtype=np.float32)
+        got = np.ascontiguousarray(fused_linear_int4(vec_np, packed_w, scales, int(out_n)), dtype=np.float32)
+        err_abs = float(np.max(np.abs(ref - got)))
+        denom = float(np.max(np.abs(ref)) + 1e-6)
+        err_rel = float(err_abs / denom)
+        print(f"[int4 debug] layer={layer_idx} key={key} max_abs_err={err_abs:.6f} max_rel_err={err_rel:.6f}")
+    except Exception as exc:
+        print(f"[int4 debug] layer={layer_idx} key={key} compare_failed={exc}")
 
 
 def _quantize_rowwise_int4(weight: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
@@ -186,6 +252,7 @@ def lowbit_linear_project(
     if use_native_cuda_norm and lowbit_plan.enabled and lowbit_plan.bits in {3, 4} and key in packed:
         packed_w, scales, bits, out_n = packed[key]
         if bits == 4 and fused_linear_int4_available():
+            _debug_compare_int4_kernel(vec, packed_w, scales, out_n, layer_idx, key)
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
             return _unwrap_single_batch(fused_linear_int4(vec, packed_w, scales, out_n))
         if bits == 3 and fused_linear_int3_available():

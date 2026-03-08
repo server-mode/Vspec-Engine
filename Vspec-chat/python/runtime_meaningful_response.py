@@ -14,6 +14,9 @@ class RuntimeMeaningfulResponseAssurance:
             return self._decode_error_response()
         if self._is_decode_failure_message(cleaned):
             return self._decode_error_response()
+        salvaged = self._salvage_prefix(cleaned)
+        if salvaged and salvaged != cleaned:
+            return salvaged
         if self._looks_hard_corrupted(cleaned):
             return self._decode_error_response()
         return cleaned
@@ -29,9 +32,11 @@ class RuntimeMeaningfulResponseAssurance:
     def _looks_hard_corrupted(self, text: str) -> bool:
         if "�" in text:
             return True
-        if len(text) < 2:
+        if len(text) < 1:
             return True
         letters = sum(1 for ch in text if ch.isalpha())
+        if letters >= 1 and len(text) <= 3:
+            return False
         if len(text) >= 40 and (letters / max(1, len(text))) < 0.18:
             return True
 
@@ -56,6 +61,53 @@ class RuntimeMeaningfulResponseAssurance:
         if text.count("[") + text.count("]") >= 4:
             return True
         return False
+
+    def _salvage_prefix(self, text: str) -> str:
+        candidate = (text or "").strip()
+        if not candidate:
+            return ""
+
+        pieces = [seg.strip() for seg in re.split(r"[\r\n]+", candidate) if seg.strip()]
+        if not pieces:
+            return ""
+
+        first = pieces[0]
+        if self._is_reasonable_prefix(first):
+            return first
+
+        sentence_match = re.match(r"^(.{2,160}?[.!?])(?:\s|$)", candidate)
+        if sentence_match is not None:
+            first_sentence = sentence_match.group(1).strip()
+            if self._is_reasonable_prefix(first_sentence):
+                return first_sentence
+
+        short_clause = candidate.split(",", 1)[0].strip()
+        if self._is_reasonable_prefix(short_clause):
+            return short_clause
+
+        return ""
+
+    def _is_reasonable_prefix(self, text: str) -> bool:
+        sample = (text or "").strip()
+        if len(sample) < 2 or len(sample) > 160:
+            return False
+        if "�" in sample:
+            return False
+        if sample.lower().startswith("[vspec-decode-error]"):
+            return False
+        letters = sum(1 for ch in sample if ch.isalpha())
+        if letters < 2:
+            return False
+        if (letters / max(1, len(sample))) < 0.35:
+            return False
+        words = re.findall(r"[A-Za-z]{2,}", sample)
+        if not words and letters < 4:
+            return False
+        if len(words) == 1 and len(words[0]) > 20:
+            return False
+        if self._looks_hard_corrupted(sample):
+            return False
+        return True
 
     def _decode_error_response(self) -> str:
         if self.lang_mode == "en":

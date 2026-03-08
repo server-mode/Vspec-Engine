@@ -7,5 +7,6 @@
 
 int vspec_safetensors_parse_header_file(const char* path, VspecCompatModel* out_model);
 int vspec_safetensors_parse_header_json(const char* json, size_t len, VspecCompatModel* out_model);
+int vspec_safetensors_find_tensor_file(const char* path, const char* tensor_name, VspecCompatTensorInfo* out_tensor);
 
 #endif

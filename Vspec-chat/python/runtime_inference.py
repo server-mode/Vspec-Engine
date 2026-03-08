@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     from vspec_cuda_bridge import (
+        attention_flash_single_f32,
+        attention_flash_single_f32_available,
         attention_single_f32,
         attention_fused_single_f32,
         attention_fused_single_f32_available,
@@ -47,6 +49,8 @@ except Exception:  # pragma: no cover - optional dependency
     rmsnorm_f32_available = lambda: False
     linear_f32 = None
     linear_f32_available = lambda: False
+    attention_flash_single_f32 = None
+    attention_flash_single_f32_available = lambda: False
     attention_single_f32 = None
     attention_fused_single_f32 = None
     attention_fused_single_f32_available = lambda: False
@@ -64,6 +68,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from model_adapters import ModelAdapter
 from model_loader import WeightInfo
+from runtime_core_bridge import CorePagedKVCache
 from runtime_baseline_manager import resolve_runtime_baseline_plan
 from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
 
@@ -103,6 +108,8 @@ def _softmax(x: "np.ndarray") -> "np.ndarray":
 def _dynamic_clamp_std_vec(x: "np.ndarray", alpha: float) -> "np.ndarray":
     if x.size == 0:
         return x
+    if float(alpha) <= 0.0:
+        return x
     mean = float(np.mean(x, axis=-1, keepdims=False))
     var = float(np.mean((x - mean) * (x - mean), axis=-1, keepdims=False))
     std = float(np.sqrt(max(var, 0.0)))
@@ -114,17 +121,22 @@ def _stabilize_logits(logits: "np.ndarray", logit_clip: float, entropy_target: f
     if logits.size == 0:
         return logits
     centered = logits.astype(np.float32, copy=False)
-    centered = centered - np.mean(centered, dtype=np.float32)
+
     if logit_clip > 0.0:
         centered = np.clip(centered, -logit_clip, logit_clip)
 
+    if entropy_target <= 0.0 and margin_floor <= 0.0:
+        return centered.astype(np.float32, copy=False)
+
+    centered = centered - np.mean(centered, dtype=np.float32)
+
     probs = _softmax(centered.reshape(1, -1))[0]
     entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), dtype=np.float64)
-    if entropy > entropy_target:
+    if entropy_target > 0.0 and entropy > entropy_target:
         scale = min(1.45, 1.0 + 0.08 * float(entropy - entropy_target))
         centered = centered * np.float32(scale)
 
-    if centered.size >= 2:
+    if margin_floor > 0.0 and centered.size >= 2:
         top2 = np.argpartition(centered, -2)[-2:]
         a = int(top2[0])
         b = int(top2[1])
@@ -242,12 +254,12 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
     max_q = float((1 << (bits - 1)) - 1)
     min_q = float(-(1 << (bits - 1)))
 
-    percentile_env = os.getenv("VSPEC_QUANT_ROW_PERCENTILE", "0.995").strip()
+    percentile_env = os.getenv("VSPEC_QUANT_ROW_PERCENTILE", "0.999").strip()
     try:
         percentile = float(percentile_env)
     except Exception:
         percentile = 0.995
-    percentile = max(0.90, min(1.0, percentile))
+    percentile = max(0.95, min(1.0, percentile))
 
     abs_w = np.abs(w)
     if percentile >= 0.9999:
@@ -268,6 +280,11 @@ def _packed_cache_root() -> Path:
     if custom:
         return Path(custom)
     return Path(__file__).resolve().parents[2] / "logs" / "pack_cache"
+
+
+def _packed_cache_write_enabled() -> bool:
+    flag = os.getenv("VSPEC_PACK_CACHE_WRITE", "0").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
 
 
 def _packed_cache_key(prefix: str, key: str, bits: int, w: "np.ndarray") -> str:
@@ -292,6 +309,8 @@ def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray"] | No
 
 
 def _save_packed_cache(cache_key: str, packed: "np.ndarray", scales: "np.ndarray") -> None:
+    if not _packed_cache_write_enabled():
+        return
     try:
         root = _packed_cache_root()
         root.mkdir(parents=True, exist_ok=True)
@@ -352,6 +371,7 @@ class LayerWeights:
 class GenericTransformerRuntime:
     embed: "np.ndarray"
     lm_head: "np.ndarray"
+    lm_head_native: Optional["np.ndarray"]
     final_norm: "np.ndarray"
     layers: list[LayerWeights]
     num_heads: int
@@ -367,6 +387,8 @@ class GenericTransformerRuntime:
     use_native_cuda_norm: bool
     fused_bits: int
     disable_fused_attention: bool
+    flash_attention_min_tokens: int
+    flash_attention_block_tokens: int
     inv_sqrt_head_dim: float
     lowbit_plan: LowbitModulePlan
     rope_inv_freq: "np.ndarray"
@@ -374,7 +396,8 @@ class GenericTransformerRuntime:
     rope_sin_cache: list["np.ndarray"]
     attention_logit_clip: float
     attn_tmp_buffers: list["np.ndarray"]
-    residual_error_buffers: list["np.ndarray"]
+    residual_error_buffers_attn: list["np.ndarray"]
+    residual_error_buffers_ff: list["np.ndarray"]
     residual_feedback_gain: float
     residual_clamp_alpha: float
     logit_entropy_target: float
@@ -473,9 +496,26 @@ class GenericTransformerRuntime:
                 self.cache_v[idx][used] = v
                 self.cache_len[idx] = used + 1
 
+            mirrors = getattr(self, "kv_core_mirrors", None)
+            if mirrors is not None and idx < len(mirrors):
+                try:
+                    mirrors[idx].append(k, v)
+                except Exception:
+                    pass
+
             used_len = self.cache_len[idx]
             keys = self.cache_k[idx][:used_len]
             values = self.cache_v[idx][:used_len]
+            if mirrors is not None and idx < len(mirrors):
+                try:
+                    mirror_tokens = int(mirrors[idx].session_tokens())
+                    if mirror_tokens == used_len:
+                        mirror_keys, mirror_values = mirrors[idx].read_tokens(used_len)
+                        if mirror_keys is not None and mirror_values is not None:
+                            keys = mirror_keys
+                            values = mirror_values
+                except Exception:
+                    pass
 
             if len(self.attn_tmp_buffers) <= idx:
                 self.attn_tmp_buffers.append(np.empty((self.num_heads, self.head_dim), dtype=np.float32))
@@ -485,7 +525,9 @@ class GenericTransformerRuntime:
                 kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
                 kh = keys[:, kv_h, :]
                 vh = values[:, kv_h, :]
-                if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
+                if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_flash_single_f32_available() and used_len >= self.flash_attention_min_tokens:
+                    attn[h] = attention_flash_single_f32(qh, kh, vh, self.flash_attention_block_tokens)
+                elif self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
                     attn[h] = attention_fused_single_f32(qh, kh, vh)
                 elif self.use_native_cuda_norm and attention_single_f32_available():
                     attn[h] = attention_single_f32(qh, kh, vh)
@@ -502,12 +544,12 @@ class GenericTransformerRuntime:
             if layer.bo is not None:
                 attn = attn + layer.bo
 
-            if len(self.residual_error_buffers) <= idx:
-                self.residual_error_buffers.append(np.zeros_like(x, dtype=np.float32))
-            residual_err = self.residual_error_buffers[idx]
+            if len(self.residual_error_buffers_attn) <= idx:
+                self.residual_error_buffers_attn.append(np.zeros_like(x, dtype=np.float32))
+            residual_err = self.residual_error_buffers_attn[idx]
             attn_stable = _dynamic_clamp_std_vec(attn.astype(np.float32, copy=False), self.residual_clamp_alpha)
             attn_corrected = attn_stable + (self.residual_feedback_gain * residual_err)
-            self.residual_error_buffers[idx] = (attn.astype(np.float32, copy=False) - attn_stable).astype(np.float32, copy=False)
+            self.residual_error_buffers_attn[idx] = (attn.astype(np.float32, copy=False) - attn_stable).astype(np.float32, copy=False)
             x = x + attn_corrected
 
             if self.use_native_cuda_norm and rmsnorm_f32_available():
@@ -534,9 +576,11 @@ class GenericTransformerRuntime:
             ff = _linear_native(fused, layer.w2, "w2")
             if layer.b2 is not None:
                 ff = ff + layer.b2
+            if len(self.residual_error_buffers_ff) <= idx:
+                self.residual_error_buffers_ff.append(np.zeros_like(x, dtype=np.float32))
             ff_stable = _dynamic_clamp_std_vec(ff.astype(np.float32, copy=False), self.residual_clamp_alpha)
-            ff_corrected = ff_stable + (self.residual_feedback_gain * self.residual_error_buffers[idx])
-            self.residual_error_buffers[idx] = (ff.astype(np.float32, copy=False) - ff_stable).astype(np.float32, copy=False)
+            ff_corrected = ff_stable + (self.residual_feedback_gain * self.residual_error_buffers_ff[idx])
+            self.residual_error_buffers_ff[idx] = (ff.astype(np.float32, copy=False) - ff_stable).astype(np.float32, copy=False)
             x = x + ff_corrected
 
         self.position += 1
@@ -549,7 +593,8 @@ class GenericTransformerRuntime:
         else:
             x_last = _rms_norm(x, self.final_norm, self.rms_eps, None)
         if self.use_native_cuda_norm and gemm_f32_available():
-            logits = gemm_f32(x_last, self.lm_head)[0]
+            native_lm_head = self.lm_head_native if self.lm_head_native is not None else np.ascontiguousarray(self.lm_head.T, dtype=np.float32)
+            logits = gemm_f32(x_last, native_lm_head)[0]
         else:
             logits = x_last @ self.lm_head
         logits = _stabilize_logits(
@@ -566,6 +611,13 @@ class GenericTransformerRuntime:
             return
         for token_id in token_ids:
             self._forward_token(int(token_id), return_logits=False)
+
+    def reset_core_kv_mirrors(self) -> None:
+        for mirror in list(getattr(self, "kv_core_mirrors", []) or []):
+            try:
+                mirror.reset()
+            except Exception:
+                pass
 
     def forward_logits(self, token_ids: list[int]) -> list[float]:
         if np is None or not token_ids:
@@ -882,13 +934,13 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
     if fused_bits in {3, 4}:
         keep_last_at_4 = max(0, int(os.getenv("VSPEC_THREEBIT_KEEP_LAST4", "4") or "4"))
         sensitive_threebit_keys = {"wq", "wk", "wo", "norm1", "norm2"}
-        int4_keys_raw = os.getenv("VSPEC_INT4_MATRIX_KEYS", "w1,w2,w3")
+        int4_keys_raw = os.getenv("VSPEC_INT4_MATRIX_KEYS", "wq,wk,wv,wo,w1,w2,w3")
         int4_allowed_keys = {k.strip().lower() for k in int4_keys_raw.split(",") if k.strip()}
         if not int4_allowed_keys:
-            int4_allowed_keys = {"w1", "w2", "w3"}
-        int4_keep_first = max(0, int(os.getenv("VSPEC_INT4_KEEP_FIRST_FP", "2") or "2"))
-        int4_keep_last = max(0, int(os.getenv("VSPEC_INT4_KEEP_LAST_FP", "6") or "6"))
-        int4_keep_sensitive = (os.getenv("VSPEC_INT4_KEEP_SENSITIVE_FP", "1").strip().lower() not in {"0", "false", "no", "off"})
+            int4_allowed_keys = {"wq", "wk", "wv", "wo", "w1", "w2", "w3"}
+        int4_keep_first = max(0, int(os.getenv("VSPEC_INT4_KEEP_FIRST_FP", "0") or "0"))
+        int4_keep_last = max(0, int(os.getenv("VSPEC_INT4_KEEP_LAST_FP", "0") or "0"))
+        int4_keep_sensitive = (os.getenv("VSPEC_INT4_KEEP_SENSITIVE_FP", "0").strip().lower() not in {"0", "false", "no", "off"})
         sensitive_int4_keys = {"wq", "wk", "wo"}
         for key, w in {
             "wq": layer.wq,
@@ -1009,6 +1061,7 @@ def _load_generic_transformer(
     weight_index: dict[str, WeightInfo],
     max_layers: Optional[int],
     use_native_cuda_norm: bool,
+    fused_bits_override: Optional[int] = None,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[GenericTransformerRuntime]:
     try:
@@ -1043,21 +1096,28 @@ def _load_generic_transformer(
         if max_layers:
             num_layers = min(num_layers, max_layers)
 
-        env_value = os.getenv("VSPEC_FUSED_BITS")
-        if env_value is not None:
+        if fused_bits_override is not None:
             try:
-                env_override = int(env_value or "0")
+                override_bits = int(fused_bits_override)
             except Exception:
-                env_override = 0
-            fused_bits = env_override if env_override in {0, 3, 4} else 0
+                override_bits = 0
+            fused_bits = override_bits if override_bits in {0, 3, 4} else 0
         else:
-            baseline_plan = resolve_runtime_baseline_plan(
-                config=config,
-                use_native_cuda_norm=use_native_cuda_norm,
-                int3_available=fused_linear_int3_available(),
-                int4_available=fused_linear_int4_available(),
-            )
-            fused_bits = baseline_plan.fused_bits
+            env_value = os.getenv("VSPEC_FUSED_BITS")
+            if env_value is not None:
+                try:
+                    env_override = int(env_value or "0")
+                except Exception:
+                    env_override = 0
+                fused_bits = env_override if env_override in {0, 3, 4} else 0
+            else:
+                baseline_plan = resolve_runtime_baseline_plan(
+                    config=config,
+                    use_native_cuda_norm=use_native_cuda_norm,
+                    int3_available=fused_linear_int3_available(),
+                    int4_available=fused_linear_int4_available(),
+                )
+                fused_bits = baseline_plan.fused_bits
 
         lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
         fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
@@ -1087,10 +1147,19 @@ def _load_generic_transformer(
 
         rms_eps = float(config.get("rms_norm_eps", 1e-6))
         rope_theta = float(config.get("rope_theta", 10000.0))
+        attn_logit_clip = float(os.getenv("VSPEC_ATTN_LOGIT_CLIP", "0") or "0")
+        residual_feedback_gain = float(os.getenv("VSPEC_RESIDUAL_FEEDBACK_GAIN", "0") or "0")
+        residual_clamp_alpha = float(os.getenv("VSPEC_RESIDUAL_CLAMP_ALPHA", "0") or "0")
+        logit_entropy_target = float(os.getenv("VSPEC_LOGIT_ENTROPY_TARGET", "0") or "0")
+        logit_margin_floor = float(os.getenv("VSPEC_LOGIT_MARGIN_FLOOR", "0") or "0")
+        logit_margin_gain = float(os.getenv("VSPEC_LOGIT_MARGIN_GAIN", "0") or "0")
+        flash_attention_min_tokens = int(os.getenv("VSPEC_FLASH_ATTN_MIN_TOKENS", "256") or "256")
+        flash_attention_block_tokens = int(os.getenv("VSPEC_FLASH_ATTN_BLOCK_TOKENS", "128") or "128")
 
         return GenericTransformerRuntime(
             embed=embed_weight,
             lm_head=lm_head,
+            lm_head_native=np.ascontiguousarray(lm_head.T, dtype=np.float32) if use_native_cuda_norm else None,
             final_norm=final_norm,
             layers=layers,
             num_heads=num_heads,
@@ -1106,19 +1175,22 @@ def _load_generic_transformer(
             use_native_cuda_norm=use_native_cuda_norm,
             fused_bits=fused_bits,
             disable_fused_attention=(os.getenv("VSPEC_DISABLE_FUSED_ATTN", "0").strip().lower() in {"1", "true", "yes", "on"}),
+            flash_attention_min_tokens=max(1, flash_attention_min_tokens),
+            flash_attention_block_tokens=max(1, flash_attention_block_tokens),
             inv_sqrt_head_dim=(1.0 / np.sqrt(float(head_dim))),
             lowbit_plan=lowbit_plan,
             rope_inv_freq=(1.0 / (rope_theta ** (np.arange(head_dim // 2, dtype=np.float32) / max(1, (head_dim // 2))))).astype(np.float32, copy=False),
             rope_cos_cache=[],
             rope_sin_cache=[],
-            attention_logit_clip=(24.0 if fused_bits == 3 else 48.0),
+            attention_logit_clip=attn_logit_clip,
             attn_tmp_buffers=[],
-            residual_error_buffers=[],
-            residual_feedback_gain=0.12,
-            residual_clamp_alpha=2.8,
-            logit_entropy_target=8.2,
-            logit_margin_floor=0.45,
-            logit_margin_gain=0.65,
+            residual_error_buffers_attn=[],
+            residual_error_buffers_ff=[],
+            residual_feedback_gain=residual_feedback_gain,
+            residual_clamp_alpha=residual_clamp_alpha,
+            logit_entropy_target=logit_entropy_target,
+            logit_margin_floor=logit_margin_floor,
+            logit_margin_gain=logit_margin_gain,
         )
     finally:
         _clear_safe_open_caches()
@@ -1228,22 +1300,22 @@ def runtime_matrix_bits_summary(layers: list[LayerWeights]) -> tuple[str, float,
     matrix_order = ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
     per_layer_values: list[float] = []
     has_lowbit = False
-    packed_total = 0
-    packed_lowbit = 0
+    total_matrices = 0
+    lowbit_matrices = 0
 
     for layer in layers:
         vals: list[float] = []
         for key in matrix_order:
+            total_matrices += 1
             packed_entry = layer.packed.get(key)
             if packed_entry is None:
                 vals.append(16.0)
             else:
                 bit_val = float(int(packed_entry[2]))
                 vals.append(bit_val)
-                packed_total += 1
                 if bit_val <= 4.0:
                     has_lowbit = True
-                    packed_lowbit += 1
+                    lowbit_matrices += 1
         per_layer_values.append(sum(vals) / float(len(vals)))
 
     if len(per_layer_values) <= 8:
@@ -1254,7 +1326,7 @@ def runtime_matrix_bits_summary(layers: list[LayerWeights]) -> tuple[str, float,
         summary = f"{head},...,{tail}"
 
     eff = float(sum(per_layer_values) / float(len(per_layer_values)))
-    coverage = float(packed_lowbit) / float(max(1, packed_total)) if packed_total > 0 else 0.0
+    coverage = float(lowbit_matrices) / float(max(1, total_matrices)) if total_matrices > 0 else 0.0
     return summary, eff, has_lowbit, coverage
 
 
@@ -1263,6 +1335,8 @@ def build_generic_runtime(
     weight_index: dict[str, WeightInfo],
     max_layers: Optional[int],
     device: str,
+    fused_bits_override: Optional[int] = None,
+    use_native_cuda_norm_override: Optional[bool] = None,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[object]:
     if device == "torch-cuda" and torch is not None and torch.cuda.is_available():
@@ -1270,4 +1344,25 @@ def build_generic_runtime(
         if runtime is not None:
             return runtime
     use_native_cuda_norm = device in {"cuda", "cuda-native"}
-    return _load_generic_transformer(config, weight_index, max_layers, use_native_cuda_norm, progress_cb)
+    if use_native_cuda_norm_override is not None:
+        use_native_cuda_norm = bool(use_native_cuda_norm_override)
+    runtime = _load_generic_transformer(
+        config,
+        weight_index,
+        max_layers,
+        use_native_cuda_norm,
+        fused_bits_override=fused_bits_override,
+        progress_cb=progress_cb,
+    )
+    if runtime is not None and np is not None:
+        try:
+            page_tokens = max(16, int(os.getenv("VSPEC_CORE_KV_PAGE_TOKENS", "64") or "64"))
+            max_tokens = max(128, int(os.getenv("VSPEC_CORE_KV_MAX_TOKENS", "4096") or "4096"))
+            max_pages = max(4, (max_tokens + page_tokens - 1) // page_tokens)
+            runtime.kv_core_mirrors = [
+                CorePagedKVCache(page_tokens, max_pages, runtime.num_kv_heads, runtime.head_dim, session_id=idx + 1)
+                for idx in range(len(getattr(runtime, "layers", []) or []))
+            ]
+        except Exception:
+            runtime.kv_core_mirrors = []
+    return runtime

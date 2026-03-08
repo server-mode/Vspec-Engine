@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "vspec/kernel/cuda_ops.h"
@@ -33,11 +34,16 @@ extern "C" void vspec_cuda_gemm_f32(
     static size_t cap_in = 0U;
     static size_t cap_out = 0U;
     static cublasHandle_t handle = NULL;
+    static int tensorcore_mode = -1;
 
     if (!handle) {
         if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
             return;
         }
+    }
+    if (tensorcore_mode < 0) {
+        const char* env = getenv("VSPEC_USE_TENSORCORE_GEMM");
+        tensorcore_mode = (!env || env[0] == '\0' || strcmp(env, "0") != 0) ? 1 : 0;
     }
 
     GemmWeightCache* entry = NULL;
@@ -84,22 +90,54 @@ extern "C" void vspec_cuda_gemm_f32(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    cublasStatus_t st = cublasSgemm(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        (int)n,
-        (int)m,
-        (int)k,
-        &alpha,
-        entry->d_w,
-        (int)k,
-        d_in,
-        (int)k,
-        &beta,
-        d_out,
-        (int)n
-    );
+    cublasStatus_t st;
+    if (tensorcore_mode) {
+        (void)cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        st = cublasGemmEx(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)n,
+            (int)m,
+            (int)k,
+            &alpha,
+            entry->d_w,
+            CUDA_R_32F,
+            (int)k,
+            d_in,
+            CUDA_R_32F,
+            (int)k,
+            &beta,
+            d_out,
+            CUDA_R_32F,
+            (int)n,
+            CUBLAS_COMPUTE_32F_FAST_TF32,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            (void)cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        }
+    } else {
+        st = CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        st = cublasSgemm(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)n,
+            (int)m,
+            (int)k,
+            &alpha,
+            entry->d_w,
+            (int)k,
+            d_in,
+            (int)k,
+            &beta,
+            d_out,
+            (int)n
+        );
+    }
     if (st != CUBLAS_STATUS_SUCCESS) return;
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;

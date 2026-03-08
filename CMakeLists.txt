@@ -60,8 +60,12 @@ add_library(vspec_engine
     src/memory/memory_metrics.c
     src/memory/vram_scheduler.c
     src/runtime/runtime.c
+    src/runtime/continuous_batch.c
     src/runtime/torch_compat_module.c
     src/runtime/three_bit_runtime_modules.c
+    src/runtime/decode_session.c
+    src/runtime/continuous_batch.c
+    src/runtime/sampling_core.c
     src/runtime/hw_performance_manager.c
     src/runtime/language_structure_guard.c
     src/runtime/runtime_behavior_monitor.c
@@ -115,6 +119,13 @@ add_library(vspec_engine_capi SHARED
     src/compat/pytorch_loader.c
     src/compat/safetensors_parser.c
     src/compat/graph_rewrite.c
+    src/compat/weight_mapper.c
+    src/attention/kv_paged_cache.c
+    src/memory/vram_scheduler.c
+    src/scheduler/request_scheduler.c
+    src/runtime/continuous_batch.c
+    src/runtime/decode_session.c
+    src/runtime/sampling_core.c
     src/graph/ir.c
 )
 
@@ -132,6 +143,7 @@ set_target_properties(vspec_engine_capi PROPERTIES
 if(VSPEC_HAS_CUDA)
     add_library(vspec_cuda_bridge SHARED
         src/python/cuda_bridge.c
+        src/attention/flash_block.c
         src/kernel/cuda/cuda_rmsnorm_f32.cu
         src/kernel/cuda/cuda_linear_f32.cu
         src/kernel/cuda/cuda_gemm_f32.cu
@@ -144,6 +156,9 @@ if(VSPEC_HAS_CUDA)
 
     if (CUDAToolkit_FOUND)
         target_link_libraries(vspec_cuda_bridge PRIVATE CUDA::cublas)
+        target_compile_definitions(vspec_cuda_bridge PRIVATE VSPEC_USE_CUBLAS=1)
+    else()
+        target_compile_definitions(vspec_cuda_bridge PRIVATE VSPEC_USE_CUBLAS=0)
     endif()
 
     target_include_directories(vspec_cuda_bridge
@@ -235,6 +250,12 @@ add_executable(vspec_request_scheduler_benchmark
 )
 
 target_link_libraries(vspec_request_scheduler_benchmark PRIVATE vspec_engine)
+
+add_executable(vspec_continuous_batch_benchmark
+    tools/benchmark/continuous_batch_benchmark.c
+)
+
+target_link_libraries(vspec_continuous_batch_benchmark PRIVATE vspec_engine)
 
 add_executable(vspec_memory_profiler
     tools/profiler/memory_profiler.c

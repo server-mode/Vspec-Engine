@@ -195,3 +195,20 @@ int vspec_safetensors_parse_header_file(const char* path, VspecCompatModel* out_
     fclose(f);
     return ok;
 }
+
+int vspec_safetensors_find_tensor_file(const char* path, const char* tensor_name, VspecCompatTensorInfo* out_tensor) {
+    VspecCompatModel model;
+    if (!path || !tensor_name || !out_tensor) {
+        return 0;
+    }
+    if (!vspec_safetensors_parse_header_file(path, &model)) {
+        return 0;
+    }
+    for (size_t i = 0U; i < model.tensor_count; ++i) {
+        if (strcmp(model.tensors[i].name, tensor_name) == 0) {
+            *out_tensor = model.tensors[i];
+            return 1;
+        }
+    }
+    return 0;
+}

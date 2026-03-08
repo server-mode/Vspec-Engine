@@ -13,6 +13,9 @@ from language_structure_guard import LanguageStructureIntegrityManager
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projection_stats_snapshot
 from runtime_threebit_module import ThreeBitRuntimeModule
+from decode_contract import sanitize_and_validate_logits
+from native_safe_decode import build_native_safe_runtime
+from runtime_core_bridge import CoreDecodeSession
 from model_adapters import select_adapter
 from model_loader import (
     build_weight_index,
@@ -52,6 +55,7 @@ def _resolve_quality_layer_floor(config: dict, requested_max_layers: int, device
     return requested_max_layers
 
 
+
 def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     if not enabled:
         return
@@ -59,6 +63,7 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     if detail:
         msg += f" | {detail}"
     print(msg)
+
 
 
 def _generate(
@@ -89,6 +94,7 @@ def _generate(
     allow_semantic_rescue: bool,
     max_decode_seconds: float,
     max_retry_seconds: float,
+    native_safe_fallback_builder: Optional[Callable[[], object]],
     torch_timeout_fallback_builder: Optional[Callable[[], object]],
 ) -> str:
     lowbit_projection_stats_reset()
@@ -100,9 +106,17 @@ def _generate(
         token_ids = [adapter.bos_token_id] + token_ids
 
     assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=allow_semantic_rescue)
+    prompt_chars = len((prompt or "").strip())
 
-    def _is_meaningful_partial(candidate: str) -> bool:
+    def _is_meaningful_partial(candidate: str, generated_tokens: int) -> bool:
         out = (candidate or "").strip()
+        if lang_mode == "en" and prioritize_english:
+            letters = sum(1 for ch in out if ch.isalpha())
+            words = [w for w in out.split() if w]
+            if len(out) >= 12 and letters >= 6 and len(words) >= 2:
+                return True
+            if generated_tokens >= 8 and letters >= 6:
+                return True
         if len(out) < 24:
             return False
         letters = sum(1 for ch in out if ch.isalpha())
@@ -113,18 +127,19 @@ def _generate(
             return False
         return True
 
-    prompt_chars = len((prompt or "").strip())
-
-    def _resolve_decode_budget_seconds() -> float:
+    def _resolve_decode_budget_seconds(prefill_tokens: int, layer_count: int) -> float:
         raw = float(max_decode_seconds)
         if raw > 0.0:
             return max(0.5, raw)
         if raw == 0.0:
             return 0.0
-        auto = 12.0 + (0.16 * float(max_tokens)) + (0.025 * float(prompt_chars))
+        work_units = max(1, (max(0, int(prefill_tokens)) + max(1, int(max_tokens))) * max(1, int(layer_count)))
+        auto = 16.0 + (0.18 * float(max_tokens)) + (0.012 * float(prompt_chars)) + (0.008 * float(work_units))
         if max_tokens <= 64:
-            auto = max(auto, 24.0)
-        return min(90.0, max(16.0, auto))
+            auto = max(auto, 48.0)
+        if lang_mode == "en" and prioritize_english:
+            auto = max(auto, 60.0)
+        return min(240.0, max(20.0, auto))
 
     def _resolve_retry_budget_seconds(decode_budget: float) -> float:
         raw = float(max_retry_seconds)
@@ -133,28 +148,101 @@ def _generate(
         if raw == 0.0:
             return 0.0
         if decode_budget <= 0.0:
-            return 8.0
-        auto = decode_budget * 0.35
-        return min(24.0, max(6.0, auto))
+            return 10.0
+        auto = decode_budget * 0.55
+        return min(72.0, max(8.0, auto))
+
+    def _should_quality_retry(candidate: str) -> bool:
+        repaired = assurance.repair(candidate, prompt)
+        if _is_runtime_fallback_text(repaired, lang_mode):
+            return True
+        out = (repaired or "").strip()
+        if not out or "�" in out:
+            return True
+        if lang_mode == "en" and prioritize_english:
+            if len(out) < 12:
+                return True
+            return _looks_gibberish_output(repaired)
+        return _looks_gibberish_output(repaired)
 
     def _prefill_runtime(runtime_obj, local_tokens: list[int]) -> None:
         if not hasattr(runtime_obj, "cache_k"):
             return
+
+        def _cache_integrity_ok(expected_len: int) -> bool:
+            if expected_len <= 0:
+                return True
+            if not hasattr(runtime_obj, "cache_len"):
+                return True
+            try:
+                cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
+                layer_count = len(getattr(runtime_obj, "layers", []) or [])
+                if layer_count <= 0:
+                    return True
+                if len(cache_len_list) < layer_count:
+                    return False
+                return all(int(cache_len_list[i]) == int(expected_len) for i in range(layer_count))
+            except Exception:
+                return False
+
         runtime_obj.cache_k = []
         runtime_obj.cache_v = []
+        if hasattr(runtime_obj, "reset_core_kv_mirrors"):
+            try:
+                runtime_obj.reset_core_kv_mirrors()
+            except Exception:
+                pass
+        if hasattr(runtime_obj, "cache_len"):
+            runtime_obj.cache_len = []
         runtime_obj.position = 0
+
         prefill = local_tokens[:-1]
         total_prefill = len(prefill)
         if hasattr(runtime_obj, "prefill_tokens"):
             runtime_obj.prefill_tokens(prefill)
             if total_prefill > 0:
                 _progress(show_progress, 45, "prefill", f"{total_prefill}/{total_prefill}")
+            if _cache_integrity_ok(total_prefill):
+                if hasattr(runtime_obj, "cache_len"):
+                    cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
+                    if cache_len_list:
+                        print(f"[session] prefill_cache_len_min= {int(min(cache_len_list))}")
+                        print(f"[session] prefill_cache_len_max= {int(max(cache_len_list))}")
+                return
+
+            print("[session] prefill_cache_integrity= failed; replaying token-by-token")
+            if hasattr(runtime_obj, "reset_core_kv_mirrors"):
+                try:
+                    runtime_obj.reset_core_kv_mirrors()
+                except Exception:
+                    pass
+            runtime_obj.cache_k = []
+            runtime_obj.cache_v = []
+            if hasattr(runtime_obj, "cache_len"):
+                runtime_obj.cache_len = []
+            runtime_obj.position = 0
+            for idx, tid in enumerate(prefill, start=1):
+                runtime_obj.forward_logits([tid])
+                if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                    pct = 10 + int((idx / total_prefill) * 35)
+                    _progress(show_progress, min(45, pct), "prefill-replay", f"{idx}/{total_prefill}")
+            if hasattr(runtime_obj, "cache_len"):
+                cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
+                if cache_len_list:
+                    print(f"[session] prefill_cache_len_min= {int(min(cache_len_list))}")
+                    print(f"[session] prefill_cache_len_max= {int(max(cache_len_list))}")
             return
+
         for idx, tid in enumerate(prefill, start=1):
             runtime_obj.forward_logits([tid])
             if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
                 pct = 10 + int((idx / total_prefill) * 35)
                 _progress(show_progress, min(45, pct), "prefill", f"{idx}/{total_prefill}")
+        if hasattr(runtime_obj, "cache_len"):
+            cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
+            if cache_len_list:
+                print(f"[session] prefill_cache_len_min= {int(min(cache_len_list))}")
+                print(f"[session] prefill_cache_len_max= {int(max(cache_len_list))}")
 
     def _decode_once(
         runtime_obj,
@@ -169,7 +257,30 @@ def _generate(
         local_stream: bool,
         decode_budget_seconds: float,
         max_steps: int,
-    ) -> tuple[str, int, float, dict | None, bool]:
+        disable_structure_guard_local: bool,
+    ) -> tuple[str, int, float, dict | None, bool, bool]:
+        debug_logits = os.getenv("VSPEC_DEBUG_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _logits_health(logits_obj, step_idx: int) -> None:
+            if not debug_logits:
+                return
+            try:
+                vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+                if not vals:
+                    print(f"[session][logits] step={step_idx} empty=True")
+                    return
+                min_v = float(min(vals))
+                max_v = float(max(vals))
+                finite = True
+                for v in vals:
+                    fv = float(v)
+                    if (fv != fv) or (fv == float("inf")) or (fv == float("-inf")):
+                        finite = False
+                        break
+                print(f"[session][logits] step={step_idx} finite={finite} min={min_v:.6f} max={max_v:.6f}")
+            except Exception as exc:
+                print(f"[session][logits] step={step_idx} stats_failed={exc}")
+
         guard = None
         if not disable_language_guard:
             guard = LanguageStabilityGuard(
@@ -180,7 +291,7 @@ def _generate(
             )
 
         structure_guard = None
-        if not disable_structure_guard:
+        if not disable_structure_guard_local:
             structure_guard = LanguageStructureIntegrityManager(prompt=prompt, strictness=structure_guard_strictness)
 
         engine = FastOutputEngine(
@@ -190,7 +301,6 @@ def _generate(
             guard=guard,
             structure_guard=structure_guard,
         )
-
         decode_optimizer = DecodeOptimizationModule(
             repetition_penalty=local_rep_penalty,
             repeat_window=local_repeat_window,
@@ -199,51 +309,170 @@ def _generate(
         )
         decode_optimizer.seed_history(local_tokens)
 
-        generated = []
+        generated: list[int] = []
         start = time.perf_counter()
         engine.begin_stream()
         timed_out = False
+        contract_failed = False
 
         total_steps = max(1, int(max_steps))
-        for step in range(total_steps):
-            elapsed = time.perf_counter() - start
-            if decode_budget_seconds > 0.0 and elapsed >= decode_budget_seconds:
-                timed_out = True
-                break
-            logits = decode_optimizer.fetch_logits(runtime_obj, local_tokens[-1], tokenizer.get_vocab_size())
-            if decode_optimizer.logits_empty(logits):
-                break
+        core_decode = CoreDecodeSession.from_runtime(runtime_obj, total_steps)
+        scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(local_tokens) - 1), max_new_tokens=total_steps)
 
-            logits = threebit_module.denoise_logits(logits, step)
-            logits = decode_optimizer.apply_generation_controls(logits, local_tokens)
-            sample_temperature = threebit_module.auto_temperature(logits, local_temperature)
-            next_id = engine.sample(logits, sample_temperature, local_top_k, local_greedy, local_lang_top_n)
-            generated.append(next_id)
-            local_tokens.append(next_id)
-            engine.stream_token(next_id)
-            decode_optimizer.observe_token(local_tokens)
+        try:
+            for step in range(total_steps):
+                if scheduler_enabled:
+                    quota = core_decode.next_quota()
+                    if quota <= 0:
+                        break
+                else:
+                    quota = 1
 
-            if adapter.eos_token_id is not None and next_id == adapter.eos_token_id:
-                break
-            if (not local_stream) and (step == 0 or (step + 1) % max(1, total_steps // 4) == 0):
-                pct = 45 + int(((step + 1) / total_steps) * 50)
-                _progress(show_progress, min(95, pct), "decode", f"{step + 1}/{total_steps}")
+                elapsed = time.perf_counter() - start
+                if decode_budget_seconds > 0.0 and elapsed >= decode_budget_seconds:
+                    timed_out = True
+                    break
 
-        engine.end_stream()
+                reached_eos = False
+                for _ in range(quota):
+                    logits = decode_optimizer.fetch_logits(runtime_obj, local_tokens[-1], tokenizer.get_vocab_size())
+                    logits, contract = sanitize_and_validate_logits(logits, tokenizer.get_vocab_size())
+                    if not contract.ok:
+                        print(
+                            f"[session] decode_contract_ok= False reason={contract.reason} logits_len={contract.logits_len} expected_vocab={contract.expected_vocab_size}"
+                        )
+                        contract_failed = True
+                        break
+                    if step == 0 and contract.masked_tail > 0:
+                        print(f"[session] decode_contract_masked_tail= {contract.masked_tail}")
+                    if step == 0:
+                        _logits_health(logits, step)
+                    if decode_optimizer.logits_empty(logits):
+                        if debug_logits:
+                            print(f"[session][logits] step={step} empty_after_fetch=True")
+                        break
+
+                    logits = threebit_module.denoise_logits(logits, step)
+                    logits = decode_optimizer.apply_generation_controls(logits, local_tokens)
+                    sample_temperature = threebit_module.auto_temperature(logits, local_temperature)
+                    next_id = engine.sample(logits, sample_temperature, local_top_k, local_greedy, local_lang_top_n)
+                    generated.append(next_id)
+                    local_tokens.append(next_id)
+                    engine.stream_token(next_id)
+                    decode_optimizer.observe_token(local_tokens)
+                    reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
+                    if scheduler_enabled:
+                        core_decode.commit(1, reached_eos)
+                    if reached_eos:
+                        break
+
+                if contract_failed or reached_eos:
+                    break
+
+                if (not local_stream) and (step == 0 or (step + 1) % max(1, total_steps // 4) == 0):
+                    pct = 45 + int(((step + 1) / total_steps) * 50)
+                    _progress(show_progress, min(95, pct), "decode", f"{step + 1}/{total_steps}")
+        finally:
+            engine.end_stream()
+            if scheduler_enabled and core_decode.is_active():
+                core_decode.cancel()
+            core_decode.close()
+
         elapsed = time.perf_counter() - start
         text = tokenizer.decode(generated) if generated else ""
         text = postprocess_output_text(text, prompt, lang_mode)
         tps = (len(generated) / elapsed) if elapsed > 0 else 0.0
-        return text, len(generated), tps, engine.structure_report(), timed_out
+        return text, len(generated), tps, engine.structure_report(), timed_out, contract_failed
 
     base_tokens = list(token_ids)
     _prefill_runtime(runtime, base_tokens)
-    decode_budget = _resolve_decode_budget_seconds()
+    layer_count = len(getattr(runtime, "layers", []) or [])
+    prefill_tokens = max(0, len(base_tokens) - 1)
+    decode_budget = _resolve_decode_budget_seconds(prefill_tokens, layer_count)
     retry_budget = _resolve_retry_budget_seconds(decode_budget)
     print(f"[session] decode_budget_seconds= {decode_budget:.1f}")
     print(f"[session] retry_budget_seconds= {retry_budget:.1f}")
 
-    text, gen_count, tps, report, timed_out_first = _decode_once(
+    effective_disable_structure_guard = bool(disable_structure_guard)
+    if (not effective_disable_structure_guard) and prioritize_english and lang_mode == "en":
+        effective_disable_structure_guard = True
+        print("[session] structure_guard= off (english-priority)")
+    else:
+        print("[session] structure_guard=", "off" if effective_disable_structure_guard else "on")
+
+    def _run_torch_rescue(
+        reason: str,
+        decode_steps: int,
+        decode_temp: float,
+        decode_top_k: int,
+        decode_lang_top_n: int,
+        decode_rep_penalty: float,
+        decode_repeat_window: int,
+        decode_no_repeat_ngram: int,
+    ) -> tuple[str, int, float, dict | None, bool, bool] | None:
+        if torch_timeout_fallback_builder is None:
+            return None
+        try:
+            fallback_runtime = torch_timeout_fallback_builder()
+        except Exception:
+            fallback_runtime = None
+        if fallback_runtime is None:
+            return None
+        print(f"[session] {reason}_fallback_runtime= torch-cuda")
+        _prefill_runtime(fallback_runtime, base_tokens)
+        return _decode_once(
+            runtime_obj=fallback_runtime,
+            local_tokens=list(base_tokens),
+            local_temperature=decode_temp,
+            local_top_k=decode_top_k,
+            local_lang_top_n=decode_lang_top_n,
+            local_greedy=True,
+            local_rep_penalty=decode_rep_penalty,
+            local_repeat_window=decode_repeat_window,
+            local_no_repeat_ngram=decode_no_repeat_ngram,
+            local_stream=False,
+            decode_budget_seconds=retry_budget,
+            max_steps=decode_steps,
+            disable_structure_guard_local=effective_disable_structure_guard,
+        )
+
+    def _run_native_safe_rescue(
+        reason: str,
+        decode_steps: int,
+        decode_temp: float,
+        decode_top_k: int,
+        decode_lang_top_n: int,
+        decode_rep_penalty: float,
+        decode_repeat_window: int,
+        decode_no_repeat_ngram: int,
+    ) -> tuple[str, int, float, dict | None, bool, bool] | None:
+        if native_safe_fallback_builder is None:
+            return None
+        try:
+            fallback_runtime = native_safe_fallback_builder()
+        except Exception:
+            fallback_runtime = None
+        if fallback_runtime is None:
+            return None
+        print(f"[session] {reason}_fallback_runtime= native-safe")
+        _prefill_runtime(fallback_runtime, base_tokens)
+        return _decode_once(
+            runtime_obj=fallback_runtime,
+            local_tokens=list(base_tokens),
+            local_temperature=decode_temp,
+            local_top_k=decode_top_k,
+            local_lang_top_n=decode_lang_top_n,
+            local_greedy=True,
+            local_rep_penalty=decode_rep_penalty,
+            local_repeat_window=decode_repeat_window,
+            local_no_repeat_ngram=decode_no_repeat_ngram,
+            local_stream=False,
+            decode_budget_seconds=retry_budget,
+            max_steps=decode_steps,
+            disable_structure_guard_local=True,
+        )
+
+    text, gen_count, tps, report, timed_out_first, contract_failed_first = _decode_once(
         runtime_obj=runtime,
         local_tokens=list(base_tokens),
         local_temperature=temperature,
@@ -256,12 +485,52 @@ def _generate(
         local_stream=stream,
         decode_budget_seconds=decode_budget,
         max_steps=max_tokens,
+        disable_structure_guard_local=effective_disable_structure_guard,
     )
 
-    first_bad = _is_runtime_fallback_text(text, lang_mode) or _looks_gibberish_output(text)
-    if timed_out_first:
+    if (gen_count <= 0 or _is_runtime_fallback_text(text, lang_mode) or contract_failed_first) and retry_budget >= 0.5:
+        rescue_top_k = max(1, min(8, top_k if top_k > 0 else 8))
+        rescue_lang_top_n = max(32, min(lang_top_n, 96))
+        rescue_temp = min(0.68, max(0.45, float(temperature) * 0.82))
+        rescue_rep = max(1.18, repetition_penalty)
+        rescue_window = max(48, repeat_window)
+        rescue_ngram = max(3, no_repeat_ngram)
+        rescue_steps = max(8, min(max_tokens, 64))
+
+        rescue_result = _run_native_safe_rescue(
+            reason="decode-failure",
+            decode_steps=rescue_steps,
+            decode_temp=rescue_temp,
+            decode_top_k=rescue_top_k,
+            decode_lang_top_n=rescue_lang_top_n,
+            decode_rep_penalty=rescue_rep,
+            decode_repeat_window=rescue_window,
+            decode_no_repeat_ngram=rescue_ngram,
+        )
+        if rescue_result is None:
+            rescue_result = _run_torch_rescue(
+                reason="decode-failure",
+                decode_steps=rescue_steps,
+                decode_temp=rescue_temp,
+                decode_top_k=rescue_top_k,
+                decode_lang_top_n=rescue_lang_top_n,
+                decode_rep_penalty=rescue_rep,
+                decode_repeat_window=rescue_window,
+                decode_no_repeat_ngram=rescue_ngram,
+            )
+        if rescue_result is not None:
+            text2, gen_count2, tps2, report2, timed_out_retry, contract_failed_retry = rescue_result
+            if (not timed_out_retry) and (not contract_failed_retry) and (not _should_quality_retry(text2)):
+                text = text2
+                gen_count = gen_count2
+                tps = tps2
+                report = report2
+                timed_out_first = False
+                contract_failed_first = False
+
+    if timed_out_first or contract_failed_first:
         print(f"[session] decode_timeout= True (budget={decode_budget:.1f}s)")
-        if not _is_meaningful_partial(text):
+        if not _is_meaningful_partial(text, gen_count):
             if retry_budget >= 0.5:
                 _progress(show_progress, 96, "timeout-rescue", "auto retry with shorter decode window")
                 rescue_top_k = max(1, min(6, top_k if top_k > 0 else 6))
@@ -272,34 +541,49 @@ def _generate(
                 rescue_ngram = max(3, no_repeat_ngram)
                 rescue_steps = max(12, min(48, max_tokens // 2 if max_tokens > 1 else 12))
 
-                fallback_runtime = None
-                if torch_timeout_fallback_builder is not None:
-                    try:
-                        fallback_runtime = torch_timeout_fallback_builder()
-                    except Exception:
-                        fallback_runtime = None
-                runtime_for_retry = fallback_runtime if fallback_runtime is not None else runtime
-                if fallback_runtime is not None:
-                    print("[session] timeout_fallback_runtime= torch-cuda")
-
-                _prefill_runtime(runtime_for_retry, base_tokens)
-                text2, gen_count2, tps2, report2, timed_out_retry = _decode_once(
-                    runtime_obj=runtime_for_retry,
-                    local_tokens=list(base_tokens),
-                    local_temperature=rescue_temp,
-                    local_top_k=rescue_top_k,
-                    local_lang_top_n=rescue_lang_top_n,
-                    local_greedy=True,
-                    local_rep_penalty=rescue_rep,
-                    local_repeat_window=rescue_window,
-                    local_no_repeat_ngram=rescue_ngram,
-                    local_stream=False,
-                    decode_budget_seconds=retry_budget,
-                    max_steps=rescue_steps,
+                rescue_result = _run_native_safe_rescue(
+                    reason="timeout",
+                    decode_steps=rescue_steps,
+                    decode_temp=rescue_temp,
+                    decode_top_k=rescue_top_k,
+                    decode_lang_top_n=rescue_lang_top_n,
+                    decode_rep_penalty=rescue_rep,
+                    decode_repeat_window=rescue_window,
+                    decode_no_repeat_ngram=rescue_ngram,
                 )
+                if rescue_result is None:
+                    rescue_result = _run_torch_rescue(
+                        reason="timeout",
+                        decode_steps=rescue_steps,
+                        decode_temp=rescue_temp,
+                        decode_top_k=rescue_top_k,
+                        decode_lang_top_n=rescue_lang_top_n,
+                        decode_rep_penalty=rescue_rep,
+                        decode_repeat_window=rescue_window,
+                        decode_no_repeat_ngram=rescue_ngram,
+                    )
+                if rescue_result is None:
+                    _prefill_runtime(runtime, base_tokens)
+                    rescue_result = _decode_once(
+                        runtime_obj=runtime,
+                        local_tokens=list(base_tokens),
+                        local_temperature=rescue_temp,
+                        local_top_k=rescue_top_k,
+                        local_lang_top_n=rescue_lang_top_n,
+                        local_greedy=True,
+                        local_rep_penalty=rescue_rep,
+                        local_repeat_window=rescue_window,
+                        local_no_repeat_ngram=rescue_ngram,
+                        local_stream=False,
+                        decode_budget_seconds=retry_budget,
+                        max_steps=rescue_steps,
+                        disable_structure_guard_local=effective_disable_structure_guard,
+                    )
+
+                text2, gen_count2, tps2, report2, timed_out_retry, contract_failed_retry = rescue_result
                 if timed_out_retry:
                     print(f"[session] retry_timeout= True (budget={retry_budget:.1f}s)")
-                if (not timed_out_retry) and (not (_is_runtime_fallback_text(text2, lang_mode) or _looks_gibberish_output(text2))):
+                if (not timed_out_retry) and (not contract_failed_retry) and (not _should_quality_retry(text2)):
                     text = text2
                     gen_count = gen_count2
                     tps = tps2
@@ -313,7 +597,7 @@ def _generate(
                 gen_count = 0
                 tps = 0.0
 
-    first_bad = _is_runtime_fallback_text(text, lang_mode) or _looks_gibberish_output(text)
+    first_bad = _should_quality_retry(text)
     if first_bad and retry_budget >= 0.5 and (not timed_out_first):
         _progress(show_progress, 96, "quality-retry", "detected noisy output, retrying with safe decode")
         safe_top_k = max(1, min(8, top_k if top_k > 0 else 8))
@@ -323,28 +607,53 @@ def _generate(
         safe_window = max(48, repeat_window)
         safe_ngram = max(3, no_repeat_ngram)
 
-        _prefill_runtime(runtime, base_tokens)
-        text2, gen_count2, tps2, report2, timed_out_retry = _decode_once(
-            runtime_obj=runtime,
-            local_tokens=list(base_tokens),
-            local_temperature=safe_temp,
-            local_top_k=safe_top_k,
-            local_lang_top_n=safe_lang_top_n,
-            local_greedy=True,
-            local_rep_penalty=safe_rep,
-            local_repeat_window=safe_window,
-            local_no_repeat_ngram=safe_ngram,
-            local_stream=False,
-            decode_budget_seconds=retry_budget,
-            max_steps=max(8, min(max_tokens, 64)),
+        rescue_result = _run_native_safe_rescue(
+            reason="quality",
+            decode_steps=max(8, min(max_tokens, 64)),
+            decode_temp=safe_temp,
+            decode_top_k=safe_top_k,
+            decode_lang_top_n=safe_lang_top_n,
+            decode_rep_penalty=safe_rep,
+            decode_repeat_window=safe_window,
+            decode_no_repeat_ngram=safe_ngram,
         )
+        if rescue_result is None:
+            rescue_result = _run_torch_rescue(
+                reason="quality",
+                decode_steps=max(8, min(max_tokens, 64)),
+                decode_temp=safe_temp,
+                decode_top_k=safe_top_k,
+                decode_lang_top_n=safe_lang_top_n,
+                decode_rep_penalty=safe_rep,
+                decode_repeat_window=safe_window,
+                decode_no_repeat_ngram=safe_ngram,
+            )
+        if rescue_result is None:
+            _prefill_runtime(runtime, base_tokens)
+            rescue_result = _decode_once(
+                runtime_obj=runtime,
+                local_tokens=list(base_tokens),
+                local_temperature=safe_temp,
+                local_top_k=safe_top_k,
+                local_lang_top_n=safe_lang_top_n,
+                local_greedy=True,
+                local_rep_penalty=safe_rep,
+                local_repeat_window=safe_window,
+                local_no_repeat_ngram=safe_ngram,
+                local_stream=False,
+                decode_budget_seconds=retry_budget,
+                max_steps=max(8, min(max_tokens, 64)),
+                disable_structure_guard_local=effective_disable_structure_guard,
+            )
+
+        text2, gen_count2, tps2, report2, timed_out_retry, contract_failed_retry = rescue_result
         if timed_out_retry:
             print(f"[session] retry_timeout= True (budget={retry_budget:.1f}s)")
-            if not _is_meaningful_partial(text2):
+            if not _is_meaningful_partial(text2, gen_count2):
                 text2 = assurance.repair("", prompt)
                 gen_count2 = 0
                 tps2 = 0.0
-        if (not timed_out_retry) and (not (_is_runtime_fallback_text(text2, lang_mode) or _looks_gibberish_output(text2))):
+        if (not timed_out_retry) and (not contract_failed_retry) and (not _should_quality_retry(text2)):
             text = text2
             gen_count = gen_count2
             tps = tps2
@@ -367,6 +676,7 @@ def _generate(
     print("[session] lowbit_exec_fallback_gemm_calls=", int(lowbit_stats.get("fallback_gemm_calls", 0)))
     print("[session] lowbit_exec_fallback_matmul_calls=", int(lowbit_stats.get("fallback_matmul_calls", 0)))
     return text
+
 
 
 def main() -> None:
@@ -397,17 +707,41 @@ def main() -> None:
     parser.add_argument("--structure-guard-strictness", type=float, default=0.72)
     parser.add_argument("--decode-opt-mode", default="optimized", choices=["stable", "optimized"])
     parser.add_argument("--enable-3bit-runtime-module", action="store_true")
-    parser.add_argument("--allow-semantic-rescue", action="store_true", help="Deprecated no-op: synthetic rescue responses are disabled by integrity policy")
+    parser.add_argument(
+        "--allow-semantic-rescue",
+        action="store_true",
+        help="Deprecated no-op: synthetic rescue responses are disabled by integrity policy",
+    )
     parser.add_argument("--unsafe-low-layers", action="store_true")
-    parser.add_argument("--max-decode-seconds", type=float, default=-1.0, help="<0 auto, =0 disable timeout, >0 fixed budget per decode pass")
-    parser.add_argument("--max-retry-seconds", type=float, default=-1.0, help="<0 auto, =0 disable retry, >0 fixed retry budget")
-    parser.add_argument("--disable-timeout-torch-fallback", action="store_true", help="Disable automatic torch-cuda retry when native decode times out")
+    parser.add_argument(
+        "--max-decode-seconds",
+        type=float,
+        default=-1.0,
+        help="<0 auto, =0 disable timeout, >0 fixed budget per decode pass",
+    )
+    parser.add_argument(
+        "--max-retry-seconds",
+        type=float,
+        default=-1.0,
+        help="<0 auto, =0 disable retry, >0 fixed retry budget",
+    )
+    parser.add_argument(
+        "--disable-timeout-torch-fallback",
+        action="store_true",
+        help="Disable automatic torch-cuda retry when native decode times out",
+    )
     args = parser.parse_args()
 
     fused_bits_env = int(args.fused_bits)
     if fused_bits_env not in {0, 3, 4}:
         fused_bits_env = 0
     os.environ["VSPEC_FUSED_BITS"] = str(fused_bits_env)
+    if (
+        fused_bits_env == 4
+        and str(args.device) in {"cuda", "cuda-native"}
+        and not os.getenv("VSPEC_INT4_COMPUTE_MODE", "").strip()
+    ):
+        os.environ["VSPEC_INT4_COMPUTE_MODE"] = "native"
 
     random.seed(args.seed)
     show_progress = not args.no_progress
@@ -420,6 +754,7 @@ def main() -> None:
     args.max_layers = _resolve_quality_layer_floor(config, requested_layers, str(args.device), bool(args.unsafe_low_layers))
     if requested_layers > 0 and args.max_layers != requested_layers:
         print(f"[session] quality_guard_max_layers_adjusted= {requested_layers} -> {args.max_layers}")
+
     tok_cfg = read_tokenizer_config(snapshot)
     tokenizer = load_tokenizer(snapshot)
     tensor_names = collect_tensor_names(snapshot)
@@ -460,10 +795,17 @@ def main() -> None:
         pct = 61 + int((current / total) * 35)
         _progress(show_progress, min(96, pct), "runtime-load", f"layer {current}/{total}")
 
-    runtime = build_generic_runtime(config, weight_index, args.max_layers, args.device, _runtime_progress)
+    runtime = build_generic_runtime(
+        config,
+        weight_index,
+        args.max_layers,
+        args.device,
+        progress_cb=_runtime_progress,
+    )
     if runtime is None:
         print("[session] runtime init failed")
         return
+
     runtime.eos_token_id = adapter.eos_token_id
     print("[session] decode_opt_mode=", args.decode_opt_mode)
     print("[session] runtime_3bit_module=", tuned.active)
@@ -494,11 +836,25 @@ def main() -> None:
             print("[session] layer_bits=", summarize_layer_bits(layer_bits))
             print("[session] effective_bits_estimate=", round(effective_bits(layer_bits), 4))
             print("[session] note=policy telemetry fallback")
-    _progress(show_progress, 100, "ready", "model loaded; enter prompt")
 
+    _progress(show_progress, 100, "ready", "model loaded; enter prompt")
     print("[session] type /exit to quit")
 
     torch_runtime_cache = {"value": None, "attempted": False}
+    native_safe_runtime_cache = {"value": None, "attempted": False}
+
+    def _native_safe_fallback_builder():
+        if native_safe_runtime_cache["attempted"]:
+            return native_safe_runtime_cache["value"]
+        native_safe_runtime_cache["attempted"] = True
+        try:
+            fallback_runtime = build_native_safe_runtime(config, weight_index, args.max_layers, str(args.device), None)
+        except Exception:
+            fallback_runtime = None
+        if fallback_runtime is not None and hasattr(fallback_runtime, "eos_token_id"):
+            fallback_runtime.eos_token_id = adapter.eos_token_id
+        native_safe_runtime_cache["value"] = fallback_runtime
+        return fallback_runtime
 
     def _torch_timeout_fallback_builder():
         if args.disable_timeout_torch_fallback:
@@ -509,7 +865,13 @@ def main() -> None:
             return torch_runtime_cache["value"]
         torch_runtime_cache["attempted"] = True
         try:
-            fallback_runtime = build_generic_runtime(config, weight_index, args.max_layers, "torch-cuda", None)
+            fallback_runtime = build_generic_runtime(
+                config,
+                weight_index,
+                args.max_layers,
+                "torch-cuda",
+                progress_cb=None,
+            )
         except Exception:
             fallback_runtime = None
         if fallback_runtime is not None and hasattr(fallback_runtime, "eos_token_id"):
@@ -559,6 +921,7 @@ def main() -> None:
             allow_semantic_rescue=args.allow_semantic_rescue,
             max_decode_seconds=args.max_decode_seconds,
             max_retry_seconds=args.max_retry_seconds,
+            native_safe_fallback_builder=_native_safe_fallback_builder,
             torch_timeout_fallback_builder=_torch_timeout_fallback_builder,
         )
         if args.no_stream:

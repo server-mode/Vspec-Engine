@@ -20,12 +20,30 @@ void vspec_cuda_attention_fused_single_f32(
 	float* output
 );
 
+void vspec_cuda_attention_flash_single_f32(
+	const float* query,
+	const float* keys,
+	const float* values,
+	size_t seq_len,
+	size_t head_dim,
+	size_t block_tokens,
+	float* output
+);
+
 void vspec_cuda_fused_linear_int4_device(
 	const float* d_a,
 	const unsigned char* d_b_packed,
 	const float* d_scales,
 	float* d_c,
 	size_t m,
+	size_t n,
+	size_t k
+);
+
+void vspec_cuda_dequant_int4_to_f32_device(
+	const unsigned char* d_b_packed,
+	const float* d_scales,
+	float* d_w_f32,
 	size_t n,
 	size_t k
 );

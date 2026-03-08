@@ -2,6 +2,7 @@
 #define VSPEC_PYTHON_CAPI_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #if defined(_WIN32)
   #if defined(VSPEC_PYTHON_CAPI_BUILD)
@@ -22,6 +23,95 @@ VSPEC_PY_API int vspec_py_load_manifest_count(const char* path);
 VSPEC_PY_API int vspec_py_parse_safetensors_count(const char* path);
 VSPEC_PY_API int vspec_py_rewrite_demo_final_nodes(void);
 VSPEC_PY_API int vspec_py_generate(const char* prompt, char* out, size_t out_size);
+VSPEC_PY_API int vspec_py_weight_canonical_name(const char* raw_name, char* out_name, size_t out_name_size);
+VSPEC_PY_API int vspec_py_safetensors_tensor_descriptor(
+  const char* path,
+  const char* tensor_name,
+  char* out_dtype,
+  size_t out_dtype_size,
+  size_t* out_shape,
+  size_t shape_cap,
+  size_t* out_ndim,
+  uint64_t* out_data_start,
+  uint64_t* out_data_end
+);
+VSPEC_PY_API int vspec_py_sample_candidate(
+  const int* token_ids,
+  const float* scores,
+  size_t count,
+  int greedy,
+  uint64_t random_bits,
+  int* out_token_id
+);
+VSPEC_PY_API int vspec_py_kv_cache_create(size_t page_tokens, size_t max_pages, size_t num_heads, size_t head_dim);
+VSPEC_PY_API void vspec_py_kv_cache_destroy(int handle_id);
+VSPEC_PY_API int vspec_py_kv_cache_reset(int handle_id);
+VSPEC_PY_API int vspec_py_kv_cache_append(int handle_id, uint64_t session_id, const float* key_token, const float* value_token);
+VSPEC_PY_API size_t vspec_py_kv_cache_session_tokens(int handle_id, uint64_t session_id);
+VSPEC_PY_API size_t vspec_py_kv_cache_read(
+  int handle_id,
+  uint64_t session_id,
+  float* out_keys,
+  float* out_values,
+  size_t max_tokens
+);
+VSPEC_PY_API int vspec_py_decode_session_create(
+  size_t total_vram_bytes,
+  size_t max_active,
+  size_t max_batch_tokens,
+  size_t token_quantum
+);
+VSPEC_PY_API void vspec_py_decode_session_destroy(int handle_id);
+VSPEC_PY_API int vspec_py_decode_session_begin(
+  int handle_id,
+  size_t reserve_bytes,
+  size_t prompt_tokens,
+  size_t max_new_tokens,
+  uint16_t priority
+);
+VSPEC_PY_API size_t vspec_py_decode_session_next_quota(int handle_id);
+VSPEC_PY_API int vspec_py_decode_session_commit(int handle_id, size_t generated_tokens, int reached_eos);
+VSPEC_PY_API int vspec_py_decode_session_cancel(int handle_id);
+VSPEC_PY_API int vspec_py_decode_session_is_active(int handle_id);
+VSPEC_PY_API size_t vspec_py_decode_session_remaining_tokens(int handle_id);
+VSPEC_PY_API int vspec_py_continuous_batch_create(
+  size_t total_vram_bytes,
+  size_t max_active,
+  size_t max_batch_items,
+  size_t max_batch_tokens,
+  size_t prefill_quantum,
+  size_t decode_quantum
+);
+VSPEC_PY_API void vspec_py_continuous_batch_destroy(int handle_id);
+VSPEC_PY_API int vspec_py_continuous_batch_submit(
+  int handle_id,
+  size_t reserve_bytes,
+  size_t prompt_tokens,
+  size_t max_new_tokens,
+  uint16_t priority,
+  uint64_t* out_request_id
+);
+VSPEC_PY_API size_t vspec_py_continuous_batch_next(
+  int handle_id,
+  uint64_t* out_request_ids,
+  uint32_t* out_phases,
+  size_t* out_quotas,
+  size_t* out_prompt_cursors,
+  size_t cap
+);
+VSPEC_PY_API int vspec_py_continuous_batch_commit_prefill(int handle_id, uint64_t request_id, size_t consumed_tokens);
+VSPEC_PY_API int vspec_py_continuous_batch_commit_decode(int handle_id, uint64_t request_id, size_t generated_tokens, int reached_eos);
+VSPEC_PY_API int vspec_py_continuous_batch_cancel(int handle_id, uint64_t request_id);
+VSPEC_PY_API int vspec_py_continuous_batch_stats(
+  int handle_id,
+  uint64_t* out_prefill_steps,
+  uint64_t* out_decode_steps,
+  uint64_t* out_prefill_tokens,
+  uint64_t* out_decode_tokens,
+  size_t* out_active_prefill,
+  size_t* out_active_decode,
+  size_t* out_reserved_vram
+);
 
 #ifdef __cplusplus
 }

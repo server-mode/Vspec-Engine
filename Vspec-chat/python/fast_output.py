@@ -1,5 +1,6 @@
 import heapq
 import math
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
 from meaningful_output_guard import MeaningfulOutputGuard
+from runtime_core_bridge import sample_candidate, sample_candidate_available
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 
 try:
@@ -51,6 +53,7 @@ class FastOutputEngine:
         self._decoded_cache: dict[int, str] = {}
         self._allowed_cache: dict[int, bool] = {}
         self._emitted_parts: list[str] = []
+        self.simple_sampling = os.getenv("VSPEC_SAMPLING_SIMPLE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
     def _prime_decode_cache(self, token_ids: list[int]) -> None:
         if self.tokenizer is None or not token_ids:
@@ -133,6 +136,40 @@ class FastOutputEngine:
         greedy: bool,
         lang_top_n: int,
     ) -> int:
+        if logits is None:
+            return 0
+        if np is not None and isinstance(logits, np.ndarray):
+            if logits.size == 0:
+                return 0
+        else:
+            try:
+                if len(logits) == 0:
+                    return 0
+            except Exception:
+                return 0
+
+        if np is not None and isinstance(logits, np.ndarray):
+            arr = np.asarray(logits, dtype=np.float32)
+            if arr.size == 0:
+                return 0
+            if not np.all(np.isfinite(arr)):
+                arr = np.nan_to_num(arr, nan=-1e9, posinf=1e9, neginf=-1e9)
+            logits = arr.tolist()
+        else:
+            safe_logits: list[float] = []
+            for value in logits:
+                try:
+                    fv = float(value)
+                except Exception:
+                    fv = -1e9
+                if not math.isfinite(fv):
+                    fv = -1e9 if fv < 0 else 1e9
+                safe_logits.append(fv)
+            logits = safe_logits
+
+        if len(logits) == 0:
+            return 0
+
         if temperature <= 0:
             temperature = 1.0
 
@@ -155,9 +192,14 @@ class FastOutputEngine:
         if top_k > 0 and len(allowed_ids) > top_k:
             allowed_ids = allowed_ids[:top_k]
 
+        if self.simple_sampling:
+            return max(allowed_ids, key=lambda tid: logits[tid])
+
         scored = []
         for tid in allowed_ids:
             scaled = logits[tid] / temperature
+            if not math.isfinite(float(scaled)):
+                scaled = -1e9
             text = self.token_text(tid)
             bonus = _token_quality_bonus(text, self.lang_mode)
             if self.guard is not None:
@@ -165,16 +207,33 @@ class FastOutputEngine:
             if self.structure_guard is not None:
                 bonus += self.structure_guard.score_adjustment(text)
             bonus += self.meaning_guard.score_adjustment(text)
-            scored.append((tid, scaled + bonus))
+            final_score = float(scaled + bonus)
+            if not math.isfinite(final_score):
+                final_score = -1e9
+            scored.append((tid, final_score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
+        if not scored:
+            return int(candidate_ids[0])
         if greedy:
             return scored[0][0]
 
+        if sample_candidate_available():
+            sampled = sample_candidate(
+                token_ids=[tid for tid, _ in scored],
+                scores=[score for _, score in scored],
+                greedy=False,
+                random_bits=random.getrandbits(63),
+            )
+            if sampled is not None:
+                return int(sampled)
+
         max_logit = scored[0][1]
+        if not math.isfinite(float(max_logit)):
+            return scored[0][0]
         exp_vals = [math.exp(v - max_logit) for _, v in scored]
         total = sum(exp_vals)
-        if total <= 0:
+        if (not math.isfinite(float(total))) or total <= 0:
             return scored[0][0]
         r = random.random()
         acc = 0.0

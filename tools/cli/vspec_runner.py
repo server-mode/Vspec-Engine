@@ -13,6 +13,8 @@ from vspec_cli_common import auto_device, auto_fused_bits, auto_target_bits, cha
 class VspecRunArgs:
     model: str
     prompt: str
+    prompts_file: str = ""
+    batch_output_file: str = ""
     device: str | None = None
     fused_bits: int | None = None
     target_bits: int | None = None
@@ -81,7 +83,12 @@ def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
         cmd.append("--interactive")
         cmd.append("--no-stream")
     else:
-        cmd.extend(["--prompt", args.prompt])
+        if str(args.prompts_file or "").strip():
+            cmd.extend(["--prompts-file", str(args.prompts_file)])
+            if str(args.batch_output_file or "").strip():
+                cmd.extend(["--batch-output-file", str(args.batch_output_file)])
+        else:
+            cmd.extend(["--prompt", args.prompt])
         if not args.stream:
             cmd.append("--no-stream")
 

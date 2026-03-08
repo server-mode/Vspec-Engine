@@ -30,6 +30,10 @@ from decode_optimization_module import DecodeOptimizationModule
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projection_stats_snapshot
 from runtime_threebit_module import ThreeBitRuntimeModule
+from decode_contract import sanitize_and_validate_logits
+from native_safe_decode import resolve_native_safe_max_layers
+from runtime_core_bridge import CoreDecodeSession
+from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
 
 
 def _load_two_bit_prototype_module():
@@ -376,6 +380,113 @@ def _run_interactive_session(args) -> int:
     return int(completed.returncode)
 
 
+def _run_prompt_file_batch(
+    args,
+    runtime,
+    tokenizer,
+    adapter,
+    tok_cfg,
+    threebit_module: ThreeBitRuntimeModule,
+    effective_top_k: int,
+    effective_lang_top_n: int,
+    effective_repetition_penalty: float,
+    effective_repeat_window: int,
+    effective_no_repeat_ngram: int,
+    show_progress: bool,
+) -> int:
+    prompts_path = Path(args.prompts_file)
+    raw_lines = prompts_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    prompts = [line.strip() for line in raw_lines if line.strip()]
+    if not prompts:
+        print(f"[vspec-chat] batch_prompts=empty file={prompts_path}")
+        return 2
+
+    max_prompt_chars = max(len(prompt) for prompt in prompts)
+    if float(args.max_decode_seconds) > 0.0:
+        decode_budget_seconds = max(0.5, float(args.max_decode_seconds))
+    elif float(args.max_decode_seconds) == 0.0:
+        decode_budget_seconds = 0.0
+    else:
+        layer_count = len(getattr(runtime, "layers", []) or []) if runtime is not None else 0
+        work_units = max(1, (max_prompt_chars + max(1, int(args.max_tokens))) * max(1, layer_count))
+        auto_budget = 18.0 + (0.16 * float(max(1, int(args.max_tokens)))) + (0.006 * float(max_prompt_chars)) + (0.003 * float(work_units))
+        decode_budget_seconds = min(240.0, max(24.0, auto_budget))
+
+    requests: list[ManagedGenerationRequest] = []
+    for prompt in prompts:
+        req_lang = str(args.lang)
+        if req_lang == "auto":
+            req_lang = _detect_lang(prompt)
+        prompt_for_model = build_prompt(prompt, adapter.model_type, tok_cfg, req_lang, args.chat_format)
+        if tokenizer is not None:
+            encoded = tokenizer.encode(prompt_for_model)
+            token_ids = list(encoded.ids)
+        else:
+            token_ids = [1]
+        if adapter.bos_token_id is not None and (not token_ids or token_ids[0] != adapter.bos_token_id):
+            token_ids = [adapter.bos_token_id] + token_ids
+        requests.append(
+            ManagedGenerationRequest(
+                prompt=prompt,
+                lang_mode=req_lang,
+                token_ids=token_ids,
+                max_new_tokens=max(1, int(args.max_tokens) if int(args.max_tokens) > 0 else 96),
+                temperature=float(args.temperature),
+                top_k=effective_top_k,
+                greedy=bool(args.greedy),
+                lang_top_n=effective_lang_top_n,
+                repetition_penalty=effective_repetition_penalty,
+                repeat_window=effective_repeat_window,
+                no_repeat_ngram=effective_no_repeat_ngram,
+                stream=False,
+                disable_language_guard=bool(args.disable_language_guard),
+                language_guard_strictness=float(args.language_guard_strictness),
+                prioritize_english=bool(not args.no_prioritize_english),
+                structure_guard_strictness=float(args.structure_guard_strictness),
+                disable_structure_guard=bool(args.disable_structure_guard or (req_lang == "en" and not args.no_prioritize_english)),
+                decode_opt_mode=str(args.decode_opt_mode),
+            )
+        )
+
+    def _batch_progress(stage: str, current: int, total: int) -> None:
+        if not show_progress or total <= 0:
+            return
+        pct = int((float(current) / float(max(1, total))) * 100.0)
+        print(f"[vspec-chat][batch] {stage}= {current}/{total} ({pct}%)")
+
+    driver = CoreBatchGenerationDriver(
+        runtime=runtime,
+        tokenizer=tokenizer,
+        adapter=adapter,
+        threebit_module=threebit_module,
+        decode_budget_seconds=decode_budget_seconds,
+        progress_cb=_batch_progress,
+    )
+    result = driver.run(requests)
+    print(f"[vspec-chat] batch_requests= {len(result.requests)}")
+    print(f"[vspec-chat] batch_core_scheduler= {'on' if result.used_core_batcher else 'off'}")
+    if result.stats:
+        print(f"[vspec-chat] batch_stats= {result.stats}")
+
+    output_chunks: list[str] = []
+    for idx, req in enumerate(result.requests, start=1):
+        status = "ok"
+        if req.contract_failed:
+            status = "contract-failed"
+        elif req.timed_out:
+            status = "timed-out"
+        print(f"[vspec-chat][batch][{idx}] status= {status} lang= {req.lang_mode} generated= {len(req.generated)} tps= {req.tokens_per_second:.2f}")
+        print(f"[vspec-chat][batch][{idx}] prompt= {req.prompt}")
+        print(f"[vspec-chat][batch][{idx}] output:")
+        print(req.output_text)
+        output_chunks.append(f"### Request {idx}\nPrompt: {req.prompt}\n\n{req.output_text}\n")
+
+    if str(getattr(args, "batch_output_file", "") or "").strip():
+        Path(args.batch_output_file).write_text("\n".join(output_chunks), encoding="utf-8")
+        print(f"[vspec-chat] batch_output_file= {args.batch_output_file}")
+    return 0
+
+
 def _resolve_quality_layer_floor(config: dict, requested_max_layers: int, device: str, unsafe_low_layers: bool) -> int:
     try:
         total_layers = int(config.get("num_hidden_layers", 0) or config.get("n_layer", 0) or 0)
@@ -416,6 +527,8 @@ def _extract_output_block(stdout_text: str) -> str:
 def _is_runtime_fallback_text(text: str, lang_mode: str) -> bool:
     out = (text or "").strip().lower()
     if not out:
+        return True
+    if out.startswith("[vspec-decode-error]"):
         return True
     if "i could not confidently decode a clean response" in out:
         return True
@@ -529,6 +642,7 @@ def _run_torch_verifier(args, prompt: str, lang_mode: str, verifier_device_overr
         "native-only",
         "--no-stream",
         "--no-progress",
+        "--greedy",
     ]
     if args.greedy:
         cmd.append("--greedy")
@@ -560,11 +674,90 @@ def _run_torch_verifier(args, prompt: str, lang_mode: str, verifier_device_overr
     return _extract_output_block(completed.stdout)
 
 
+def _run_native_safe_verifier(args, prompt: str, lang_mode: str, timeout_override_sec: float | None = None) -> str:
+    env = os.environ.copy()
+    env["VSPEC_DISABLE_NATIVE_SAFE_VERIFY"] = "1"
+    safe_layers = resolve_native_safe_max_layers(read_config(find_snapshot_dir(Path(args.model_dir))), args.max_layers)
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--model-dir",
+        str(args.model_dir),
+        "--prompt",
+        str(prompt),
+        "--max-tokens",
+        str(min(max(12, int(args.max_tokens or 12)), 32)),
+        "--temperature",
+        str(min(0.55, max(0.20, float(args.temperature) * 0.70))),
+        "--top-k",
+        str(max(1, min(8, int(args.top_k or 8)))),
+        "--seed",
+        str(args.seed),
+        "--max-layers",
+        str(int(safe_layers or 0)),
+        "--device",
+        "cuda" if str(args.device) in {"cuda", "cuda-native"} else "cpu",
+        "--repetition-penalty",
+        str(max(1.18, float(args.repetition_penalty))),
+        "--repeat-window",
+        str(max(48, int(args.repeat_window))),
+        "--no-repeat-ngram",
+        str(max(3, int(args.no_repeat_ngram))),
+        "--lang",
+        str(lang_mode),
+        "--lang-top-n",
+        str(max(32, min(int(args.lang_top_n), 96))),
+        "--chat-format",
+        str(args.chat_format),
+        "--speed-preset",
+        "normal",
+        "--target-bits",
+        "16",
+        "--fused-bits",
+        "0",
+        "--decode-opt-mode",
+        "stable",
+        "--runtime-mix-mode",
+        "native-only",
+        "--no-stream",
+        "--no-progress",
+        "--greedy",
+    ]
+    if args.disable_language_guard:
+        cmd.append("--disable-language-guard")
+    if args.no_prioritize_english:
+        cmd.append("--no-prioritize-english")
+    cmd.append("--disable-structure-guard")
+    cmd.extend(["--language-guard-strictness", str(args.language_guard_strictness)])
+    cmd.extend(["--structure-guard-strictness", str(args.structure_guard_strictness)])
+
+    try:
+        timeout_sec = float(timeout_override_sec if timeout_override_sec is not None else 30.0)
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=env,
+            timeout=max(5.0, timeout_sec),
+        )
+    except Exception:
+        return ""
+
+    if completed.returncode != 0:
+        return ""
+    return _extract_output_block(completed.stdout)
+
+
 def main() -> None:
     _configure_console_encoding()
     parser = argparse.ArgumentParser(description="Vspec-chat prototype CLI")
     parser.add_argument("--model-dir", required=True, help="Path to HF cache model dir")
     parser.add_argument("--prompt", default="", help="Prompt text (required unless --interactive)")
+    parser.add_argument("--prompts-file", default="", help="Text file with one prompt per line for continuous-batch generation")
+    parser.add_argument("--batch-output-file", default="", help="Optional file to save batched outputs")
     parser.add_argument("--interactive", action="store_true", help="Start terminal chat session (REPL)")
     parser.add_argument("--max-tokens", type=int, default=0, help="0 = generate until EOS or safety cap")
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -605,12 +798,16 @@ def main() -> None:
     parser.add_argument("--unsafe-low-layers", action="store_true", help="Allow very low max-layers even if quality may collapse")
     args = parser.parse_args()
 
+    batch_mode = bool(str(args.prompts_file or "").strip())
+
     if args.interactive:
+        if batch_mode:
+            parser.error("--interactive cannot be combined with --prompts-file")
         exit_code = _run_interactive_session(args)
         raise SystemExit(exit_code)
 
-    if not str(args.prompt or "").strip():
-        parser.error("--prompt is required unless --interactive is used")
+    if (not batch_mode) and (not str(args.prompt or "").strip()):
+        parser.error("--prompt is required unless --interactive or --prompts-file is used")
 
     if args.threebit_test_boost:
         if int(args.max_layers) <= 0:
@@ -626,6 +823,12 @@ def main() -> None:
     if fused_bits_env not in {0, 3, 4}:
         fused_bits_env = 0
     os.environ["VSPEC_FUSED_BITS"] = str(fused_bits_env)
+    if (
+        fused_bits_env == 4
+        and str(args.device) in {"cuda", "cuda-native"}
+        and not os.getenv("VSPEC_INT4_COMPUTE_MODE", "").strip()
+    ):
+        os.environ["VSPEC_INT4_COMPUTE_MODE"] = "native"
     if int(args.fused_bits) == 3 or int(args.target_bits) == 3:
         os.environ["VSPEC_3BIT_RUNTIME_MODULE"] = "1"
 
@@ -667,7 +870,7 @@ def main() -> None:
         print("[vspec-chat] tokenizer=missing (install 'tokenizers')")
 
     lang_mode = args.lang
-    if lang_mode == "auto":
+    if (not batch_mode) and lang_mode == "auto":
         lang_mode = _detect_lang(args.prompt)
 
     speed_cfg = resolve_speed_preset(args.speed_preset)
@@ -697,39 +900,55 @@ def main() -> None:
         args.max_tokens = 32
 
     guard = None
-    if not args.disable_language_guard:
-        guard = LanguageStabilityGuard(
-            prompt=args.prompt,
-            lang_mode=lang_mode,
-            strictness=args.language_guard_strictness,
-            prioritize_english=(not args.no_prioritize_english),
-        )
-
     structure_guard = None
-    if not args.disable_structure_guard:
-        structure_guard = LanguageStructureIntegrityManager(
-            prompt=args.prompt,
-            strictness=args.structure_guard_strictness,
+    effective_disable_structure_guard = bool(args.disable_structure_guard)
+    fast_engine = None
+    token_ids: list[int] = []
+    generated: list[int] = []
+    decode_optimizer = None
+    if not batch_mode:
+        if not args.disable_language_guard:
+            guard = LanguageStabilityGuard(
+                prompt=args.prompt,
+                lang_mode=lang_mode,
+                strictness=args.language_guard_strictness,
+                prioritize_english=(not args.no_prioritize_english),
+            )
+
+        if (not effective_disable_structure_guard) and (lang_mode == "en") and (not args.no_prioritize_english):
+            effective_disable_structure_guard = True
+        if not effective_disable_structure_guard:
+            structure_guard = LanguageStructureIntegrityManager(
+                prompt=args.prompt,
+                strictness=args.structure_guard_strictness,
+            )
+
+        fast_engine = FastOutputEngine(
+            tokenizer=tokenizer,
+            lang_mode=lang_mode,
+            stream=(not args.no_stream),
+            guard=guard,
+            structure_guard=structure_guard,
         )
 
-    fast_engine = FastOutputEngine(
-        tokenizer=tokenizer,
-        lang_mode=lang_mode,
-        stream=(not args.no_stream),
-        guard=guard,
-        structure_guard=structure_guard,
-    )
+        prompt_for_model = build_prompt(args.prompt, adapter.model_type, tok_cfg, lang_mode, args.chat_format)
 
-    prompt_for_model = build_prompt(args.prompt, adapter.model_type, tok_cfg, lang_mode, args.chat_format)
+        if tokenizer is not None:
+            encoded = tokenizer.encode(prompt_for_model)
+            token_ids = list(encoded.ids)
+        else:
+            token_ids = [1]
 
-    if tokenizer is not None:
-        encoded = tokenizer.encode(prompt_for_model)
-        token_ids = list(encoded.ids)
-    else:
-        token_ids = [1]
+        if adapter.bos_token_id is not None and (not token_ids or token_ids[0] != adapter.bos_token_id):
+            token_ids = [adapter.bos_token_id] + token_ids
 
-    if adapter.bos_token_id is not None and (not token_ids or token_ids[0] != adapter.bos_token_id):
-        token_ids = [adapter.bos_token_id] + token_ids
+        decode_optimizer = DecodeOptimizationModule(
+            repetition_penalty=effective_repetition_penalty,
+            repeat_window=effective_repeat_window,
+            no_repeat_ngram=effective_no_repeat_ngram,
+            mode=args.decode_opt_mode,
+        )
+        decode_optimizer.seed_history(token_ids)
 
     print("[vspec-chat] lang_mode=", lang_mode)
     print("[vspec-chat] chat_format=", args.chat_format)
@@ -744,27 +963,27 @@ def main() -> None:
         print("[vspec-chat] runtime_3bit_tuned_repeat_window=", tuned.repeat_window)
     print("[vspec-chat] fused_bits=", args.fused_bits)
     print("[vspec-chat] language_guard=", "on" if guard is not None else "off")
-    print("[vspec-chat] structure_guard=", "on" if structure_guard is not None else "off")
-    if guard is not None:
-        print("[vspec-chat] language_guard_primary_script=", guard.profile.primary_script)
-        print("[vspec-chat] language_guard_strictness=", round(guard.profile.strictness, 3))
-        print("[vspec-chat] language_guard_prioritize_english=", guard.profile.prioritized_english)
-    if structure_guard is not None:
-        print("[vspec-chat] structure_guard_expected_sections=", structure_guard.profile.expected_sections)
-        print("[vspec-chat] structure_guard_strictness=", round(structure_guard.profile.strictness, 3))
+    if not batch_mode:
+        if effective_disable_structure_guard and (not args.disable_structure_guard) and (lang_mode == "en") and (not args.no_prioritize_english):
+            print("[vspec-chat] structure_guard= off (english-priority)")
+        else:
+            print("[vspec-chat] structure_guard=", "on" if structure_guard is not None else "off")
+        if guard is not None:
+            print("[vspec-chat] language_guard_primary_script=", guard.profile.primary_script)
+            print("[vspec-chat] language_guard_strictness=", round(guard.profile.strictness, 3))
+            print("[vspec-chat] language_guard_prioritize_english=", guard.profile.prioritized_english)
+        if structure_guard is not None:
+            print("[vspec-chat] structure_guard_expected_sections=", structure_guard.profile.expected_sections)
+            print("[vspec-chat] structure_guard_strictness=", round(structure_guard.profile.strictness, 3))
+    else:
+        print("[vspec-chat] structure_guard= per-request")
     print("[vspec-chat] decode_top_k=", effective_top_k)
     print("[vspec-chat] decode_lang_top_n=", effective_lang_top_n)
 
-    print("[vspec-chat] prompt_tokens=", len(token_ids))
-    generated = []
-
-    decode_optimizer = DecodeOptimizationModule(
-        repetition_penalty=effective_repetition_penalty,
-        repeat_window=effective_repeat_window,
-        no_repeat_ngram=effective_no_repeat_ngram,
-        mode=args.decode_opt_mode,
-    )
-    decode_optimizer.seed_history(token_ids)
+    if not batch_mode:
+        print("[vspec-chat] prompt_tokens=", len(token_ids))
+    else:
+        print("[vspec-chat] batch_mode= prompts-file")
 
     start_ts = time.perf_counter()
     vram_before = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None
@@ -777,7 +996,13 @@ def main() -> None:
         pct = 36 + int((current / total) * 22)
         _progress(show_progress, min(58, pct), "runtime-load", f"layer {current}/{total}")
 
-    runtime = build_generic_runtime(config, weight_index, args.max_layers, args.device, _runtime_progress)
+    runtime = build_generic_runtime(
+        config,
+        weight_index,
+        args.max_layers,
+        args.device,
+        progress_cb=_runtime_progress,
+    )
     runtime_mode = "stub"
     if runtime is None:
         reason = runtime_load_reason(
@@ -836,10 +1061,50 @@ def main() -> None:
                     print("[vspec-chat] prototype_2bit_quantized_matrices=", int(getattr(report, "quantized_matrices", 0)))
                     print("[vspec-chat] prototype_2bit_effective_bits_estimate=", round(float(getattr(report, "estimated_effective_bits", 0.0)), 4))
 
+        if batch_mode:
+            exit_code = _run_prompt_file_batch(
+                args=args,
+                runtime=runtime,
+                tokenizer=tokenizer,
+                adapter=adapter,
+                tok_cfg=tok_cfg,
+                threebit_module=threebit_module,
+                effective_top_k=effective_top_k,
+                effective_lang_top_n=effective_lang_top_n,
+                effective_repetition_penalty=effective_repetition_penalty,
+                effective_repeat_window=effective_repeat_window,
+                effective_no_repeat_ngram=effective_no_repeat_ngram,
+                show_progress=show_progress,
+            )
+            raise SystemExit(exit_code)
+
+        def _cache_integrity_ok(runtime_obj, expected_len: int) -> bool:
+            if expected_len <= 0:
+                return True
+            if not hasattr(runtime_obj, "cache_len"):
+                return True
+            try:
+                cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
+                layer_count = len(getattr(runtime_obj, "layers", []) or [])
+                if layer_count <= 0:
+                    return True
+                if len(cache_len_list) < layer_count:
+                    return False
+                return all(int(cache_len_list[i]) == int(expected_len) for i in range(layer_count))
+            except Exception:
+                return False
+
         # Prefill KV cache with prompt tokens so attention has context.
         if len(token_ids) > 1 and hasattr(runtime, "cache_k"):
+            if hasattr(runtime, "reset_core_kv_mirrors"):
+                try:
+                    runtime.reset_core_kv_mirrors()
+                except Exception:
+                    pass
             runtime.cache_k = []
             runtime.cache_v = []
+            if hasattr(runtime, "cache_len"):
+                runtime.cache_len = []
             runtime.position = 0
             prefill_ids = token_ids[:-1]
             total_prefill = len(prefill_ids)
@@ -847,12 +1112,37 @@ def main() -> None:
                 runtime.prefill_tokens(prefill_ids)
                 if total_prefill > 0:
                     _progress(show_progress, 80, "prefill", f"{total_prefill}/{total_prefill} tokens")
+                if not _cache_integrity_ok(runtime, total_prefill):
+                    print("[vspec-chat] prefill_cache_integrity= failed; replaying token-by-token")
+                    if hasattr(runtime, "reset_core_kv_mirrors"):
+                        try:
+                            runtime.reset_core_kv_mirrors()
+                        except Exception:
+                            pass
+                    runtime.cache_k = []
+                    runtime.cache_v = []
+                    if hasattr(runtime, "cache_len"):
+                        runtime.cache_len = []
+                    runtime.position = 0
+                    for idx, tid in enumerate(prefill_ids, start=1):
+                        runtime.forward_logits([tid])
+                        if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                            pct = 60 + int((idx / total_prefill) * 20)
+                            _progress(show_progress, min(80, pct), "prefill-replay", f"{idx}/{total_prefill} tokens")
             else:
                 for idx, tid in enumerate(prefill_ids, start=1):
                     runtime.forward_logits([tid])
                     if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
                         pct = 60 + int((idx / total_prefill) * 20)
                         _progress(show_progress, min(80, pct), "prefill", f"{idx}/{total_prefill} tokens")
+            if hasattr(runtime, "cache_len"):
+                try:
+                    cache_len_list = list(getattr(runtime, "cache_len") or [])
+                    if cache_len_list:
+                        print("[vspec-chat] prefill_cache_len_min=", int(min(cache_len_list)))
+                        print("[vspec-chat] prefill_cache_len_max=", int(max(cache_len_list)))
+                except Exception:
+                    pass
 
     # Placeholder sampling loop. Qwen ops stubs are in src/model/qwen_ops.c.
     # Next step: wire logits from Vspec runtime forward pass.
@@ -866,6 +1156,7 @@ def main() -> None:
     lowbit_projection_stats_reset()
     fast_engine.begin_stream()
     stream_buffer = []
+    decode_contract_failed = False
     decode_start_ts = time.perf_counter()
     if float(args.max_decode_seconds) > 0.0:
         decode_budget_seconds = max(0.5, float(args.max_decode_seconds))
@@ -873,43 +1164,79 @@ def main() -> None:
         decode_budget_seconds = 0.0
     else:
         prompt_chars = len(str(args.prompt or "").strip())
-        auto_budget = 14.0 + (0.12 * float(max_steps)) + (0.02 * float(prompt_chars))
+        prompt_tokens = max(0, len(token_ids) - 1)
+        layer_count = len(getattr(runtime, "layers", []) or []) if runtime is not None else 0
+        work_units = max(1, (prompt_tokens + max_steps) * max(1, layer_count))
+        auto_budget = 16.0 + (0.18 * float(max_steps)) + (0.012 * float(prompt_chars)) + (0.008 * float(work_units))
         if max_steps <= 64:
-            auto_budget = max(auto_budget, 22.0)
-        decode_budget_seconds = min(90.0, max(14.0, auto_budget))
+            auto_budget = max(auto_budget, 48.0)
+        if (lang_mode == "en") and (not args.no_prioritize_english):
+            auto_budget = max(auto_budget, 60.0)
+        decode_budget_seconds = min(240.0, max(20.0, auto_budget))
     print(f"[vspec-chat] decode_budget_seconds= {decode_budget_seconds:.1f}")
+    core_decode = CoreDecodeSession.from_runtime(runtime, max_steps)
+    scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
+    if scheduler_enabled:
+        print(f"[vspec-chat] core_scheduler= on reserve_bytes={core_decode.reserve_bytes}")
     for step in range(max_steps):
+        if scheduler_enabled:
+            quota = core_decode.next_quota()
+            if quota <= 0:
+                break
+        else:
+            quota = 1
         decode_elapsed = time.perf_counter() - decode_start_ts
         if decode_budget_seconds > 0.0 and decode_elapsed >= decode_budget_seconds:
             print(f"[vspec-chat] decode_timeout= True (budget={decode_budget_seconds:.1f}s)")
             break
-        if runtime is None:
-            logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
-        else:
-            logits = decode_optimizer.fetch_logits(runtime, token_ids[-1], vocab_size)
-            if decode_optimizer.logits_empty(logits):
+        reached_eos = False
+        for _ in range(quota):
+            if runtime is None:
                 logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
-        logits = threebit_module.denoise_logits(logits, step)
-        logits = decode_optimizer.apply_generation_controls(logits, token_ids)
-        sample_temperature = threebit_module.auto_temperature(logits, args.temperature)
-        next_id = fast_engine.sample(
-            logits,
-            sample_temperature,
-            effective_top_k,
-            args.greedy,
-            effective_lang_top_n,
-        )
-        generated.append(next_id)
-        stream_buffer.append(next_id)
-        fast_engine.stream_token(next_id)
-        token_ids.append(next_id)
-        decode_optimizer.observe_token(token_ids)
-        if adapter.eos_token_id is not None and next_id == adapter.eos_token_id:
+            else:
+                logits = decode_optimizer.fetch_logits(runtime, token_ids[-1], vocab_size)
+                logits, contract = sanitize_and_validate_logits(logits, vocab_size)
+                if not contract.ok:
+                    print(f"[vspec-chat] decode_contract_ok= False reason={contract.reason} logits_len={contract.logits_len} expected_vocab={contract.expected_vocab_size}")
+                    decode_contract_failed = True
+                    break
+                if step == 0 and contract.masked_tail > 0:
+                    print(f"[vspec-chat] decode_contract_masked_tail= {contract.masked_tail}")
+                if decode_optimizer.logits_empty(logits):
+                    logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
+            if decode_contract_failed:
+                break
+            logits = threebit_module.denoise_logits(logits, step)
+            logits = decode_optimizer.apply_generation_controls(logits, token_ids)
+            sample_temperature = threebit_module.auto_temperature(logits, args.temperature)
+            next_id = fast_engine.sample(
+                logits,
+                sample_temperature,
+                effective_top_k,
+                args.greedy,
+                effective_lang_top_n,
+            )
+            generated.append(next_id)
+            stream_buffer.append(next_id)
+            fast_engine.stream_token(next_id)
+            token_ids.append(next_id)
+            decode_optimizer.observe_token(token_ids)
+            reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
+            if scheduler_enabled:
+                core_decode.commit(1, reached_eos)
+            if reached_eos:
+                break
+
+        if decode_contract_failed or reached_eos:
             break
 
         if args.no_stream and (step == 0 or (step + 1) % max(1, max_steps // 4) == 0):
             decode_pct = 82 + int(((step + 1) / max_steps) * 17)
             _progress(show_progress, min(99, decode_pct), "decode", f"{step + 1}/{max_steps} tokens")
+
+    if scheduler_enabled and core_decode.is_active():
+        core_decode.cancel()
+    core_decode.close()
 
     fast_engine.end_stream()
     _progress(show_progress, 100, "done", "generation complete")
@@ -920,7 +1247,19 @@ def main() -> None:
         text = "<tokens> " + " ".join(str(t) for t in generated[:16])
     text = postprocess_output_text(text, args.prompt, lang_mode)
 
-    needs_verify = _is_runtime_fallback_text(text, lang_mode) or _looks_gibberish_output(text)
+    needs_verify = decode_contract_failed or _is_runtime_fallback_text(text, lang_mode) or _looks_gibberish_output(text)
+    disable_native_safe_verify = os.getenv("VSPEC_DISABLE_NATIVE_SAFE_VERIFY", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if (not disable_native_safe_verify) and needs_verify and args.device in {"cuda", "cuda-native", "cpu"}:
+        native_safe_text = _run_native_safe_verifier(args, args.prompt, lang_mode)
+        assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=args.allow_semantic_rescue)
+        native_safe_text = assurance.repair(native_safe_text, args.prompt) if native_safe_text else ""
+        if native_safe_text and (not _is_runtime_fallback_text(native_safe_text, lang_mode)):
+            text = native_safe_text
+            needs_verify = False
+            print("[vspec-chat] native_safe_verify_used= True")
+        else:
+            print("[vspec-chat] native_safe_verify_used= False")
+
     if (
         args.runtime_mix_mode == "hybrid-verify"
         and args.device in {"cuda", "cuda-native", "cpu"}

@@ -11,6 +11,8 @@ def main() -> None:
     parser.add_argument("model", nargs="?", default="", help="Path to .vspec package or model directory")
     parser.add_argument("-m", "--model", dest="model_opt", default="", help="Path to .vspec package or model directory")
     parser.add_argument("-p", "--prompt", default="", help="Prompt text")
+    parser.add_argument("--prompts-file", default="", help="Text file with one prompt per line for continuous-batch generation")
+    parser.add_argument("--batch-output-file", default="", help="Optional file to save batched outputs")
     parser.add_argument("--chat", action="store_true", help="Interactive terminal chat mode")
 
     parser.add_argument("--device", default="", choices=["", "cpu", "cuda", "cuda-native", "torch-cuda"])
@@ -40,6 +42,8 @@ def main() -> None:
     run_args = VspecRunArgs(
         model=model,
         prompt=args.prompt,
+        prompts_file=args.prompts_file,
+        batch_output_file=args.batch_output_file,
         device=(args.device or None),
         fused_bits=args.fused_bits,
         target_bits=args.target_bits,
@@ -59,11 +63,13 @@ def main() -> None:
     )
 
     if args.chat:
+        if str(args.prompts_file or "").strip():
+            parser.error("--prompts-file cannot be combined with --chat")
         code = run_interactive(run_args)
         raise SystemExit(code)
 
-    if not args.prompt.strip():
-        parser.error("--prompt is required unless --chat is used")
+    if (not str(args.prompts_file or "").strip()) and (not args.prompt.strip()):
+        parser.error("--prompt is required unless --chat or --prompts-file is used")
 
     result = run_once(run_args)
 

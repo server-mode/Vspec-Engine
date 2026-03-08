@@ -133,9 +133,7 @@ __global__ __launch_bounds__(256) static void fused_int4_kernel_tiled(
     const size_t j = (size_t)(blockIdx.x * TILE_N + local_x);
     const size_t i = (size_t)(blockIdx.y * TILE_M + local_y);
     const size_t tid = local_y * TILE_N + local_x;
-    if (i >= m || j >= n) {
-        return;
-    }
+    const int valid = (i < m && j < n) ? 1 : 0;
 
     float acc = 0.0f;
 
@@ -176,7 +174,47 @@ __global__ __launch_bounds__(256) static void fused_int4_kernel_tiled(
         __syncthreads();
     }
 
-    c[i * n + j] = acc;
+    if (valid) {
+        c[i * n + j] = acc;
+    }
+}
+
+__global__ static void dequant_int4_rowwise_kernel(
+    const uint8_t* b_packed,
+    const float* scales,
+    float* w_f32,
+    size_t n,
+    size_t k,
+    size_t packed_k
+) {
+    const size_t row = (size_t)(blockIdx.y * blockDim.y + threadIdx.y);
+    const size_t packed_col = (size_t)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= n || packed_col >= packed_k) {
+        return;
+    }
+
+    const size_t base_packed = row * packed_k;
+    const uint8_t byte = b_packed[base_packed + packed_col];
+    const float scale = scales[row];
+
+    const size_t t0 = packed_col * 2U;
+    const size_t t1 = t0 + 1U;
+
+    int8_t q0 = (int8_t)(byte & 0x0F);
+    if (q0 >= 8) {
+        q0 = (int8_t)(q0 - 16);
+    }
+    if (t0 < k) {
+        w_f32[row * k + t0] = (float)q0 * scale;
+    }
+
+    int8_t q1 = (int8_t)((byte >> 4) & 0x0F);
+    if (q1 >= 8) {
+        q1 = (int8_t)(q1 - 16);
+    }
+    if (t1 < k) {
+        w_f32[row * k + t1] = (float)q1 * scale;
+    }
 }
 
 extern "C" int vspec_cuda_fused_available(void) {
@@ -207,6 +245,22 @@ extern "C" void vspec_cuda_fused_linear_int4_device(
     dim3 block((unsigned)block_x, (unsigned)block_y);
     dim3 grid((unsigned)((n + 15U) / 16U), (unsigned)((m + 15U) / 16U));
     fused_int4_kernel_tiled<<<grid, block>>>(d_a, d_b_packed, d_scales, d_c, m, n, k, packed_k);
+}
+
+extern "C" void vspec_cuda_dequant_int4_to_f32_device(
+    const unsigned char* d_b_packed,
+    const float* d_scales,
+    float* d_w_f32,
+    size_t n,
+    size_t k
+) {
+    if (!d_b_packed || !d_scales || !d_w_f32 || n == 0U || k == 0U) {
+        return;
+    }
+    const size_t packed_k = (k + 1U) / 2U;
+    dim3 block(128, 1);
+    dim3 grid((unsigned)((packed_k + block.x - 1U) / block.x), (unsigned)n);
+    dequant_int4_rowwise_kernel<<<grid, block>>>(d_b_packed, d_scales, d_w_f32, n, k, packed_k);
 }
 
 extern "C" void vspec_cuda_expand_int3_to_int4_device(

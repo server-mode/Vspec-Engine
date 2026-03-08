@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 try:
     import numpy as np
@@ -46,12 +47,24 @@ class DecodeOptimizationModule:
         if self.profile.use_numpy_logits and hasattr(runtime, "forward_logits_np"):
             logits = runtime.forward_logits_np([int(last_token_id)])
             if np is not None and isinstance(logits, np.ndarray) and logits.size > 0:
-                return logits
+                safe = np.asarray(logits, dtype=np.float32)
+                if not np.all(np.isfinite(safe)):
+                    safe = np.nan_to_num(safe, nan=-1e9, posinf=1e9, neginf=-1e9)
+                return safe
 
         if hasattr(runtime, "forward_logits"):
             logits = runtime.forward_logits([int(last_token_id)])
             if logits:
-                return logits
+                safe_logits: list[float] = []
+                for value in logits:
+                    try:
+                        fv = float(value)
+                    except Exception:
+                        fv = -1e9
+                    if not math.isfinite(fv):
+                        fv = -1e9 if fv < 0 else 1e9
+                    safe_logits.append(fv)
+                return safe_logits
 
         return [0.0 for _ in range(vocab_size)]
 

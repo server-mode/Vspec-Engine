@@ -87,6 +87,18 @@ if _lib is not None:
             POINTER(c_float),
         ]
         _lib.vspec_cuda_attention_fused_single_f32_bridge.restype = None
+    _HAS_FLASH_ATTN = hasattr(_lib, "vspec_attention_flash_single_f32_bridge")
+    if _HAS_FLASH_ATTN:
+        _lib.vspec_attention_flash_single_f32_bridge.argtypes = [
+            POINTER(c_float),
+            POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        _lib.vspec_attention_flash_single_f32_bridge.restype = None
     _lib.vspec_cuda_silu_f32_bridge.argtypes = [
         POINTER(c_float),
         c_size_t,
@@ -131,6 +143,7 @@ if _lib is not None:
         _HAS_FUSED_INT3 = True
 else:
     _HAS_FUSED_ATTN = False
+    _HAS_FLASH_ATTN = False
 
 
 def rmsnorm_f32_available() -> bool:
@@ -230,6 +243,10 @@ def attention_fused_single_f32_available() -> bool:
     return _lib is not None and _HAS_FUSED_ATTN
 
 
+def attention_flash_single_f32_available() -> bool:
+    return _lib is not None and _HAS_FLASH_ATTN
+
+
 def attention_single_f32(query: np.ndarray, keys: np.ndarray, values: np.ndarray) -> np.ndarray:
     if _lib is None:
         raise RuntimeError("vspec_cuda_bridge.dll not found")
@@ -282,6 +299,36 @@ def attention_fused_single_f32(query: np.ndarray, keys: np.ndarray, values: np.n
         values.ctypes.data_as(POINTER(c_float)),
         c_size_t(seq_len),
         c_size_t(head_dim),
+        output.ctypes.data_as(POINTER(c_float)),
+    )
+
+    return output
+
+
+def attention_flash_single_f32(query: np.ndarray, keys: np.ndarray, values: np.ndarray, block_tokens: int = 128) -> np.ndarray:
+    if _lib is None or not _HAS_FLASH_ATTN:
+        raise RuntimeError("flash attention bridge not available")
+    if query.dtype != np.float32:
+        query = query.astype(np.float32)
+    if keys.dtype != np.float32:
+        keys = keys.astype(np.float32)
+    if values.dtype != np.float32:
+        values = values.astype(np.float32)
+
+    query = np.ascontiguousarray(query)
+    keys = np.ascontiguousarray(keys)
+    values = np.ascontiguousarray(values)
+
+    seq_len, head_dim = keys.shape
+    output = np.empty((head_dim,), dtype=np.float32)
+
+    _lib.vspec_attention_flash_single_f32_bridge(
+        query.ctypes.data_as(POINTER(c_float)),
+        keys.ctypes.data_as(POINTER(c_float)),
+        values.ctypes.data_as(POINTER(c_float)),
+        c_size_t(seq_len),
+        c_size_t(head_dim),
+        c_size_t(max(1, int(block_tokens))),
         output.ctypes.data_as(POINTER(c_float)),
     )
 
