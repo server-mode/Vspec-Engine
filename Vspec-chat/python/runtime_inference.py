@@ -68,6 +68,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from model_adapters import ModelAdapter
 from model_loader import WeightInfo
+from gguf_support import get_gguf_archive
 from runtime_core_bridge import CorePagedKVCache
 from runtime_baseline_manager import resolve_runtime_baseline_plan
 from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
@@ -766,6 +767,8 @@ class GenericTransformerRuntimeTorch:
 
 
 def _load_tensor(info: WeightInfo) -> Optional["np.ndarray"]:
+    if getattr(info, "source_format", "safetensors") == "gguf":
+        return get_gguf_archive(info.path).load_tensor(info.name)
     if np is None or safe_open is None:
         return None
     f = _get_safe_open_handle(info.path, "np")
@@ -800,13 +803,19 @@ def _select_weight(weight_index: dict[str, WeightInfo], candidates: list[str]) -
 
 
 def runtime_load_reason(weight_index: dict[str, WeightInfo], embed_names: list[str], lm_head_names: list[str]) -> str:
-    if np is None or safe_open is None:
+    if np is None:
         return "missing numpy or safetensors"
 
     embed_info = _select_weight(weight_index, embed_names)
     lm_head_info = _select_weight(weight_index, lm_head_names)
     if not embed_info or not lm_head_info:
         return "missing embed or lm_head weights"
+
+    if getattr(embed_info, "source_format", "safetensors") == "gguf" and getattr(lm_head_info, "source_format", "safetensors") == "gguf":
+        return "unknown"
+
+    if safe_open is None:
+        return "missing numpy or safetensors"
 
     needs_torch = False
     for info in (embed_info, lm_head_info):
@@ -1056,6 +1065,24 @@ def _load_layer_torch(weight_index: dict[str, WeightInfo], layer_idx: int, devic
     )
 
 
+def _infer_head_dim(layers: list[LayerWeights], num_heads: int, num_kv_heads: int, hidden: int) -> int:
+    if layers:
+        first = layers[0]
+        try:
+            q_rows = int(first.wq.shape[0])
+            if num_heads > 0 and q_rows > 0 and (q_rows % num_heads) == 0:
+                return q_rows // num_heads
+        except Exception:
+            pass
+        try:
+            k_rows = int(first.wk.shape[0])
+            if num_kv_heads > 0 and k_rows > 0 and (k_rows % num_kv_heads) == 0:
+                return k_rows // num_kv_heads
+        except Exception:
+            pass
+    return hidden // max(1, num_heads)
+
+
 def _load_generic_transformer(
     config: dict,
     weight_index: dict[str, WeightInfo],
@@ -1143,7 +1170,7 @@ def _load_generic_transformer(
             num_heads = 32
         if num_kv_heads <= 0:
             num_kv_heads = num_heads
-        head_dim = hidden // num_heads
+        head_dim = _infer_head_dim(layers, num_heads, num_kv_heads, hidden)
 
         rms_eps = float(config.get("rms_norm_eps", 1e-6))
         rope_theta = float(config.get("rope_theta", 10000.0))
@@ -1265,7 +1292,7 @@ def _load_generic_transformer_torch(
             num_heads = 32
         if num_kv_heads <= 0:
             num_kv_heads = num_heads
-        head_dim = hidden // num_heads
+        head_dim = _infer_head_dim(layers, num_heads, num_kv_heads, hidden)
 
         rms_eps = float(config.get("rms_norm_eps", 1e-6))
         rope_theta = float(config.get("rope_theta", 10000.0))
@@ -1339,7 +1366,9 @@ def build_generic_runtime(
     use_native_cuda_norm_override: Optional[bool] = None,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[object]:
-    if device == "torch-cuda" and torch is not None and torch.cuda.is_available():
+    any_weight = next(iter(weight_index.values()), None)
+    has_gguf = getattr(any_weight, "source_format", "safetensors") == "gguf"
+    if device == "torch-cuda" and (not has_gguf) and torch is not None and torch.cuda.is_available():
         runtime = _load_generic_transformer_torch(config, weight_index, max_layers, "cuda", progress_cb)
         if runtime is not None:
             return runtime

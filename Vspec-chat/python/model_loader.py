@@ -4,6 +4,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+from gguf_support import get_gguf_archive, is_gguf_path
 from runtime_core_bridge import canonical_weight_name
 
 try:
@@ -49,6 +50,8 @@ class _TransformersTokenizerAdapter:
 
 
 def find_snapshot_dir(model_dir: Path) -> Path:
+    if is_gguf_path(model_dir):
+        return model_dir
     snapshot_root = model_dir / "snapshots"
     if not snapshot_root.exists():
         return model_dir
@@ -60,6 +63,8 @@ def find_snapshot_dir(model_dir: Path) -> Path:
 
 
 def read_config(snapshot_dir: Path) -> dict:
+    if is_gguf_path(snapshot_dir):
+        return get_gguf_archive(snapshot_dir).config()
     config_path = snapshot_dir / "config.json"
     if not config_path.exists():
         return {}
@@ -67,6 +72,8 @@ def read_config(snapshot_dir: Path) -> dict:
 
 
 def read_tokenizer_config(snapshot_dir: Path) -> dict:
+    if is_gguf_path(snapshot_dir):
+        return get_gguf_archive(snapshot_dir).tokenizer_config()
     tok_cfg_path = snapshot_dir / "tokenizer_config.json"
     if not tok_cfg_path.exists():
         return {}
@@ -77,6 +84,8 @@ def read_tokenizer_config(snapshot_dir: Path) -> dict:
 
 
 def load_tokenizer(snapshot_dir: Path) -> Optional[object]:
+    if is_gguf_path(snapshot_dir):
+        return get_gguf_archive(snapshot_dir).load_tokenizer()
     if Tokenizer is not None:
         tok_path = snapshot_dir / "tokenizer.json"
         if tok_path.exists():
@@ -106,10 +115,14 @@ def parse_safetensors_header_names(path: Path) -> list[str]:
 
 
 def pick_safetensors(snapshot_dir: Path) -> list[Path]:
+    if is_gguf_path(snapshot_dir):
+        return []
     return sorted([p for p in snapshot_dir.rglob("*.safetensors") if ".no_exist" not in str(p)])
 
 
 def collect_tensor_names(snapshot_dir: Path) -> list[str]:
+    if is_gguf_path(snapshot_dir):
+        return get_gguf_archive(snapshot_dir).list_tensor_names()
     names: list[str] = []
     seen = set()
     for path in pick_safetensors(snapshot_dir):
@@ -126,9 +139,47 @@ class WeightInfo:
     dtype: str
     shape: list[int]
     path: Path
+    source_format: str = "safetensors"
 
 
 def build_weight_index(snapshot_dir: Path) -> dict[str, WeightInfo]:
+    if is_gguf_path(snapshot_dir):
+        archive = get_gguf_archive(snapshot_dir)
+        index: dict[str, WeightInfo] = {}
+        for tensor in archive.reader.tensors:
+            shape = [int(x) for x in reversed(tensor.shape.tolist())]
+            weight = WeightInfo(
+                name=tensor.name,
+                dtype=str(tensor.tensor_type.name).lower(),
+                shape=shape,
+                path=snapshot_dir,
+                source_format="gguf",
+            )
+            index[tensor.name] = weight
+            mapped = archive.map_tensor_name(tensor.name)
+            if mapped and mapped not in index:
+                index[mapped] = WeightInfo(
+                    name=tensor.name,
+                    dtype=str(tensor.tensor_type.name).lower(),
+                    shape=shape,
+                    path=snapshot_dir,
+                    source_format="gguf",
+                )
+        for mapped_name, raw_name in archive.tensor_name_map.items():
+            if mapped_name in index:
+                continue
+            tensor = archive.tensor_by_name.get(raw_name)
+            if tensor is None:
+                continue
+            index[mapped_name] = WeightInfo(
+                name=raw_name,
+                dtype=str(tensor.tensor_type.name).lower(),
+                shape=[int(x) for x in reversed(tensor.shape.tolist())],
+                path=snapshot_dir,
+                source_format="gguf",
+            )
+        return index
+
     index: dict[str, WeightInfo] = {}
     for path in pick_safetensors(snapshot_dir):
         header = _parse_safetensors_header(path)
