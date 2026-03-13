@@ -100,10 +100,14 @@ VspecDynamicQuantDecision vspec_dynamic_quant_decide(
         representative_abs = vspec_percentile_abs(data, count, cfg->percentile);
     }
 
+    const float global_abs = vspec_percentile_abs(data, count, cfg->percentile);
+    const float denom = (global_abs > 1e-6f) ? global_abs : 1e-6f;
+    const float relative_strength = representative_abs / denom;
+
     d.bits = cfg->max_bits;
-    if (representative_abs < 0.25f && cfg->min_bits <= 2) {
+    if (relative_strength < 0.18f && cfg->min_bits <= 2) {
         d.bits = 2;
-    } else if (representative_abs < 1.0f && cfg->min_bits <= 3) {
+    } else if (relative_strength < 0.55f && cfg->min_bits <= 3) {
         d.bits = 3;
     }
 

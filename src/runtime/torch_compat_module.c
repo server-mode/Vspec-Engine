@@ -182,12 +182,13 @@ void vspec_torch_compat_rmsnorm_f32(
         return;
     }
 
-    float mean_sq = 0.0f;
+    double mean_sq = 0.0;
     for (size_t i = 0; i < n; ++i) {
-        mean_sq += input[i] * input[i];
+        const double v = (double)input[i];
+        mean_sq += v * v;
     }
-    mean_sq /= (float)n;
-    const float inv_rms = 1.0f / sqrtf(mean_sq + eps);
+    mean_sq /= (double)n;
+    const float inv_rms = 1.0f / (float)sqrt(mean_sq + (double)eps);
 
     for (size_t i = 0; i < n; ++i) {
         float v = input[i] * inv_rms * weight[i];

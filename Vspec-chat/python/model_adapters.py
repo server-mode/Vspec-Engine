@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from runtime_compat import resolve_runtime_target
+
 
 def _first_int(value) -> Optional[int]:
     if isinstance(value, list) and value:
@@ -35,5 +37,7 @@ def _make_adapter(model_type: str, config: dict) -> ModelAdapter:
 
 
 def select_adapter(config: dict, tensor_names: list[str]) -> ModelAdapter:
-    model_type = str(config.get("model_type", "")).lower()
-    return _make_adapter(model_type, config)
+    target = resolve_runtime_target(config, tensor_names)
+    adapter_cfg = dict(config)
+    adapter_cfg["model_type"] = target.normalized_model_type
+    return _make_adapter(target.normalized_model_type, adapter_cfg)

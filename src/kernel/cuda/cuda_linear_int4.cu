@@ -9,6 +9,8 @@
 #include "vspec/kernel/cuda_ultimate.h"
 #include "vspec/quant/quant.h"
 
+extern "C" void vspec_cuda_launch_attention_fused(VspecKernelContext* ctx);
+
 #ifndef VSPEC_CUDA_BLOCK_X
 #define VSPEC_CUDA_BLOCK_X 16
 #endif
@@ -108,5 +110,5 @@ extern "C" void vspec_cuda_launch_linear_impl(VspecKernelContext* ctx) {
 }
 
 extern "C" void vspec_cuda_launch_attention_impl(VspecKernelContext* ctx) {
-    (void)ctx;
+    vspec_cuda_launch_attention_fused(ctx);
 }

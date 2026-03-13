@@ -88,7 +88,7 @@ static void quantize_head_int3_percentile(
         }
 
         const float rep_abs = percentile_abs_block(src + base, len, percentile);
-        const float qmax = 3.0f;
+        const float qmax = 4.0f;
         float scale = (rep_abs > 0.0f) ? (rep_abs / qmax) : 1.0f;
         if (scale < 1e-6f) {
             scale = 1e-6f;
@@ -194,15 +194,27 @@ int vspec_kv_cache_append(
                 cache->value_int3 + qoff,
                 cache->value_scales + soff
             );
+
+            if (cache->key && cache->value) {
+                float* key_mirror = cache->key + base + h * cache->head_dim;
+                float* value_mirror = cache->value + base + h * cache->head_dim;
+                dequantize_head_int3(
+                    cache->key_int3 + qoff,
+                    cache->key_scales + soff,
+                    cache->head_dim,
+                    cache->block_size,
+                    key_mirror
+                );
+                dequantize_head_int3(
+                    cache->value_int3 + qoff,
+                    cache->value_scales + soff,
+                    cache->head_dim,
+                    cache->block_size,
+                    value_mirror
+                );
+            }
         }
     } else {
-        for (size_t i = 0; i < stride; ++i) {
-            cache->key[base + i] = key_token[i];
-            cache->value[base + i] = value_token[i];
-        }
-    }
-
-    if (cache->key && cache->value) {
         for (size_t i = 0; i < stride; ++i) {
             cache->key[base + i] = key_token[i];
             cache->value[base + i] = value_token[i];
@@ -286,7 +298,15 @@ const float* vspec_kv_cache_key_at(const VspecKVCache* cache, size_t token_idx, 
         return NULL;
     }
 
-    if (cache->int3_compressed && cache->key_int3 && cache->key_scales && cache->scratch_key_head) {
+    if (cache->int3_compressed && cache->key_int3 && cache->key_scales) {
+        const size_t stride = token_stride(cache);
+        const size_t offset = token_idx * stride + head_idx * cache->head_dim;
+        if (cache->key) {
+            return cache->key + offset;
+        }
+        if (!cache->scratch_key_head) {
+            return NULL;
+        }
         const size_t qoff = (token_idx * cache->num_heads + head_idx) * cache->packed_head_bytes;
         const size_t soff = (token_idx * cache->num_heads + head_idx) * cache->blocks_per_head;
         dequantize_head_int3(
@@ -313,7 +333,15 @@ const float* vspec_kv_cache_value_at(const VspecKVCache* cache, size_t token_idx
         return NULL;
     }
 
-    if (cache->int3_compressed && cache->value_int3 && cache->value_scales && cache->scratch_value_head) {
+    if (cache->int3_compressed && cache->value_int3 && cache->value_scales) {
+        const size_t stride = token_stride(cache);
+        const size_t offset = token_idx * stride + head_idx * cache->head_dim;
+        if (cache->value) {
+            return cache->value + offset;
+        }
+        if (!cache->scratch_value_head) {
+            return NULL;
+        }
         const size_t qoff = (token_idx * cache->num_heads + head_idx) * cache->packed_head_bytes;
         const size_t soff = (token_idx * cache->num_heads + head_idx) * cache->blocks_per_head;
         dequantize_head_int3(

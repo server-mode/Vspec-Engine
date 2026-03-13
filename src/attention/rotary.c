@@ -8,7 +8,10 @@ void vspec_rotary_apply(float* q, float* k, size_t head_dim, size_t base_pos) {
     }
 
     for (size_t i = 0; i + 1 < head_dim; i += 2) {
-        const float angle = (float)base_pos * 0.001f * (float)(i + 1);
+        const size_t pair_idx = i / 2U;
+        const float exponent = (2.0f * (float)pair_idx) / (float)head_dim;
+        const float inv_freq = powf(10000.0f, -exponent);
+        const float angle = (float)base_pos * inv_freq;
         const float c = cosf(angle);
         const float s = sinf(angle);
 

@@ -177,15 +177,27 @@ static uint8_t vspec_clamp_bits(uint8_t bits, uint8_t min_bits, uint8_t max_bits
     return bits;
 }
 
+static int vspec_layer_requires_4bit(VspecLayerType type) {
+    return (type == VSPEC_LAYER_ATTENTION_QK ||
+            type == VSPEC_LAYER_ATTENTION_PROJ ||
+            type == VSPEC_LAYER_LM_HEAD ||
+            type == VSPEC_LAYER_EMBED);
+}
+
 static uint8_t vspec_apply_realtime_pressure_downshift(
     uint8_t bits,
     const VspecMixedBitPolicy* policy,
+    VspecLayerType type,
     const VspecMixedBitPressureProfile* pressure,
     uint8_t min_bits,
     uint8_t max_bits
 ) {
     if (!policy || !pressure) {
         return vspec_clamp_bits(bits, min_bits, max_bits);
+    }
+
+    if (vspec_layer_requires_4bit(type) && bits >= 4U) {
+        return 4U;
     }
 
     float peak_pressure = pressure->vram_pressure;
@@ -258,12 +270,15 @@ uint8_t vspec_mixed_bit_select_bits(
 ) {
     uint8_t override_bits = 0U;
     if (vspec_mixed_bit_runtime_get(runtime, layer_id, type, &override_bits)) {
+        if (vspec_layer_requires_4bit(type) && override_bits < 4U) {
+            return 4U;
+        }
         return override_bits;
     }
 
     uint8_t bits = vspec_base_bits_from_policy(policy, type);
 
-    if (type == VSPEC_LAYER_ATTENTION_QK || type == VSPEC_LAYER_ATTENTION_PROJ || type == VSPEC_LAYER_LM_HEAD) {
+    if (vspec_layer_requires_4bit(type)) {
         return vspec_clamp_bits(4U, 2U, 4U);
     }
 
@@ -329,6 +344,7 @@ uint8_t vspec_mixed_bit_select_bits(
 
     bits = vspec_clamp_bits(bits, min_bits, max_bits);
 
+    int quality_escalated = 0;
     if (policy && policy->enable_bit_escalation && data && count > 0U) {
         const float rms = vspec_layer_rms(data, count);
         const float drift = vspec_activation_norm_drift(layer_id, type, rms);
@@ -341,10 +357,11 @@ uint8_t vspec_mixed_bit_select_bits(
             drift >= policy->activation_norm_drift_threshold ||
             entropy_collapse >= policy->attention_entropy_escalate_threshold) {
             bits = 4U;
+            quality_escalated = 1;
         }
     }
 
-    if (policy) {
+    if (policy && !quality_escalated) {
         if (pressure >= policy->pressure_critical) {
             if (bits > policy->downshift_step * 2U) {
                 bits -= (uint8_t)(policy->downshift_step * 2U);
@@ -358,6 +375,10 @@ uint8_t vspec_mixed_bit_select_bits(
                 bits = min_bits;
             }
         }
+    }
+
+    if (vspec_layer_requires_4bit(type)) {
+        bits = 4U;
     }
 
     return vspec_clamp_bits(bits, min_bits, max_bits);
@@ -386,5 +407,9 @@ uint8_t vspec_mixed_bit_select_bits_realtime(
     if (min_bits > max_bits) {
         min_bits = max_bits;
     }
-    return vspec_apply_realtime_pressure_downshift(bits, policy, pressure, min_bits, max_bits);
+    bits = vspec_apply_realtime_pressure_downshift(bits, policy, type, pressure, min_bits, max_bits);
+    if (vspec_layer_requires_4bit(type)) {
+        bits = 4U;
+    }
+    return bits;
 }

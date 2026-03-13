@@ -809,6 +809,9 @@ def main() -> None:
     if (not batch_mode) and (not str(args.prompt or "").strip()):
         parser.error("--prompt is required unless --interactive or --prompts-file is used")
 
+    requested_max_tokens = int(args.max_tokens)
+    requested_max_layers_post_parse = int(args.max_layers)
+
     if args.threebit_test_boost:
         if int(args.max_layers) <= 0:
             args.max_layers = 0
@@ -847,7 +850,20 @@ def main() -> None:
         print(f"[vspec-chat] quality_guard_max_layers_adjusted= {requested_layers} -> {args.max_layers}")
     tok_cfg = read_tokenizer_config(snapshot_dir)
     tokenizer = load_tokenizer(snapshot_dir)
-    _progress(show_progress, 35, "weights", "indexing safetensors headers")
+    model_type = str(config.get("model_type", "") or "").lower()
+    if model_type == "gpt2":
+        if int(args.fused_bits) == 3:
+            args.fused_bits = 4
+            os.environ["VSPEC_FUSED_BITS"] = "4"
+            print("[vspec-chat] auto_adjust_fused_bits= 3 -> 4 for gpt2 stability")
+        if int(args.target_bits) == 3:
+            args.target_bits = 4
+            print("[vspec-chat] auto_adjust_target_bits= 3 -> 4 for gpt2 stability")
+        if requested_max_tokens > 0:
+            args.max_tokens = requested_max_tokens
+        if requested_max_layers_post_parse > 0:
+            args.max_layers = requested_max_layers_post_parse
+    _progress(show_progress, 35, "weights", "indexing model weights")
     tensor_names = collect_tensor_names(snapshot_dir)
     weight_index = build_weight_index(snapshot_dir)
     dtype_stats = summarize_weight_dtypes(weight_index)

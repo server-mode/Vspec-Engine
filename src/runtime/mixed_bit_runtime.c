@@ -60,7 +60,7 @@ void vspec_mixed_bit_runtime_set(VspecMixedBitRuntime* rt, uint32_t layer_id, Vs
 
 uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, uint32_t layer_id, VspecLayerType type) {
     if (!rt) {
-        return 3;
+        return 4;
     }
 
     if (rt->has_last_lookup && rt->last_lookup_layer_id == layer_id && rt->last_lookup_type == type) {
@@ -76,19 +76,19 @@ uint8_t vspec_mixed_bit_runtime_bits_for_layer(const VspecMixedBitRuntime* rt, u
 
     switch (type) {
         case VSPEC_LAYER_ATTENTION:
-            return 3;
+            return 4;
         case VSPEC_LAYER_ATTENTION_QK:
-            return 3;
+            return 4;
         case VSPEC_LAYER_ATTENTION_PROJ:
             return 4;
         case VSPEC_LAYER_MLP:
-            return 3;
+            return 4;
         case VSPEC_LAYER_EMBED:
-            return 3;
+            return 4;
         case VSPEC_LAYER_LM_HEAD:
             return 4;
         default:
-            return 3;
+            return 4;
     }
 }
 

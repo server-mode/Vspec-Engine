@@ -194,6 +194,31 @@ class GGUFArchive:
             "eos_token_id": int(eos_id) if eos_id is not None else None,
             "tie_word_embeddings": "output.weight" not in self.tensor_by_name,
         }
+        if arch == "qwen35":
+            num_layers = int(cfg.get("num_hidden_layers", 0) or 0)
+            ssm_group_count = int(_field_value(self.reader, f"{arch}.ssm.group_count", 0) or 0)
+            ssm_time_step_rank = int(_field_value(self.reader, f"{arch}.ssm.time_step_rank", 0) or 0)
+            ssm_inner_size = int(_field_value(self.reader, f"{arch}.ssm.inner_size", 0) or 0)
+            layer_types: list[str] = []
+            for layer_idx in range(num_layers):
+                prefix = f"blk.{layer_idx}."
+                if prefix + "attn_q.weight" in self.tensor_by_name:
+                    layer_types.append("full_attention")
+                elif prefix + "attn_qkv.weight" in self.tensor_by_name:
+                    layer_types.append("linear_attention")
+                else:
+                    layer_types.append("unknown")
+            cfg.update({
+                "head_dim": int(_field_value(self.reader, f"{arch}.attention.key_length", 0) or 0),
+                "rope_dimension_count": int(_field_value(self.reader, f"{arch}.rope.dimension_count", 0) or 0),
+                "rope_dimension_sections": list(_field_value(self.reader, f"{arch}.rope.dimension_sections", []) or []),
+                "linear_num_key_heads": ssm_group_count,
+                "linear_num_value_heads": ssm_time_step_rank,
+                "linear_key_head_dim": int(_field_value(self.reader, f"{arch}.ssm.state_size", 0) or 0),
+                "linear_value_head_dim": (ssm_inner_size // ssm_time_step_rank) if ssm_time_step_rank > 0 else 0,
+                "linear_conv_kernel_dim": int(_field_value(self.reader, f"{arch}.ssm.conv_kernel", 0) or 0),
+                "layer_types": layer_types,
+            })
         return cfg
 
     def tokenizer_config(self) -> dict[str, Any]:

@@ -495,10 +495,29 @@ extern "C" void vspec_cuda_launch_attention_fused(VspecKernelContext* ctx) {
             free(key_head_scales);
             free(value_head_scales);
         } else {
-            const float* kh = cache->key + h * cache->max_tokens * d;
-            const float* vh = cache->value + h * cache->max_tokens * d;
+            float* key_head = (float*)malloc(tmax * d * sizeof(float));
+            float* value_head = (float*)malloc(tmax * d * sizeof(float));
+            if (!key_head || !value_head) {
+                free(key_head);
+                free(value_head);
+                return;
+            }
+            for (size_t t = 0; t < tmax; ++t) {
+                const float* kh_t = vspec_kv_cache_key_at(cache, t, h);
+                const float* vh_t = vspec_kv_cache_value_at(cache, t, h);
+                if (!kh_t || !vh_t) {
+                    free(key_head);
+                    free(value_head);
+                    return;
+                }
+                memcpy(key_head + t * d, kh_t, d * sizeof(float));
+                memcpy(value_head + t * d, vh_t, d * sizeof(float));
+            }
+
             float* oh = out + h * d;
-            vspec_cuda_attention_fused_single_f32(qh, kh, vh, tmax, d, oh);
+            vspec_cuda_attention_fused_single_f32(qh, key_head, value_head, tmax, d, oh);
+            free(key_head);
+            free(value_head);
         }
     }
 }

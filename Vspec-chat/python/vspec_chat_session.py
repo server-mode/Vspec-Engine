@@ -754,11 +754,20 @@ def main() -> None:
     args.max_layers = _resolve_quality_layer_floor(config, requested_layers, str(args.device), bool(args.unsafe_low_layers))
     if requested_layers > 0 and args.max_layers != requested_layers:
         print(f"[session] quality_guard_max_layers_adjusted= {requested_layers} -> {args.max_layers}")
+    model_type = str(config.get("model_type", "") or "").lower()
+    if model_type == "gpt2":
+        if int(args.fused_bits) == 3:
+            args.fused_bits = 4
+            os.environ["VSPEC_FUSED_BITS"] = "4"
+            print("[session] auto_adjust_fused_bits= 3 -> 4 for gpt2 stability")
+        if int(args.target_bits) == 3:
+            args.target_bits = 4
+            print("[session] auto_adjust_target_bits= 3 -> 4 for gpt2 stability")
 
     tok_cfg = read_tokenizer_config(snapshot)
     tokenizer = load_tokenizer(snapshot)
     tensor_names = collect_tensor_names(snapshot)
-    _progress(show_progress, 35, "weights", "index headers")
+    _progress(show_progress, 35, "weights", "index model weights")
     weight_index = build_weight_index(snapshot)
     adapter = select_adapter(config, tensor_names)
 

@@ -21,3 +21,4 @@ struc/
 research/
 **/__pycache__/
 *.py[cod]
+tmp/

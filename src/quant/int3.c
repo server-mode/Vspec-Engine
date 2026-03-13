@@ -46,12 +46,21 @@ void vspec_int3_matmul_ref_f32_q3(
         for (size_t j = 0; j < n; ++j) {
             const uint8_t* b_row = b_packed + (j * row_bytes);
             const float scale = scales[j];
+            float zero_point = 0.0f;
+            {
+                double sum_q = 0.0;
+                for (size_t t = 0; t < k; ++t) {
+                    const int8_t wq = vspec_quant_get_signed(b_row, t, 3);
+                    sum_q += (double)wq;
+                }
+                zero_point = (float)(sum_q / (double)k);
+            }
             float acc = 0.0f;
 
             if (!use_runtime_3bit) {
                 for (size_t t = 0; t < k; ++t) {
                     const int8_t wq = vspec_quant_get_signed(b_row, t, 3);
-                    acc += a_row[t] * ((float)wq * scale);
+                    acc += a_row[t] * (((float)wq - zero_point) * scale);
                 }
             } else {
                 for (size_t base = 0; base < k; base += block) {
@@ -64,7 +73,7 @@ void vspec_int3_matmul_ref_f32_q3(
                     for (size_t t = base; t < end; ++t) {
                         const float av = a_row_clamped[t];
                         const int8_t wq = vspec_quant_get_signed(b_row, t, 3);
-                        const float bv = (float)wq * scale;
+                        const float bv = ((float)wq - zero_point) * scale;
                         const float aabs = (av < 0.0f) ? -av : av;
                         const float babs = (bv < 0.0f) ? -bv : bv;
                         if (aabs > block_abs) {
@@ -79,7 +88,7 @@ void vspec_int3_matmul_ref_f32_q3(
                     float block_acc = 0.0f;
                     for (size_t t = base; t < end; ++t) {
                         const int8_t wq = vspec_quant_get_signed(b_row, t, 3);
-                        const float bn = ((float)wq * scale) / block_scale;
+                        const float bn = (((float)wq - zero_point) * scale) / block_scale;
                         const float an = a_row_clamped[t] / block_scale;
                         block_acc += an * bn;
                     }

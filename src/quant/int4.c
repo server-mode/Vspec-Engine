@@ -65,6 +65,15 @@ void vspec_int4_matmul_ref_f32_q4(
         for (size_t j = 0; j < n; ++j) {
             const uint8_t* b_row = b_packed + (j * b_row_packed);
             const float scale = scales[j];
+            float zero_point = 0.0f;
+            {
+                double sum_q = 0.0;
+                for (size_t t_scan = 0; t_scan < k; ++t_scan) {
+                    const int8_t wq = vspec_int4_get(b_row, t_scan);
+                    sum_q += (double)wq;
+                }
+                zero_point = (float)(sum_q / (double)k);
+            }
             float acc = 0.0f;
 
             size_t t = 0;
@@ -72,13 +81,13 @@ void vspec_int4_matmul_ref_f32_q4(
                 const uint8_t byte = b_row[t >> 1U];
                 const int8_t w0 = decode_int4(byte & 0x0F);
                 const int8_t w1 = decode_int4((byte >> 4) & 0x0F);
-                acc += a_row[t] * ((float)w0 * scale);
-                acc += a_row[t + 1U] * ((float)w1 * scale);
+                acc += a_row[t] * (((float)w0 - zero_point) * scale);
+                acc += a_row[t + 1U] * (((float)w1 - zero_point) * scale);
             }
 
             if (t < k) {
                 const int8_t wq = vspec_int4_get(b_row, t);
-                acc += a_row[t] * ((float)wq * scale);
+                acc += a_row[t] * (((float)wq - zero_point) * scale);
             }
 
             c_row[j] = acc;

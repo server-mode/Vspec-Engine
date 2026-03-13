@@ -5,7 +5,7 @@ void vspec_mixed_bit_plan_init(VspecMixedBitPlan* plan) {
     if (!plan) {
         return;
     }
-    plan->bits = 3;
+    plan->bits = 4;
     plan->group_size = 32;
 }
 
@@ -21,8 +21,8 @@ VspecMixedBitPlan vspec_mixed_bit_plan_from_data(
     if (cfg.min_bits < 2U) {
         cfg.min_bits = 2U;
     }
-    if (cfg.max_bits > 3U) {
-        cfg.max_bits = 3U;
+    if (cfg.max_bits > 4U) {
+        cfg.max_bits = 4U;
     }
     cfg.group_size = 32U;
     VspecDynamicQuantDecision d = vspec_dynamic_quant_decide(data, count, &cfg);
@@ -31,8 +31,8 @@ VspecMixedBitPlan vspec_mixed_bit_plan_from_data(
     if (plan.bits < 2U) {
         plan.bits = 2U;
     }
-    if (plan.bits > 3U) {
-        plan.bits = 3U;
+    if (plan.bits > 4U) {
+        plan.bits = 4U;
     }
     plan.group_size = cfg.group_size;
     return plan;

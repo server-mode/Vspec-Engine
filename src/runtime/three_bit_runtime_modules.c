@@ -91,8 +91,8 @@ void vspec_3bit_softmax_manager_default(Vspec3BitSoftmaxManager* manager) {
         return;
     }
     manager->enabled = vspec_runtime_3bit_enabled();
-    manager->logit_clip = 10.0f;
-    manager->temperature_floor = 0.70f;
+    manager->logit_clip = 24.0f;
+    manager->temperature_floor = 0.85f;
     manager->min_denom = 1e-12f;
 }
 
@@ -110,10 +110,10 @@ void vspec_3bit_noise_reducer_default(Vspec3BitNoiseReducer* reducer) {
         return;
     }
     reducer->enabled = vspec_runtime_3bit_enabled();
-    reducer->input_clip = 8.0f;
-    reducer->smooth_alpha = 0.20f;
-    reducer->outlier_threshold = 4.5f;
-    reducer->activation_clamp_alpha = 2.8f;
+    reducer->input_clip = 16.0f;
+    reducer->smooth_alpha = 0.0f;
+    reducer->outlier_threshold = 32.0f;
+    reducer->activation_clamp_alpha = 4.5f;
 }
 
 void vspec_3bit_attention_manager_default(Vspec3BitAttentionManager* manager) {
@@ -124,8 +124,8 @@ void vspec_3bit_attention_manager_default(Vspec3BitAttentionManager* manager) {
     manager->qk_compute_bits = vspec_runtime_3bit_bits_for_component("attention.qk");
     manager->output_projection_bits = vspec_runtime_3bit_bits_for_component("attention.projection");
     manager->mlp_compute_bits = vspec_runtime_3bit_bits_for_component("mlp");
-    manager->qk_scale_min = 0.05f;
-    manager->qk_scale_max = 4.00f;
+    manager->qk_scale_min = 1e-4f;
+    manager->qk_scale_max = 32.0f;
     manager->output_clip = 16.0f;
     vspec_3bit_softmax_manager_default(&manager->softmax);
     vspec_3bit_accum_manager_default(&manager->accum);
@@ -163,7 +163,11 @@ void vspec_3bit_noise_reduce_vector(
         if (fabsf(delta) > outlier_th) {
             v = prev + ((delta > 0.0f) ? outlier_th : -outlier_th);
         }
-        output[i] = prev * alpha + v * (1.0f - alpha);
+        if (alpha > 0.0f) {
+            output[i] = prev * alpha + v * (1.0f - alpha);
+        } else {
+            output[i] = v;
+        }
         prev = output[i];
     }
 }

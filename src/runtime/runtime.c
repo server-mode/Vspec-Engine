@@ -10,6 +10,27 @@ static int g_language_guard_enabled = 0;
 static VspecRuntimeBehaviorMonitor g_behavior_monitor;
 static VspecRuntimeUltimateState g_ultimate_state;
 
+static void vspec_runtime_enable_language_guard_auto(void) {
+    const char* disable = getenv("VSPEC_LANGUAGE_GUARD_DISABLE");
+    if (disable && (disable[0] == '1' || disable[0] == 'y' || disable[0] == 'Y' || disable[0] == 't' || disable[0] == 'T')) {
+        g_language_guard_enabled = 0;
+        return;
+    }
+
+    const char* strictness_env = getenv("VSPEC_LANGUAGE_GUARD_STRICTNESS");
+    float strictness = 0.55f;
+    if (strictness_env && strictness_env[0] != '\0') {
+        strictness = (float)atof(strictness_env);
+        if (strictness < 0.0f) {
+            strictness = 0.0f;
+        }
+        if (strictness > 1.0f) {
+            strictness = 1.0f;
+        }
+    }
+    vspec_runtime_language_guard_init(NULL, strictness);
+}
+
 static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
     if (!cfg || !cfg->enable_lowbit_boost) {
         return;
@@ -115,6 +136,7 @@ void vspec_runtime_init_with_hw_config(const char* config_path) {
     vspec_runtime_ultimate_init(&g_ultimate_state, &g_hw_state.config);
     vspec_qlora_adapter_clear();
     g_hw_state.active_backend_name = "cpu";
+    vspec_runtime_enable_language_guard_auto();
 
     VspecBackend backend = vspec_make_cpu_backend();
     if (vspec_runtime_hw_pick_backend(&g_hw_state.config, &backend)) {
