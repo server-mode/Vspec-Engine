@@ -1338,6 +1338,11 @@ def main() -> None:
 
     print("[vspec-chat] runtime_mode=", runtime_mode)
     print("[vspec-chat] runtime_is_vspec=", runtime is not None)
+    if runtime is not None:
+        print("[vspec-chat] quant_source_format=", getattr(runtime, "quant_source_format", "unknown"))
+        print("[vspec-chat] quant_source_quantized=", bool(getattr(runtime, "quant_source_quantized", False)))
+        print("[vspec-chat] quant_runtime_disabled=", bool(getattr(runtime, "quant_runtime_disabled", False)))
+        print("[vspec-chat] quant_policy_reason=", getattr(runtime, "quant_policy_reason", "unknown"))
     print("[vspec-chat] timing_sec=", round(elapsed, 4))
     print("[vspec-chat] tokens_prompt=", prompt_tok)
     print("[vspec-chat] tokens_generated=", gen_tok)

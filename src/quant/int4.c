@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "vspec/quant/int4.h"
 
@@ -56,6 +57,51 @@ void vspec_int4_matmul_ref_f32_q4(
         return;
     }
 
+    float* zero_points = (float*)malloc(n * sizeof(float));
+    if (!zero_points) {
+        return;
+    }
+    vspec_int4_compute_zero_points(b_packed, k, n, zero_points);
+    vspec_int4_matmul_ref_f32_q4_with_zero_points(a, m, k, b_packed, n, scales, zero_points, c);
+    free(zero_points);
+}
+
+void vspec_int4_compute_zero_points(
+    const uint8_t* b_packed,
+    size_t k,
+    size_t n,
+    float* zero_points
+) {
+    if (!b_packed || !zero_points || k == 0U || n == 0U) {
+        return;
+    }
+
+    const size_t b_row_packed = vspec_int4_packed_bytes(k);
+    for (size_t j = 0U; j < n; ++j) {
+        const uint8_t* b_row = b_packed + (j * b_row_packed);
+        double sum_q = 0.0;
+        for (size_t t = 0U; t < k; ++t) {
+            const int8_t wq = vspec_int4_get(b_row, t);
+            sum_q += (double)wq;
+        }
+        zero_points[j] = (float)(sum_q / (double)k);
+    }
+}
+
+void vspec_int4_matmul_ref_f32_q4_with_zero_points(
+    const float* a,
+    size_t m,
+    size_t k,
+    const uint8_t* b_packed,
+    size_t n,
+    const float* scales,
+    const float* zero_points,
+    float* c
+) {
+    if (!a || !b_packed || !scales || !c) {
+        return;
+    }
+
     const size_t b_row_packed = vspec_int4_packed_bytes(k);
 
     for (size_t i = 0; i < m; ++i) {
@@ -65,15 +111,7 @@ void vspec_int4_matmul_ref_f32_q4(
         for (size_t j = 0; j < n; ++j) {
             const uint8_t* b_row = b_packed + (j * b_row_packed);
             const float scale = scales[j];
-            float zero_point = 0.0f;
-            {
-                double sum_q = 0.0;
-                for (size_t t_scan = 0; t_scan < k; ++t_scan) {
-                    const int8_t wq = vspec_int4_get(b_row, t_scan);
-                    sum_q += (double)wq;
-                }
-                zero_point = (float)(sum_q / (double)k);
-            }
+            const float zero_point = zero_points ? zero_points[j] : 0.0f;
             float acc = 0.0f;
 
             size_t t = 0;

@@ -11,6 +11,18 @@ static int output_is_live(uint32_t out, const uint32_t* live, size_t live_count)
     return 0;
 }
 
+static int find_node_by_output(const VspecGraph* graph, uint32_t output) {
+    if (!graph) {
+        return -1;
+    }
+    for (size_t i = 0U; i < graph->node_count; ++i) {
+        if (graph->nodes[i].op != VSPEC_OP_INVALID && graph->nodes[i].output == output) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 void vspec_graph_optimize_fuse_attention(VspecGraph* graph, VspecGraphOptStats* stats) {
     if (!graph) {
         return;
@@ -106,6 +118,44 @@ void vspec_graph_optimize_dead_nodes(
         return;
     }
 
+    int live_nodes[VSPEC_GRAPH_MAX_NODES];
+    for (size_t i = 0U; i < VSPEC_GRAPH_MAX_NODES; ++i) {
+        live_nodes[i] = 0;
+    }
+
+    for (size_t i = 0U; i < graph->node_count; ++i) {
+        VspecNode* n = &graph->nodes[i];
+        if (n->op == VSPEC_OP_INVALID) {
+            continue;
+        }
+        if (output_is_live(n->output, live_outputs, live_count)) {
+            live_nodes[i] = 1;
+        }
+    }
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (size_t i = 0U; i < graph->node_count; ++i) {
+            if (!live_nodes[i]) {
+                continue;
+            }
+
+            const VspecNode* n = &graph->nodes[i];
+            const int pa = find_node_by_output(graph, n->input_a);
+            if (pa >= 0 && !live_nodes[(size_t)pa]) {
+                live_nodes[(size_t)pa] = 1;
+                changed = 1;
+            }
+
+            const int pb = find_node_by_output(graph, n->input_b);
+            if (pb >= 0 && !live_nodes[(size_t)pb]) {
+                live_nodes[(size_t)pb] = 1;
+                changed = 1;
+            }
+        }
+    }
+
     if (stats) {
         stats->removed_dead_nodes = 0U;
     }
@@ -116,7 +166,7 @@ void vspec_graph_optimize_dead_nodes(
             continue;
         }
 
-        if (!output_is_live(n->output, live_outputs, live_count)) {
+        if (!live_nodes[i]) {
             n->op = VSPEC_OP_INVALID;
             if (stats) {
                 stats->removed_dead_nodes += 1U;

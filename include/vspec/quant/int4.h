@@ -18,4 +18,22 @@ void vspec_int4_matmul_ref_f32_q4(
     float* c
 );
 
+void vspec_int4_compute_zero_points(
+    const uint8_t* b_packed,
+    size_t k,
+    size_t n,
+    float* zero_points
+);
+
+void vspec_int4_matmul_ref_f32_q4_with_zero_points(
+    const float* a,
+    size_t m,
+    size_t k,
+    const uint8_t* b_packed,
+    size_t n,
+    const float* scales,
+    const float* zero_points,
+    float* c
+);
+
 #endif

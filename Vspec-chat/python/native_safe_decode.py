@@ -30,8 +30,10 @@ def build_native_safe_runtime(
     safe_layers = resolve_native_safe_max_layers(config, requested_max_layers)
     device = "cuda" if str(device_preference) in {"cuda", "cuda-native"} else "cpu"
     use_native = device == "cuda"
+    safe_config = dict(config)
+    safe_config["vspec_force_runtime"] = "generic"
     runtime = build_generic_runtime(
-        config,
+        safe_config,
         weight_index,
         safe_layers,
         device,
@@ -39,6 +41,16 @@ def build_native_safe_runtime(
         use_native_cuda_norm_override=use_native,
         progress_cb=progress_cb,
     )
+    if runtime is None:
+        runtime = build_generic_runtime(
+            config,
+            weight_index,
+            safe_layers,
+            device,
+            fused_bits_override=0,
+            use_native_cuda_norm_override=use_native,
+            progress_cb=progress_cb,
+        )
     if runtime is not None:
         try:
             setattr(runtime, "vspec_safe_lane", True)

@@ -12,5 +12,7 @@ typedef struct VspecMemoryMetrics {
 
 void vspec_memory_metrics_reset(VspecMemoryMetrics* metrics);
 void vspec_memory_metrics_add(VspecMemoryMetrics* metrics, size_t weight, size_t act, size_t kv, size_t scratch);
+size_t vspec_memory_metrics_total(const VspecMemoryMetrics* metrics);
+float vspec_memory_metrics_pressure(const VspecMemoryMetrics* metrics, size_t budget_bytes);
 
 #endif

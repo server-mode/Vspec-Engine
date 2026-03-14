@@ -325,6 +325,12 @@ add_executable(vspec_validation_demo
 
 target_link_libraries(vspec_validation_demo PRIVATE vspec_engine)
 
+add_executable(vspec_job29_now_validation
+    tools/validation/job29_now_validation_suite.c
+)
+
+target_link_libraries(vspec_job29_now_validation PRIVATE vspec_engine)
+
 add_executable(vspec_attention_v2_demo
     examples/attention_v2_demo.c
 )

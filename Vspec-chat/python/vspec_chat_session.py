@@ -830,6 +830,10 @@ def main() -> None:
         lowbit_plan = getattr(runtime, "lowbit_plan")
         print("[session] runtime_lowbit_enabled=", bool(getattr(lowbit_plan, "enabled", False)))
         print("[session] runtime_lowbit_reason=", getattr(lowbit_plan, "reason", "unknown"))
+    print("[session] quant_source_format=", getattr(runtime, "quant_source_format", "unknown"))
+    print("[session] quant_source_quantized=", bool(getattr(runtime, "quant_source_quantized", False)))
+    print("[session] quant_runtime_disabled=", bool(getattr(runtime, "quant_runtime_disabled", False)))
+    print("[session] quant_policy_reason=", getattr(runtime, "quant_policy_reason", "unknown"))
     if hasattr(runtime, "layers"):
         try:
             matrix_bits, exec_eff_bits, _, lowbit_coverage = runtime_matrix_bits_summary(runtime.layers)

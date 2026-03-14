@@ -72,7 +72,13 @@ from gguf_support import get_gguf_archive
 from runtime_core_bridge import CorePagedKVCache
 from runtime_baseline_manager import resolve_runtime_baseline_plan
 from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
-from runtime_compat import resolve_generic_stability_profile, resolve_qwen35_stability_profile, resolve_runtime_target
+from runtime_compat import (
+    QuantizationSourcePolicy,
+    resolve_generic_stability_profile,
+    resolve_qwen35_stability_profile,
+    resolve_quantization_source_policy,
+    resolve_runtime_target,
+)
 
 
 _NP_SAFEOPEN_CACHE: dict[str, object] = {}
@@ -444,6 +450,40 @@ def _apply_partial_rotary(q: "np.ndarray", k: "np.ndarray", position: int, rope_
     q_out = np.concatenate([q_rot, q[..., use_dim:]], axis=-1)
     k_out = np.concatenate([k_rot, k[..., use_dim:]], axis=-1)
     return q_out, k_out
+
+
+def _split_qwen35_q_and_gate(q_proj: "np.ndarray", num_heads: int, head_dim: int) -> tuple["np.ndarray", "np.ndarray"]:
+    proj = np.asarray(q_proj, dtype=np.float32)
+    expected_q = max(1, int(num_heads) * int(head_dim))
+    total = int(proj.size)
+
+    if total == expected_q * 2:
+        q_full = proj.reshape(int(num_heads), int(head_dim) * 2)
+        return q_full[:, :head_dim], q_full[:, head_dim:]
+
+    if total == expected_q:
+        q = proj.reshape(int(num_heads), int(head_dim))
+        gate = np.ones_like(q, dtype=np.float32)
+        return q, gate
+
+    if int(num_heads) <= 0:
+        q = proj.reshape(1, -1)
+        gate = np.ones_like(q, dtype=np.float32)
+        return q, gate
+
+    per_head = max(1, total // int(num_heads))
+    trimmed = proj[: per_head * int(num_heads)].reshape(int(num_heads), per_head)
+    q = np.zeros((int(num_heads), int(head_dim)), dtype=np.float32)
+    copy_q = min(int(head_dim), per_head)
+    if copy_q > 0:
+        q[:, :copy_q] = trimmed[:, :copy_q]
+
+    gate = np.ones((int(num_heads), int(head_dim)), dtype=np.float32)
+    gate_start = int(head_dim)
+    if per_head > gate_start:
+        copy_gate = min(int(head_dim), per_head - gate_start)
+        gate[:, :copy_gate] = trimmed[:, gate_start:gate_start + copy_gate]
+    return q, gate
 
 
 @dataclass
@@ -931,9 +971,8 @@ class Qwen35Runtime:
 
             if layer.layer_type == "full_attention":
                 assert layer.wq is not None and layer.wk is not None and layer.wv is not None and layer.wo is not None
-                q_full = _linear(x_norm, layer.wq, "wq").reshape(self.num_heads, self.head_dim * 2)
-                q = q_full[:, :self.head_dim]
-                gate = q_full[:, self.head_dim:]
+                q_proj = _linear(x_norm, layer.wq, "wq")
+                q, gate = _split_qwen35_q_and_gate(q_proj, self.num_heads, self.head_dim)
                 k = _linear(x_norm, layer.wk, "wk").reshape(self.num_kv_heads, self.head_dim)
                 v = _linear(x_norm, layer.wv, "wv").reshape(self.num_kv_heads, self.head_dim)
 
@@ -1379,10 +1418,18 @@ def _load_first_available_torch(weight_index: dict[str, WeightInfo], name: str, 
 
 def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits: int, total_layers: int) -> Optional[LayerWeights]:
     prefix = f"model.layers.{layer_idx}."
+    blk_prefix = f"blk.{layer_idx}."
 
     q = _load_first_available(weight_index, prefix + "self_attn.q_proj.weight")
     k = _load_first_available(weight_index, prefix + "self_attn.k_proj.weight")
     v = _load_first_available(weight_index, prefix + "self_attn.v_proj.weight")
+
+    if q is None:
+        q = _load_first_available(weight_index, blk_prefix + "attn_q.weight")
+    if k is None:
+        k = _load_first_available(weight_index, blk_prefix + "attn_k.weight")
+    if v is None:
+        v = _load_first_available(weight_index, blk_prefix + "attn_v.weight")
 
     qkv = _load_first_available(weight_index, prefix + "self_attn.qkv_proj.weight")
     if qkv is not None and q is None and k is None and v is None:
@@ -1391,17 +1438,29 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
     o = _load_first_available(weight_index, prefix + "self_attn.o_proj.weight")
     if o is None:
         o = _load_first_available(weight_index, prefix + "self_attn.out_proj.weight")
+    if o is None:
+        o = _load_first_available(weight_index, blk_prefix + "attn_output.weight")
 
     n1 = _load_first_available(weight_index, prefix + "input_layernorm.weight")
     if n1 is None:
         n1 = _load_first_available(weight_index, prefix + "attention_norm.weight")
+    if n1 is None:
+        n1 = _load_first_available(weight_index, blk_prefix + "attn_norm.weight")
 
     n2 = _load_first_available(weight_index, prefix + "post_attention_layernorm.weight")
     if n2 is None:
         n2 = _load_first_available(weight_index, prefix + "mlp_norm.weight")
+    if n2 is None:
+        n2 = _load_first_available(weight_index, blk_prefix + "post_attention_norm.weight")
+    if n2 is None:
+        n2 = _load_first_available(weight_index, blk_prefix + "ffn_norm.weight")
 
     q_norm = _load_first_available(weight_index, prefix + "self_attn.q_norm.weight")
     k_norm = _load_first_available(weight_index, prefix + "self_attn.k_norm.weight")
+    if q_norm is None:
+        q_norm = _load_first_available(weight_index, blk_prefix + "attn_q_norm.weight")
+    if k_norm is None:
+        k_norm = _load_first_available(weight_index, blk_prefix + "attn_k_norm.weight")
 
     w1 = _load_first_available(weight_index, prefix + "mlp.gate_proj.weight")
     w2 = _load_first_available(weight_index, prefix + "mlp.down_proj.weight")
@@ -1413,6 +1472,19 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
         w2 = _load_first_available(weight_index, prefix + "mlp.w2.weight")
     if w3 is None:
         w3 = _load_first_available(weight_index, prefix + "mlp.w3.weight")
+    if w1 is None:
+        w1 = _load_first_available(weight_index, blk_prefix + "ffn_gate.weight")
+    if w2 is None:
+        w2 = _load_first_available(weight_index, blk_prefix + "ffn_down.weight")
+    if w3 is None:
+        w3 = _load_first_available(weight_index, blk_prefix + "ffn_up.weight")
+
+    if q is not None and k is not None:
+        try:
+            if q.ndim == 2 and k.ndim == 2 and int(q.shape[0]) == int(k.shape[0]) * 2:
+                q = q[: int(k.shape[0]), :]
+        except Exception:
+            pass
 
     if any(x is None for x in (q, k, v, o, w1, w2, w3, n1, n2)):
         return None
@@ -1651,6 +1723,8 @@ def _load_qwen35_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fuse
         pack_targets = {
             "wqkv": layer.wqkv,
             "wgate": layer.wgate,
+            "ssm_alpha": layer.ssm_alpha,
+            "ssm_beta": layer.ssm_beta,
             "ssm_out": layer.ssm_out,
             "w1": layer.w1,
             "w2": layer.w2,
@@ -1673,6 +1747,32 @@ def _load_qwen35_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fuse
             layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
 
     return layer
+
+
+def _resolve_runtime_lowbit_plan(
+    config: dict,
+    weight_index: dict[str, WeightInfo],
+    use_native_cuda_norm: bool,
+    requested_fused_bits: int,
+) -> tuple[LowbitModulePlan, int, QuantizationSourcePolicy]:
+    quant_policy = resolve_quantization_source_policy(weight_index)
+    if quant_policy.disable_runtime_quantization:
+        profile = os.getenv("VSPEC_LOWBIT_PROFILE", "aggressive").strip().lower() or "aggressive"
+        return (
+            LowbitModulePlan(
+                enabled=False,
+                bits=0,
+                compatible=True,
+                reason=quant_policy.reason,
+                profile=profile,
+            ),
+            0,
+            quant_policy,
+        )
+
+    plan = build_lowbit_module_plan(config, use_native_cuda_norm, requested_fused_bits)
+    effective_bits = plan.bits if plan.enabled else 0
+    return plan, effective_bits, quant_policy
 
 
 def _load_qwen35_runtime(
@@ -1727,8 +1827,12 @@ def _load_qwen35_runtime(
                 )
                 fused_bits = baseline_plan.fused_bits
 
-        lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
-        fused_bits = lowbit_plan.bits if lowbit_plan.enabled else 0
+        lowbit_plan, fused_bits, quant_policy = _resolve_runtime_lowbit_plan(
+            config,
+            weight_index,
+            use_native_cuda_norm,
+            fused_bits,
+        )
 
         layers: list[Qwen35LayerWeights] = []
         if progress_cb is not None:
@@ -1751,6 +1855,9 @@ def _load_qwen35_runtime(
             return None
 
         stability = resolve_qwen35_stability_profile()
+        q_residual_clamp_alpha = stability.residual_clamp_alpha
+        if quant_policy.disable_runtime_quantization:
+            q_residual_clamp_alpha = 0.0
 
         return Qwen35Runtime(
             embed=embed.embed.astype(np.float32, copy=False),
@@ -1783,7 +1890,7 @@ def _load_qwen35_runtime(
             residual_error_buffers_attn=[],
             residual_error_buffers_ff=[],
             residual_feedback_gain=stability.residual_feedback_gain,
-            residual_clamp_alpha=stability.residual_clamp_alpha,
+            residual_clamp_alpha=q_residual_clamp_alpha,
             logit_entropy_target=stability.logit_entropy_target,
             logit_margin_floor=stability.logit_margin_floor,
             logit_margin_gain=stability.logit_margin_gain,
@@ -1911,8 +2018,12 @@ def _load_gpt2_runtime(
                 )
                 fused_bits = baseline_plan.fused_bits
 
-        lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
-        fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
+        lowbit_plan, fused_bits, _ = _resolve_runtime_lowbit_plan(
+            config,
+            weight_index,
+            use_native_cuda_norm,
+            fused_bits,
+        )
 
         layers: list[GPT2LayerWeights] = []
         if progress_cb is not None:
@@ -2025,8 +2136,12 @@ def _load_generic_transformer(
                 )
                 fused_bits = baseline_plan.fused_bits
 
-        lowbit_plan = build_lowbit_module_plan(config, use_native_cuda_norm, fused_bits)
-        fused_bits = lowbit_plan.bits if lowbit_plan.enabled else fused_bits
+        lowbit_plan, fused_bits, quant_policy = _resolve_runtime_lowbit_plan(
+            config,
+            weight_index,
+            use_native_cuda_norm,
+            fused_bits,
+        )
 
         layers: list[LayerWeights] = []
         if progress_cb is not None:
@@ -2054,6 +2169,9 @@ def _load_generic_transformer(
         rms_eps = float(config.get("rms_norm_eps", 1e-6))
         rope_theta = float(config.get("rope_theta", 10000.0))
         stability = resolve_generic_stability_profile()
+        g_residual_clamp_alpha = stability.residual_clamp_alpha
+        if quant_policy.disable_runtime_quantization:
+            g_residual_clamp_alpha = 0.0
         flash_attention_min_tokens = int(os.getenv("VSPEC_FLASH_ATTN_MIN_TOKENS", "256") or "256")
         flash_attention_block_tokens = int(os.getenv("VSPEC_FLASH_ATTN_BLOCK_TOKENS", "128") or "128")
 
@@ -2088,7 +2206,7 @@ def _load_generic_transformer(
             residual_error_buffers_attn=[],
             residual_error_buffers_ff=[],
             residual_feedback_gain=stability.residual_feedback_gain,
-            residual_clamp_alpha=stability.residual_clamp_alpha,
+            residual_clamp_alpha=g_residual_clamp_alpha,
             logit_entropy_target=stability.logit_entropy_target,
             logit_margin_floor=stability.logit_margin_floor,
             logit_margin_gain=stability.logit_margin_gain,
@@ -2276,6 +2394,7 @@ def build_generic_runtime(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[object]:
     runtime_target = resolve_runtime_target(config, list(weight_index.keys()), weight_index)
+    quant_policy = resolve_quantization_source_policy(weight_index)
     runtime_config = runtime_target.config
     model_type = runtime_target.runtime_name
     if model_type == "gpt2":
@@ -2299,6 +2418,10 @@ def build_generic_runtime(
         if runtime is not None:
             runtime.compat_reason = runtime_target.reason
             runtime.compat_warnings = list(runtime_target.warnings)
+            runtime.quant_source_format = quant_policy.source_format
+            runtime.quant_source_quantized = bool(quant_policy.source_quantized)
+            runtime.quant_runtime_disabled = bool(quant_policy.disable_runtime_quantization)
+            runtime.quant_policy_reason = quant_policy.reason
         return runtime
 
     any_weight = next(iter(weight_index.values()), None)
@@ -2308,6 +2431,10 @@ def build_generic_runtime(
         if runtime is not None:
             runtime.compat_reason = runtime_target.reason
             runtime.compat_warnings = list(runtime_target.warnings)
+            runtime.quant_source_format = quant_policy.source_format
+            runtime.quant_source_quantized = bool(quant_policy.source_quantized)
+            runtime.quant_runtime_disabled = bool(quant_policy.disable_runtime_quantization)
+            runtime.quant_policy_reason = quant_policy.reason
             return runtime
     use_native_cuda_norm = device in {"cuda", "cuda-native"}
     if use_native_cuda_norm_override is not None:
@@ -2323,6 +2450,10 @@ def build_generic_runtime(
     if runtime is not None and np is not None:
         runtime.compat_reason = runtime_target.reason
         runtime.compat_warnings = list(runtime_target.warnings)
+        runtime.quant_source_format = quant_policy.source_format
+        runtime.quant_source_quantized = bool(quant_policy.source_quantized)
+        runtime.quant_runtime_disabled = bool(quant_policy.disable_runtime_quantization)
+        runtime.quant_policy_reason = quant_policy.reason
         try:
             page_tokens = max(16, int(os.getenv("VSPEC_CORE_KV_PAGE_TOKENS", "64") or "64"))
             max_tokens = max(128, int(os.getenv("VSPEC_CORE_KV_MAX_TOKENS", "4096") or "4096"))

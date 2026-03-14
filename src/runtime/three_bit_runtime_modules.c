@@ -381,7 +381,7 @@ void vspec_3bit_attention_output_projection(
         return;
     }
 
-    const float alpha = (manager && manager->noise.enabled) ? manager->noise.activation_clamp_alpha : 2.8f;
+    const float alpha = (manager && manager->noise.enabled) ? manager->noise.activation_clamp_alpha : 4.5f;
     vspec_3bit_dynamic_clamp_std(input, in_dim, alpha, input_clamped);
 
     for (size_t out_idx = 0; out_idx < out_dim; ++out_idx) {

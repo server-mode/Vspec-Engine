@@ -120,6 +120,32 @@ static uint16_t vspec_model_id_from_layer_id(uint32_t layer_id) {
     return (uint16_t)((layer_id >> 16U) & 0xFFFFU);
 }
 
+static int vspec_should_quality_escalate(
+    const VspecMixedBitPolicy* policy,
+    uint32_t layer_id,
+    VspecLayerType type,
+    const float* data,
+    size_t count
+) {
+    if (!policy || !policy->enable_bit_escalation || !data || count == 0U) {
+        return 0;
+    }
+
+    const float rms = vspec_layer_rms(data, count);
+    const float drift = vspec_activation_norm_drift(layer_id, type, rms);
+    float entropy_collapse = 0.0f;
+    if (type == VSPEC_LAYER_ATTENTION || type == VSPEC_LAYER_ATTENTION_QK) {
+        entropy_collapse = vspec_attention_entropy_collapse_score(data, count);
+    }
+
+    if (rms >= policy->residual_rms_escalate_threshold ||
+        drift >= policy->activation_norm_drift_threshold ||
+        entropy_collapse >= policy->attention_entropy_escalate_threshold) {
+        return 1;
+    }
+    return 0;
+}
+
 static float vspec_pressure_from_metrics(
     const VspecMemoryMetrics* metrics,
     const VspecVramBudget* budget,
@@ -345,20 +371,9 @@ uint8_t vspec_mixed_bit_select_bits(
     bits = vspec_clamp_bits(bits, min_bits, max_bits);
 
     int quality_escalated = 0;
-    if (policy && policy->enable_bit_escalation && data && count > 0U) {
-        const float rms = vspec_layer_rms(data, count);
-        const float drift = vspec_activation_norm_drift(layer_id, type, rms);
-        float entropy_collapse = 0.0f;
-        if (type == VSPEC_LAYER_ATTENTION || type == VSPEC_LAYER_ATTENTION_QK) {
-            entropy_collapse = vspec_attention_entropy_collapse_score(data, count);
-        }
-
-        if (rms >= policy->residual_rms_escalate_threshold ||
-            drift >= policy->activation_norm_drift_threshold ||
-            entropy_collapse >= policy->attention_entropy_escalate_threshold) {
-            bits = 4U;
-            quality_escalated = 1;
-        }
+    if (vspec_should_quality_escalate(policy, layer_id, type, data, count)) {
+        bits = 4U;
+        quality_escalated = 1;
     }
 
     if (policy && !quality_escalated) {
@@ -407,7 +422,13 @@ uint8_t vspec_mixed_bit_select_bits_realtime(
     if (min_bits > max_bits) {
         min_bits = max_bits;
     }
-    bits = vspec_apply_realtime_pressure_downshift(bits, policy, type, pressure, min_bits, max_bits);
+    const int quality_escalated =
+        (policy && policy->enable_bit_escalation && data && count > 0U && bits >= 4U && !vspec_layer_requires_4bit(type));
+    if (!quality_escalated) {
+        bits = vspec_apply_realtime_pressure_downshift(bits, policy, type, pressure, min_bits, max_bits);
+    } else {
+        bits = 4U;
+    }
     if (vspec_layer_requires_4bit(type)) {
         bits = 4U;
     }

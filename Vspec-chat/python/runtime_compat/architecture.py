@@ -158,6 +158,17 @@ def resolve_runtime_target(
     cfg = dict(config or {})
     names = _tensor_name_set(tensor_names)
     model_type = str(cfg.get("model_type", "") or "").strip().lower()
+    forced_runtime = str(cfg.get("vspec_force_runtime", "") or "").strip().lower()
+
+    if forced_runtime in {"generic", "gpt2", "qwen35"}:
+        forced_cfg = dict(cfg)
+        forced_cfg["model_type"] = forced_runtime if forced_runtime != "generic" else str(forced_cfg.get("model_type", "generic") or "generic")
+        return RuntimeTarget(
+            runtime_name=forced_runtime,
+            normalized_model_type=(forced_runtime if forced_runtime != "generic" else str(forced_cfg.get("model_type", "generic") or "generic")),
+            config=forced_cfg,
+            reason=f"forced_runtime_{forced_runtime}",
+        )
 
     if model_type == "gpt2":
         return RuntimeTarget(

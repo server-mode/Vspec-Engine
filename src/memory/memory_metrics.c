@@ -19,3 +19,17 @@ void vspec_memory_metrics_add(VspecMemoryMetrics* metrics, size_t weight, size_t
     metrics->kv_bytes += kv;
     metrics->scratch_bytes += scratch;
 }
+
+size_t vspec_memory_metrics_total(const VspecMemoryMetrics* metrics) {
+    if (!metrics) {
+        return 0U;
+    }
+    return metrics->weight_bytes + metrics->activation_bytes + metrics->kv_bytes + metrics->scratch_bytes;
+}
+
+float vspec_memory_metrics_pressure(const VspecMemoryMetrics* metrics, size_t budget_bytes) {
+    if (!metrics || budget_bytes == 0U) {
+        return 0.0f;
+    }
+    return (float)vspec_memory_metrics_total(metrics) / (float)budget_bytes;
+}
