@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.jpg" alt="Vspec Engine Icon" width="300" />
+  <img src="Logo.png" alt="Vspec Engine Icon" width="600" />
 </p>
 
 <p align="center">
