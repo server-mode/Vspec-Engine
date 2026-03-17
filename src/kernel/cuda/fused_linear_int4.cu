@@ -42,6 +42,33 @@ static size_t vspec_env_size_or_default(const char* name, size_t fallback) {
     return (size_t)parsed;
 }
 
+static float vspec_env_float_or_default(const char* name, float fallback) {
+    const char* value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    const float parsed = (float)atof(value);
+    if (!(parsed == parsed)) {
+        return fallback;
+    }
+    return parsed;
+}
+
+static int vspec_env_flag_or_default(const char* name, int fallback) {
+    const char* value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    const char c = value[0];
+    if (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T') {
+        return 1;
+    }
+    if (c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F') {
+        return 0;
+    }
+    return fallback;
+}
+
 __global__ static void int3_to_int4_expand_kernel(
     const uint8_t* b_int3,
     uint8_t* b_int4,
@@ -298,7 +325,8 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     const size_t bytes_b = n * packed_k * sizeof(uint8_t);
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
-    const float clamp_alpha = 2.8f;
+    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 1);
+    const float clamp_alpha = vspec_env_float_or_default("VSPEC_FUSED_INPUT_CLAMP_ALPHA", 6.0f);
 
     static float* d_a = NULL;
     static float* d_a_clamped = NULL;
@@ -346,11 +374,15 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) return;
     if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) return;
 
-    dim3 clamp_block(128);
-    dim3 clamp_grid((unsigned)((m + clamp_block.x - 1U) / clamp_block.x));
-    clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_a, d_a_clamped, m, k, clamp_alpha);
+    const float* d_input = d_a;
+    if (clamp_enabled && clamp_alpha > 0.0f) {
+        dim3 clamp_block(128);
+        dim3 clamp_grid((unsigned)((m + clamp_block.x - 1U) / clamp_block.x));
+        clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_a, d_a_clamped, m, k, clamp_alpha);
+        d_input = d_a_clamped;
+    }
 
-    vspec_cuda_fused_linear_int4_device(d_a_clamped, d_b, d_s, d_c, m, n, k);
+    vspec_cuda_fused_linear_int4_device(d_input, d_b, d_s, d_c, m, n, k);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);
@@ -376,7 +408,8 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
     const size_t bytes_b4 = n * packed_k4 * sizeof(uint8_t);
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
-    const float clamp_alpha = 2.8f;
+    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 1);
+    const float clamp_alpha = vspec_env_float_or_default("VSPEC_FUSED_INPUT_CLAMP_ALPHA", 6.0f);
 
     static float* d_a = NULL;
     static float* d_a_clamped = NULL;
@@ -434,11 +467,15 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
 
     vspec_cuda_expand_int3_to_int4_device(d_b3, d_b4, n, k);
 
-    dim3 clamp_block(128);
-    dim3 clamp_grid((unsigned)((m + clamp_block.x - 1U) / clamp_block.x));
-    clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_a, d_a_clamped, m, k, clamp_alpha);
+    const float* d_input = d_a;
+    if (clamp_enabled && clamp_alpha > 0.0f) {
+        dim3 clamp_block(128);
+        dim3 clamp_grid((unsigned)((m + clamp_block.x - 1U) / clamp_block.x));
+        clamp_rows_std_kernel<<<clamp_grid, clamp_block>>>(d_a, d_a_clamped, m, k, clamp_alpha);
+        d_input = d_a_clamped;
+    }
 
-    vspec_cuda_fused_linear_int4_device(d_a_clamped, d_b4, d_s, d_c, m, n, k);
+    vspec_cuda_fused_linear_int4_device(d_input, d_b4, d_s, d_c, m, n, k);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);

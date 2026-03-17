@@ -38,26 +38,94 @@ def _env_int(name: str, fallback: int) -> int:
         return fallback
 
 
-def resolve_generic_stability_profile() -> RuntimeStabilityProfile:
+def _normalize_model_family(model_family: str | None) -> str:
+    name = (model_family or "").strip().lower()
+    if not name:
+        return "generic"
+    if "qwen3.5" in name or "qwen35" in name:
+        return "qwen35"
+    if "qwen" in name:
+        return "qwen"
+    if "llama" in name or "mistral" in name:
+        return "llama"
+    if "gpt2" in name:
+        return "gpt2"
+    return "generic"
+
+
+def _resolve_family_defaults(model_family: str) -> RuntimeStabilityProfile:
+    family = _normalize_model_family(model_family)
+    if family == "gpt2":
+        return RuntimeStabilityProfile(
+            attention_logit_clip=20.0,
+            residual_feedback_gain=0.06,
+            residual_clamp_alpha=4.0,
+            logit_entropy_target=5.6,
+            logit_margin_floor=0.10,
+            logit_margin_gain=0.28,
+            ssm_warmup_tokens=0,
+        )
+    if family == "qwen":
+        return RuntimeStabilityProfile(
+            attention_logit_clip=24.0,
+            residual_feedback_gain=0.10,
+            residual_clamp_alpha=4.8,
+            logit_entropy_target=7.0,
+            logit_margin_floor=0.18,
+            logit_margin_gain=0.55,
+            ssm_warmup_tokens=0,
+        )
+    if family == "llama":
+        return RuntimeStabilityProfile(
+            attention_logit_clip=22.0,
+            residual_feedback_gain=0.08,
+            residual_clamp_alpha=5.2,
+            logit_entropy_target=6.8,
+            logit_margin_floor=0.14,
+            logit_margin_gain=0.45,
+            ssm_warmup_tokens=0,
+        )
+    if family == "qwen35":
+        return RuntimeStabilityProfile(
+            attention_logit_clip=24.0,
+            residual_feedback_gain=0.12,
+            residual_clamp_alpha=4.5,
+            logit_entropy_target=7.5,
+            logit_margin_floor=0.20,
+            logit_margin_gain=0.60,
+            ssm_warmup_tokens=8,
+        )
     return RuntimeStabilityProfile(
-        attention_logit_clip=_env_float("VSPEC_ATTN_LOGIT_CLIP", 0.0),
-        residual_feedback_gain=_env_float("VSPEC_RESIDUAL_FEEDBACK_GAIN", 0.0),
-        residual_clamp_alpha=_env_float("VSPEC_RESIDUAL_CLAMP_ALPHA", 0.0),
-        logit_entropy_target=_env_float("VSPEC_LOGIT_ENTROPY_TARGET", 0.0),
-        logit_margin_floor=_env_float("VSPEC_LOGIT_MARGIN_FLOOR", 0.0),
-        logit_margin_gain=_env_float("VSPEC_LOGIT_MARGIN_GAIN", 0.0),
+        attention_logit_clip=22.0,
+        residual_feedback_gain=0.08,
+        residual_clamp_alpha=5.0,
+        logit_entropy_target=6.5,
+        logit_margin_floor=0.12,
+        logit_margin_gain=0.40,
         ssm_warmup_tokens=0,
     )
 
 
-def resolve_qwen35_stability_profile() -> RuntimeStabilityProfile:
-    generic = resolve_generic_stability_profile()
+def resolve_model_stability_profile(model_family: str | None = None) -> RuntimeStabilityProfile:
+    base = _resolve_family_defaults(_normalize_model_family(model_family))
+    env_prefix = _normalize_model_family(model_family).upper()
+    if env_prefix == "GENERIC":
+        env_prefix = "MODEL"
+
     return RuntimeStabilityProfile(
-        attention_logit_clip=_env_float("VSPEC_QWEN35_ATTN_LOGIT_CLIP", generic.attention_logit_clip if generic.attention_logit_clip > 0.0 else 24.0),
-        residual_feedback_gain=_env_float("VSPEC_QWEN35_RESIDUAL_FEEDBACK_GAIN", generic.residual_feedback_gain if generic.residual_feedback_gain > 0.0 else 0.12),
-        residual_clamp_alpha=_env_float("VSPEC_QWEN35_RESIDUAL_CLAMP_ALPHA", generic.residual_clamp_alpha if generic.residual_clamp_alpha > 0.0 else 4.5),
-        logit_entropy_target=_env_float("VSPEC_QWEN35_LOGIT_ENTROPY_TARGET", generic.logit_entropy_target if generic.logit_entropy_target > 0.0 else 7.5),
-        logit_margin_floor=_env_float("VSPEC_QWEN35_LOGIT_MARGIN_FLOOR", generic.logit_margin_floor if generic.logit_margin_floor > 0.0 else 0.20),
-        logit_margin_gain=_env_float("VSPEC_QWEN35_LOGIT_MARGIN_GAIN", generic.logit_margin_gain if generic.logit_margin_gain > 0.0 else 0.60),
-        ssm_warmup_tokens=max(0, _env_int("VSPEC_QWEN35_SSM_WARMUP_TOKENS", 8)),
+        attention_logit_clip=_env_float(f"VSPEC_{env_prefix}_ATTN_LOGIT_CLIP", _env_float("VSPEC_ATTN_LOGIT_CLIP", base.attention_logit_clip)),
+        residual_feedback_gain=_env_float(f"VSPEC_{env_prefix}_RESIDUAL_FEEDBACK_GAIN", _env_float("VSPEC_RESIDUAL_FEEDBACK_GAIN", base.residual_feedback_gain)),
+        residual_clamp_alpha=_env_float(f"VSPEC_{env_prefix}_RESIDUAL_CLAMP_ALPHA", _env_float("VSPEC_RESIDUAL_CLAMP_ALPHA", base.residual_clamp_alpha)),
+        logit_entropy_target=_env_float(f"VSPEC_{env_prefix}_LOGIT_ENTROPY_TARGET", _env_float("VSPEC_LOGIT_ENTROPY_TARGET", base.logit_entropy_target)),
+        logit_margin_floor=_env_float(f"VSPEC_{env_prefix}_LOGIT_MARGIN_FLOOR", _env_float("VSPEC_LOGIT_MARGIN_FLOOR", base.logit_margin_floor)),
+        logit_margin_gain=_env_float(f"VSPEC_{env_prefix}_LOGIT_MARGIN_GAIN", _env_float("VSPEC_LOGIT_MARGIN_GAIN", base.logit_margin_gain)),
+        ssm_warmup_tokens=max(0, _env_int(f"VSPEC_{env_prefix}_SSM_WARMUP_TOKENS", base.ssm_warmup_tokens)),
     )
+
+
+def resolve_generic_stability_profile() -> RuntimeStabilityProfile:
+    return resolve_model_stability_profile("generic")
+
+
+def resolve_qwen35_stability_profile() -> RuntimeStabilityProfile:
+    return resolve_model_stability_profile("qwen35")

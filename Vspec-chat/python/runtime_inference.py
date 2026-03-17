@@ -74,7 +74,7 @@ from runtime_baseline_manager import resolve_runtime_baseline_plan
 from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
 from runtime_compat import (
     QuantizationSourcePolicy,
-    resolve_generic_stability_profile,
+    resolve_model_stability_profile,
     resolve_qwen35_stability_profile,
     resolve_quantization_source_policy,
     resolve_runtime_target,
@@ -123,6 +123,21 @@ def _dynamic_clamp_std_vec(x: "np.ndarray", alpha: float) -> "np.ndarray":
     std = float(np.sqrt(max(var, 0.0)))
     th = max(1e-6, abs(float(alpha)) * std)
     return np.clip(x, -th, th)
+
+
+def _infer_model_family(config: dict) -> str:
+    model_type = str(config.get("model_type", "") or "").strip().lower()
+    arch = str(config.get("architectures", "") or "").strip().lower()
+    family = f"{model_type} {arch}".strip()
+    if "qwen3.5" in family or "qwen35" in family:
+        return "qwen35"
+    if "qwen" in family:
+        return "qwen"
+    if "llama" in family or "mistral" in family:
+        return "llama"
+    if "gpt2" in family:
+        return "gpt2"
+    return "generic"
 
 
 def _stabilize_logits(logits: "np.ndarray", logit_clip: float, entropy_target: float, margin_floor: float, margin_gain: float) -> "np.ndarray":
@@ -279,7 +294,7 @@ def _pack_signed_rowwise(q: "np.ndarray", bits: int) -> "np.ndarray":
     return out.reshape(-1)
 
 
-def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarray", "np.ndarray"]:
+def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarray", "np.ndarray", "np.ndarray | None"]:
     w = weight.astype(np.float32, copy=False)
     max_q = float((1 << (bits - 1)) - 1)
     min_q = float(-(1 << (bits - 1)))
@@ -302,7 +317,10 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
     q = np.clip(q, min_q, max_q).astype(np.int8)
 
     packed = _pack_signed_rowwise(q, bits)
-    return packed, scales
+    zero_points = None
+    if bits in {3, 4}:
+        zero_points = np.mean(q.astype(np.float32, copy=False), axis=1).astype(np.float32, copy=False)
+    return packed, scales, zero_points
 
 
 def _packed_cache_root() -> Path:
@@ -325,7 +343,7 @@ def _packed_cache_key(prefix: str, key: str, bits: int, w: "np.ndarray") -> str:
     return f"{prefix}{key}.b{bits}.{w.shape[0]}x{w.shape[1]}.{digest}"
 
 
-def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray"] | None:
+def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray", "np.ndarray | None"] | None:
     cache_file = _packed_cache_root() / f"{cache_key}.npz"
     if not cache_file.exists():
         return None
@@ -333,19 +351,30 @@ def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray"] | No
         data = np.load(cache_file, allow_pickle=False)
         packed = data["packed"].astype(np.uint8, copy=False)
         scales = data["scales"].astype(np.float32, copy=False)
-        return packed, scales
+        zero_points = None
+        if "zero_points" in data.files:
+            zero_points = data["zero_points"].astype(np.float32, copy=False)
+        return packed, scales, zero_points
     except Exception:
         return None
 
 
-def _save_packed_cache(cache_key: str, packed: "np.ndarray", scales: "np.ndarray") -> None:
+def _save_packed_cache(
+    cache_key: str,
+    packed: "np.ndarray",
+    scales: "np.ndarray",
+    zero_points: "np.ndarray | None" = None,
+) -> None:
     if not _packed_cache_write_enabled():
         return
     try:
         root = _packed_cache_root()
         root.mkdir(parents=True, exist_ok=True)
         cache_file = root / f"{cache_key}.npz"
-        np.savez(cache_file, packed=packed, scales=scales)
+        if zero_points is not None:
+            np.savez(cache_file, packed=packed, scales=scales, zero_points=zero_points)
+        else:
+            np.savez(cache_file, packed=packed, scales=scales)
     except Exception:
         return
 
@@ -1564,11 +1593,11 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
             cache_key = _packed_cache_key(prefix, key, matrix_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
-                packed, scales = cached
+                packed, scales, zero_points = cached
             else:
-                packed, scales = _quantize_weight_rowwise(w, matrix_bits)
-                _save_packed_cache(cache_key, packed, scales)
-            layer.packed[key] = (packed, scales, matrix_bits, int(w.shape[0]))
+                packed, scales, zero_points = _quantize_weight_rowwise(w, matrix_bits)
+                _save_packed_cache(cache_key, packed, scales, zero_points)
+            layer.packed[key] = (packed, scales, matrix_bits, int(w.shape[0]), zero_points)
 
     return layer
 
@@ -1740,11 +1769,11 @@ def _load_qwen35_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fuse
             cache_key = _packed_cache_key(f"qwen35.layers.{layer_idx}.", key, fused_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
-                packed, scales = cached
+                packed, scales, zero_points = cached
             else:
-                packed, scales = _quantize_weight_rowwise(w, fused_bits)
-                _save_packed_cache(cache_key, packed, scales)
-            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
+                packed, scales, zero_points = _quantize_weight_rowwise(w, fused_bits)
+                _save_packed_cache(cache_key, packed, scales, zero_points)
+            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]), zero_points)
 
     return layer
 
@@ -1961,11 +1990,11 @@ def _load_gpt2_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_
             cache_key = _packed_cache_key(f"gpt2.layers.{layer_idx}.", key, fused_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
-                packed, scales = cached
+                packed, scales, zero_points = cached
             else:
-                packed, scales = _quantize_weight_rowwise(w, fused_bits)
-                _save_packed_cache(cache_key, packed, scales)
-            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]))
+                packed, scales, zero_points = _quantize_weight_rowwise(w, fused_bits)
+                _save_packed_cache(cache_key, packed, scales, zero_points)
+            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]), zero_points)
 
     return layer
 
@@ -2168,7 +2197,7 @@ def _load_generic_transformer(
 
         rms_eps = float(config.get("rms_norm_eps", 1e-6))
         rope_theta = float(config.get("rope_theta", 10000.0))
-        stability = resolve_generic_stability_profile()
+        stability = resolve_model_stability_profile(_infer_model_family(config))
         g_residual_clamp_alpha = stability.residual_clamp_alpha
         if quant_policy.disable_runtime_quantization:
             g_residual_clamp_alpha = 0.0

@@ -92,7 +92,13 @@ def _pack_signed_rowwise_int4(q: "np.ndarray") -> "np.ndarray":
     return (lo | hi).astype(np.uint8, copy=False).reshape(-1)
 
 
-def _unpack_int4_rowwise(packed: "np.ndarray", scales: "np.ndarray", out_n: int, k: int) -> "np.ndarray":
+def _unpack_int4_rowwise(
+    packed: "np.ndarray",
+    scales: "np.ndarray",
+    out_n: int,
+    k: int,
+    zero_points: "np.ndarray | None" = None,
+) -> "np.ndarray":
     packed_flat = np.ascontiguousarray(packed.reshape(-1), dtype=np.uint8)
     scales_flat = np.ascontiguousarray(scales.reshape(-1), dtype=np.float32)
     packed_k = (k + 1) // 2
@@ -104,12 +110,15 @@ def _unpack_int4_rowwise(packed: "np.ndarray", scales: "np.ndarray", out_n: int,
     for j in range(out_n):
         base = j * packed_k
         scale = float(scales_flat[j])
+        zp = 0.0
+        if zero_points is not None and zero_points.size > j:
+            zp = float(zero_points[j])
         for t in range(k):
             byte = int(packed_flat[base + (t >> 1)])
             nibble = ((byte >> 4) & 0x0F) if (t & 1) else (byte & 0x0F)
             if nibble >= 8:
                 nibble -= 16
-            w[j, t] = float(nibble) * scale
+            w[j, t] = (float(nibble) - zp) * scale
     return w
 
 
@@ -120,6 +129,7 @@ def _debug_compare_int4_kernel(
     out_n: int,
     layer_idx: int,
     key: str,
+    zero_points: "np.ndarray | None" = None,
 ) -> None:
     if np is None or not fused_linear_int4_available():
         return
@@ -146,9 +156,13 @@ def _debug_compare_int4_kernel(
         if vec_np.ndim == 1:
             vec_np = vec_np[None, :]
         k = int(vec_np.shape[-1])
-        w_deq = _unpack_int4_rowwise(packed_w, scales, int(out_n), k)
+        w_deq = _unpack_int4_rowwise(packed_w, scales, int(out_n), k, zero_points=zero_points)
         ref = np.ascontiguousarray(vec_np @ w_deq.T, dtype=np.float32)
         got = np.ascontiguousarray(fused_linear_int4(vec_np, packed_w, scales, int(out_n)), dtype=np.float32)
+        if zero_points is not None and zero_points.size == int(out_n):
+            vec_sum = np.sum(vec_np.astype(np.float32, copy=False), axis=-1, keepdims=True)
+            zp_scale = np.ascontiguousarray(zero_points.astype(np.float32, copy=False) * scales.astype(np.float32, copy=False))
+            got = got - (vec_sum * zp_scale[None, :])
         err_abs = float(np.max(np.abs(ref - got)))
         denom = float(np.max(np.abs(ref)) + 1e-6)
         err_rel = float(err_abs / denom)
@@ -157,14 +171,39 @@ def _debug_compare_int4_kernel(
         print(f"[int4 debug] layer={layer_idx} key={key} compare_failed={exc}")
 
 
-def _quantize_rowwise_int4(weight: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+def _quantize_rowwise_int4(weight: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"]:
     w = weight.astype(np.float32, copy=False)
     max_abs = np.max(np.abs(w), axis=1)
     scales = np.where(max_abs > 0.0, max_abs / 7.0, 1.0).astype(np.float32, copy=False)
     q = np.clip(np.round(w / scales[:, None]), -8.0, 7.0).astype(np.int8, copy=False)
+    zero_points = np.mean(q.astype(np.float32, copy=False), axis=1).astype(np.float32, copy=False)
     packed = _pack_signed_rowwise_int4(q)
-    dequant = (q.astype(np.float32, copy=False) * scales[:, None]).astype(np.float32, copy=False)
-    return packed, scales, dequant
+    dequant = ((q.astype(np.float32, copy=False) - zero_points[:, None]) * scales[:, None]).astype(np.float32, copy=False)
+    return packed, scales, zero_points, dequant
+
+
+def _apply_rowwise_zero_point_correction(output, vec, scales: "np.ndarray", zero_points: "np.ndarray | None"):
+    if np is None or zero_points is None:
+        return output
+    try:
+        zp = np.ascontiguousarray(zero_points.astype(np.float32, copy=False).reshape(-1))
+        if zp.size == 0:
+            return output
+        s = np.ascontiguousarray(scales.astype(np.float32, copy=False).reshape(-1))
+        if s.size != zp.size:
+            return output
+        v = np.ascontiguousarray(vec.astype(np.float32, copy=False))
+        if v.ndim == 1:
+            v = v[None, :]
+        vec_sum = np.sum(v, axis=-1, keepdims=True)
+        corr = vec_sum * (s * zp)[None, :]
+        out = np.ascontiguousarray(output.astype(np.float32, copy=False))
+        if out.ndim == 1:
+            out = out[None, :]
+            return (out - corr)[0]
+        return out - corr
+    except Exception:
+        return output
 
 
 def _run_int4_kernel_selftest() -> bool:
@@ -183,7 +222,7 @@ def _run_int4_kernel_selftest() -> bool:
         k = 96
         vec = rng.standard_normal((1, k), dtype=np.float32)
         w = (rng.standard_normal((n, k), dtype=np.float32) * 0.35).astype(np.float32, copy=False)
-        packed, scales, dequant = _quantize_rowwise_int4(w)
+        packed, scales, zero_points, dequant = _quantize_rowwise_int4(w)
 
         ref = (vec @ dequant.T).astype(np.float32, copy=False)
         got = fused_linear_int4(vec, packed, scales, n).astype(np.float32, copy=False)
@@ -250,14 +289,23 @@ def lowbit_linear_project(
         return vec @ w.T
 
     if use_native_cuda_norm and lowbit_plan.enabled and lowbit_plan.bits in {3, 4} and key in packed:
-        packed_w, scales, bits, out_n = packed[key]
+        entry = packed[key]
+        if len(entry) >= 5:
+            packed_w, scales, bits, out_n, zero_points = entry
+        else:
+            packed_w, scales, bits, out_n = entry
+            zero_points = None
         if bits == 4 and fused_linear_int4_available():
-            _debug_compare_int4_kernel(vec, packed_w, scales, out_n, layer_idx, key)
+            _debug_compare_int4_kernel(vec, packed_w, scales, out_n, layer_idx, key, zero_points=zero_points)
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
-            return _unwrap_single_batch(fused_linear_int4(vec, packed_w, scales, out_n))
+            out = fused_linear_int4(vec, packed_w, scales, out_n)
+            out = _apply_rowwise_zero_point_correction(out, vec, scales, zero_points)
+            return _unwrap_single_batch(out)
         if bits == 3 and fused_linear_int3_available():
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
-            return _unwrap_single_batch(fused_linear_int3(vec, packed_w, scales, out_n))
+            out = fused_linear_int3(vec, packed_w, scales, out_n)
+            out = _apply_rowwise_zero_point_correction(out, vec, scales, zero_points)
+            return _unwrap_single_batch(out)
 
     if use_native_cuda_norm and gemm_f32_available():
         _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] += 1
