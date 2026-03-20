@@ -36,5 +36,8 @@ typedef struct VspecGraph {
 void vspec_graph_init(VspecGraph* graph);
 int vspec_graph_add_node(VspecGraph* graph, VspecOpType op, uint32_t input_a, uint32_t input_b, uint32_t output);
 const VspecNode* vspec_graph_get_node(const VspecGraph* graph, size_t index);
+int vspec_graph_validate(const VspecGraph* graph, char* error_buf, size_t error_buf_len);
+int vspec_graph_find_producer(const VspecGraph* graph, uint32_t output_tensor_id);
+size_t vspec_graph_build_topological_order(const VspecGraph* graph, uint32_t* node_ids_out, size_t capacity);
 
 #endif

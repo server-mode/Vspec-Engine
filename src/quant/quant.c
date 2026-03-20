@@ -9,4 +9,6 @@ void vspec_quant_meta_init(VspecQuantMeta* meta) {
     meta->type = VSPEC_QUANT_NONE;
     meta->scales = 0;
     meta->scale_count = 0;
+    meta->special_format = VSPEC_SPECIAL_QUANT_NONE;
+    meta->special_data = 0;
 }

@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "vspec/quant/formats/special_quant.h"
+
 typedef enum VspecQuantType {
     VSPEC_QUANT_NONE = 0,
     VSPEC_QUANT_INT2 = 2,
@@ -15,6 +17,8 @@ typedef struct VspecQuantMeta {
     VspecQuantType type;
     const float* scales;
     size_t scale_count;
+    VspecSpecialQuantFormat special_format;
+    const void* special_data;
 } VspecQuantMeta;
 
 void vspec_quant_meta_init(VspecQuantMeta* meta);

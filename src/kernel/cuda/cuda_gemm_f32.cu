@@ -2,8 +2,11 @@
 #include <cublas_v2.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "vspec/kernel/cuda_ops.h"
+
+static const size_t VSPEC_GEMM_WEIGHT_CACHE_CAPACITY = 256U;
 
 extern "C" void vspec_cuda_gemm_f32(
     const float* input,
@@ -25,16 +28,38 @@ extern "C" void vspec_cuda_gemm_f32(
         const float* host_w;
         float* d_w;
         size_t bytes_w;
+        uint64_t fingerprint;
+        uint64_t last_used;
     } GemmWeightCache;
 
-    static GemmWeightCache cache[64];
-    static size_t cache_count = 0U;
-    static float* d_in = NULL;
-    static float* d_out = NULL;
-    static size_t cap_in = 0U;
-    static size_t cap_out = 0U;
-    static cublasHandle_t handle = NULL;
-    static int tensorcore_mode = -1;
+    static thread_local GemmWeightCache cache[VSPEC_GEMM_WEIGHT_CACHE_CAPACITY];
+    static thread_local size_t cache_count = 0U;
+    static thread_local uint64_t use_clock = 0U;
+    static thread_local float* d_in = NULL;
+    static thread_local float* d_out = NULL;
+    static thread_local size_t cap_in = 0U;
+    static thread_local size_t cap_out = 0U;
+    static thread_local cublasHandle_t handle = NULL;
+    static thread_local int tensorcore_mode = -1;
+
+    auto hash_weight_fingerprint = [](const float* w, size_t bytes) -> uint64_t {
+        if (!w || bytes < sizeof(float)) {
+            return (uint64_t)bytes;
+        }
+        const size_t elems = bytes / sizeof(float);
+        const size_t samples = 64U;
+        const size_t step = (elems / samples) + 1U;
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0U; i < elems; i += step) {
+            uint32_t bits = 0U;
+            memcpy(&bits, w + i, sizeof(uint32_t));
+            h ^= (uint64_t)bits;
+            h *= 1099511628211ULL;
+        }
+        h ^= (uint64_t)elems;
+        h *= 1099511628211ULL;
+        return h;
+    };
 
     if (!handle) {
         if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
@@ -46,24 +71,41 @@ extern "C" void vspec_cuda_gemm_f32(
         tensorcore_mode = (!env || env[0] == '\0' || strcmp(env, "0") != 0) ? 1 : 0;
     }
 
+    const uint64_t weight_fp = hash_weight_fingerprint(weight, bytes_w);
+
     GemmWeightCache* entry = NULL;
+    GemmWeightCache* stale_entry = NULL;
     for (size_t i = 0; i < cache_count; ++i) {
-        if (cache[i].host_w == weight && cache[i].bytes_w == bytes_w) {
+        if (cache[i].host_w == weight && cache[i].bytes_w == bytes_w && cache[i].fingerprint == weight_fp) {
             entry = &cache[i];
             break;
+        }
+        if (cache[i].host_w == weight && cache[i].bytes_w == bytes_w) {
+            stale_entry = &cache[i];
         }
     }
 
     if (!entry) {
-        if (cache_count < 64U) {
-            entry = &cache[cache_count++];
+        if (stale_entry) {
+            entry = stale_entry;
         } else {
-            entry = &cache[cache_count - 1U];
-            if (entry->d_w) cudaFree(entry->d_w);
+            if (cache_count < VSPEC_GEMM_WEIGHT_CACHE_CAPACITY) {
+                entry = &cache[cache_count++];
+            } else {
+                size_t lru_idx = 0U;
+                for (size_t i = 1U; i < VSPEC_GEMM_WEIGHT_CACHE_CAPACITY; ++i) {
+                    if (cache[i].last_used < cache[lru_idx].last_used) {
+                        lru_idx = i;
+                    }
+                }
+                entry = &cache[lru_idx];
+            }
         }
+        if (entry->d_w) cudaFree(entry->d_w);
         memset(entry, 0, sizeof(*entry));
         entry->host_w = weight;
         entry->bytes_w = bytes_w;
+        entry->fingerprint = weight_fp;
         if (cudaMalloc((void**)&entry->d_w, bytes_w) != cudaSuccess) {
             return;
         }
@@ -71,6 +113,7 @@ extern "C" void vspec_cuda_gemm_f32(
             return;
         }
     }
+    entry->last_used = ++use_clock;
 
     if (cap_in < bytes_in) {
         if (d_in) cudaFree(d_in);

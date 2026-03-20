@@ -17,6 +17,18 @@ static size_t clamp_block_size(size_t block_size) {
     return 32U;
 }
 
+static int compare_float_asc(const void* a, const void* b) {
+    const float va = *(const float*)a;
+    const float vb = *(const float*)b;
+    if (va < vb) {
+        return -1;
+    }
+    if (va > vb) {
+        return 1;
+    }
+    return 0;
+}
+
 static float percentile_abs_block(const float* data, size_t n, float percentile) {
     if (!data || n == 0U) {
         return 0.0f;
@@ -37,19 +49,7 @@ static float percentile_abs_block(const float* data, size_t n, float percentile)
         temp[i] = fabsf(data[i]);
     }
 
-    for (size_t i = 0; i < n; ++i) {
-        size_t min_idx = i;
-        for (size_t j = i + 1U; j < n; ++j) {
-            if (temp[j] < temp[min_idx]) {
-                min_idx = j;
-            }
-        }
-        if (min_idx != i) {
-            float swap = temp[i];
-            temp[i] = temp[min_idx];
-            temp[min_idx] = swap;
-        }
-    }
+    qsort(temp, n, sizeof(float), compare_float_asc);
 
     size_t idx = (size_t)((double)(n - 1U) * ((double)percentile / 100.0));
     if (idx >= n) {

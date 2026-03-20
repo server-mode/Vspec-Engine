@@ -325,19 +325,19 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     const size_t bytes_b = n * packed_k * sizeof(uint8_t);
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
-    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 1);
+    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 0);
     const float clamp_alpha = vspec_env_float_or_default("VSPEC_FUSED_INPUT_CLAMP_ALPHA", 6.0f);
 
-    static float* d_a = NULL;
-    static float* d_a_clamped = NULL;
-    static uint8_t* d_b = NULL;
-    static float* d_s = NULL;
-    static float* d_c = NULL;
-    static size_t cap_a = 0U;
-    static size_t cap_a_clamped = 0U;
-    static size_t cap_b = 0U;
-    static size_t cap_s = 0U;
-    static size_t cap_c = 0U;
+    static thread_local float* d_a = NULL;
+    static thread_local float* d_a_clamped = NULL;
+    static thread_local uint8_t* d_b = NULL;
+    static thread_local float* d_s = NULL;
+    static thread_local float* d_c = NULL;
+    static thread_local size_t cap_a = 0U;
+    static thread_local size_t cap_a_clamped = 0U;
+    static thread_local size_t cap_b = 0U;
+    static thread_local size_t cap_s = 0U;
+    static thread_local size_t cap_c = 0U;
 
     if (cap_a < bytes_a) {
         if (d_a) cudaFree(d_a);
@@ -345,11 +345,17 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
         if (cudaMalloc((void**)&d_a, bytes_a) != cudaSuccess) return;
         cap_a = bytes_a;
     }
-    if (cap_a_clamped < bytes_a) {
-        if (d_a_clamped) cudaFree(d_a_clamped);
+    if (clamp_enabled && clamp_alpha > 0.0f) {
+        if (cap_a_clamped < bytes_a) {
+            if (d_a_clamped) cudaFree(d_a_clamped);
+            d_a_clamped = NULL;
+            if (cudaMalloc((void**)&d_a_clamped, bytes_a) != cudaSuccess) return;
+            cap_a_clamped = bytes_a;
+        }
+    } else if (d_a_clamped) {
+        cudaFree(d_a_clamped);
         d_a_clamped = NULL;
-        if (cudaMalloc((void**)&d_a_clamped, bytes_a) != cudaSuccess) return;
-        cap_a_clamped = bytes_a;
+        cap_a_clamped = 0U;
     }
     if (cap_b < bytes_b) {
         if (d_b) cudaFree(d_b);
@@ -408,21 +414,21 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
     const size_t bytes_b4 = n * packed_k4 * sizeof(uint8_t);
     const size_t bytes_s = n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
-    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 1);
+    const int clamp_enabled = vspec_env_flag_or_default("VSPEC_FUSED_INPUT_CLAMP_ENABLE", 0);
     const float clamp_alpha = vspec_env_float_or_default("VSPEC_FUSED_INPUT_CLAMP_ALPHA", 6.0f);
 
-    static float* d_a = NULL;
-    static float* d_a_clamped = NULL;
-    static uint8_t* d_b3 = NULL;
-    static uint8_t* d_b4 = NULL;
-    static float* d_s = NULL;
-    static float* d_c = NULL;
-    static size_t cap_a = 0U;
-    static size_t cap_a_clamped = 0U;
-    static size_t cap_b3 = 0U;
-    static size_t cap_b4 = 0U;
-    static size_t cap_s = 0U;
-    static size_t cap_c = 0U;
+    static thread_local float* d_a = NULL;
+    static thread_local float* d_a_clamped = NULL;
+    static thread_local uint8_t* d_b3 = NULL;
+    static thread_local uint8_t* d_b4 = NULL;
+    static thread_local float* d_s = NULL;
+    static thread_local float* d_c = NULL;
+    static thread_local size_t cap_a = 0U;
+    static thread_local size_t cap_a_clamped = 0U;
+    static thread_local size_t cap_b3 = 0U;
+    static thread_local size_t cap_b4 = 0U;
+    static thread_local size_t cap_s = 0U;
+    static thread_local size_t cap_c = 0U;
 
     if (cap_a < bytes_a) {
         if (d_a) cudaFree(d_a);
@@ -430,11 +436,17 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
         if (cudaMalloc((void**)&d_a, bytes_a) != cudaSuccess) return;
         cap_a = bytes_a;
     }
-    if (cap_a_clamped < bytes_a) {
-        if (d_a_clamped) cudaFree(d_a_clamped);
+    if (clamp_enabled && clamp_alpha > 0.0f) {
+        if (cap_a_clamped < bytes_a) {
+            if (d_a_clamped) cudaFree(d_a_clamped);
+            d_a_clamped = NULL;
+            if (cudaMalloc((void**)&d_a_clamped, bytes_a) != cudaSuccess) return;
+            cap_a_clamped = bytes_a;
+        }
+    } else if (d_a_clamped) {
+        cudaFree(d_a_clamped);
         d_a_clamped = NULL;
-        if (cudaMalloc((void**)&d_a_clamped, bytes_a) != cudaSuccess) return;
-        cap_a_clamped = bytes_a;
+        cap_a_clamped = 0U;
     }
     if (cap_b3 < bytes_b3) {
         if (d_b3) cudaFree(d_b3);

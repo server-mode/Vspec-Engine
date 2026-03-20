@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -65,15 +66,55 @@ class SimpleGGUFTokenizer:
         self._eos = eos_token_id
         self._by_token = {token: idx for idx, token in enumerate(self._tokens)}
 
+    def _append_piece_ids(self, piece: str, ids: list[int]) -> None:
+        remaining = str(piece or "")
+        while remaining:
+            match_id = self._by_token.get(remaining)
+            if match_id is not None:
+                ids.append(int(match_id))
+                return
+
+            found = False
+            for cut in range(len(remaining) - 1, 0, -1):
+                prefix = remaining[:cut]
+                token_id = self._by_token.get(prefix)
+                if token_id is not None:
+                    ids.append(int(token_id))
+                    remaining = remaining[cut:]
+                    found = True
+                    break
+            if found:
+                continue
+
+            b0 = remaining.encode("utf-8", errors="ignore")[:1]
+            if not b0:
+                remaining = remaining[1:]
+                continue
+            byte_token = f"<0x{int(b0[0]):02X}>"
+            token_id = self._by_token.get(byte_token)
+            if token_id is not None:
+                ids.append(int(token_id))
+            remaining = remaining[1:]
+
     def encode(self, text: str):
         ids: list[int] = []
         sample = str(text or "")
         if sample in self._by_token:
             ids.append(int(self._by_token[sample]))
         else:
-            for chunk in sample.split():
-                if chunk in self._by_token:
-                    ids.append(int(self._by_token[chunk]))
+            # Prefer sentencepiece-like fallback before raw chunks.
+            sp_sample = sample.replace(" ", "▁")
+            if sp_sample.startswith("▁"):
+                sp_sample = sp_sample[1:]
+            if sp_sample:
+                self._append_piece_ids(sp_sample, ids)
+
+            if not ids:
+                for chunk in sample.split():
+                    if chunk in self._by_token:
+                        ids.append(int(self._by_token[chunk]))
+                    else:
+                        self._append_piece_ids(chunk, ids)
         return type("_EncodeResult", (), {"ids": ids})()
 
     def decode(self, ids: list[int]) -> str:
@@ -162,43 +203,117 @@ class GGUFArchive:
 
     def config(self) -> dict[str, Any]:
         arch = self.arch
+        arch_candidates: list[str] = []
+        for candidate in [arch, "qwen35", "qwen2", "qwen", "llama", "mistral", "gpt2"]:
+            c = str(candidate or "").strip().lower()
+            if c and c not in arch_candidates:
+                arch_candidates.append(c)
+
+        def _pick_arch_value(key_template: str, default: Any = None, positive_only: bool = False) -> tuple[Any, str]:
+            chosen = default
+            chosen_arch = arch
+            for candidate in arch_candidates:
+                key = key_template.format(arch=candidate)
+                value = _field_value(self.reader, key, None)
+                if value is None:
+                    continue
+                if positive_only:
+                    try:
+                        valid = float(value) > 0.0
+                    except Exception:
+                        valid = False
+                    if not valid:
+                        continue
+                chosen = value
+                chosen_arch = candidate
+                break
+            if chosen is None:
+                chosen = default
+            return chosen, chosen_arch
+
+        def _int_with_arch(key_template: str, default: int = 0, positive_only: bool = False) -> tuple[int, str]:
+            value, value_arch = _pick_arch_value(key_template, default=default, positive_only=positive_only)
+            try:
+                return int(value or 0), value_arch
+            except Exception:
+                return int(default), value_arch
+
+        def _float_with_arch(key_template: str, default: float = 0.0, positive_only: bool = False) -> tuple[float, str]:
+            value, value_arch = _pick_arch_value(key_template, default=default, positive_only=positive_only)
+            try:
+                return float(value or 0.0), value_arch
+            except Exception:
+                return float(default), value_arch
+
         tokens = _field_value(self.reader, gguf.Keys.Tokenizer.LIST, []) or []
         bos_id = _field_value(self.reader, gguf.Keys.Tokenizer.BOS_ID, None)
         eos_id = _field_value(self.reader, gguf.Keys.Tokenizer.EOS_ID, None)
+
+        vocab_size, vocab_arch = _int_with_arch(gguf.Keys.LLM.VOCAB_SIZE, len(tokens), positive_only=True)
+        context_len, context_arch = _int_with_arch(gguf.Keys.LLM.CONTEXT_LENGTH, 0, positive_only=True)
+        num_layers, layers_arch = _int_with_arch(gguf.Keys.LLM.BLOCK_COUNT, 0, positive_only=True)
+        hidden_size, hidden_arch = _int_with_arch(gguf.Keys.LLM.EMBEDDING_LENGTH, 0, positive_only=True)
+        inter_size, ffn_arch = _int_with_arch(gguf.Keys.LLM.FEED_FORWARD_LENGTH, 0, positive_only=True)
+        num_heads, heads_arch = _int_with_arch(gguf.Keys.Attention.HEAD_COUNT, 0, positive_only=True)
+        kv_heads_raw, kv_arch = _int_with_arch(gguf.Keys.Attention.HEAD_COUNT_KV, 0, positive_only=True)
+        kv_heads = kv_heads_raw if kv_heads_raw > 0 else num_heads
+        rms_eps, eps_arch = _float_with_arch(gguf.Keys.Attention.LAYERNORM_RMS_EPS, 0.0, positive_only=True)
+        if rms_eps <= 0.0:
+            rms_eps, eps_arch = _float_with_arch(gguf.Keys.Attention.LAYERNORM_EPS, 1e-6, positive_only=True)
+        if rms_eps <= 0.0:
+            rms_eps = 1e-6
+        rope_theta, rope_arch = _float_with_arch(gguf.Keys.Rope.FREQ_BASE, 10000.0, positive_only=True)
+        if rope_theta <= 0.0:
+            rope_theta = 10000.0
+
+        discovered_arch = arch
+        for candidate in [hidden_arch, heads_arch, layers_arch, context_arch, ffn_arch, vocab_arch, kv_arch, rope_arch, eps_arch]:
+            c = str(candidate or "").strip().lower()
+            if c and c != arch:
+                discovered_arch = c
+                break
+
+        tensor_names = set(self.tensor_by_name.keys())
+        has_qwen35_ssm = any(
+            (".attn_qkv.weight" in name) or (".ssm_" in name)
+            for name in tensor_names
+        )
+        model_type = discovered_arch
+        if arch == "qwen35" and not has_qwen35_ssm:
+            model_type = discovered_arch if discovered_arch != "qwen35" else "qwen"
+
         cfg = {
-            "model_type": arch,
-            "vocab_size": int(_field_value(self.reader, gguf.Keys.LLM.VOCAB_SIZE.format(arch=arch), len(tokens)) or len(tokens)),
-            "max_position_embeddings": int(_field_value(self.reader, gguf.Keys.LLM.CONTEXT_LENGTH.format(arch=arch), 0) or 0),
-            "num_hidden_layers": int(_field_value(self.reader, gguf.Keys.LLM.BLOCK_COUNT.format(arch=arch), 0) or 0),
-            "hidden_size": int(_field_value(self.reader, gguf.Keys.LLM.EMBEDDING_LENGTH.format(arch=arch), 0) or 0),
-            "intermediate_size": int(_field_value(self.reader, gguf.Keys.LLM.FEED_FORWARD_LENGTH.format(arch=arch), 0) or 0),
-            "num_attention_heads": int(_field_value(self.reader, gguf.Keys.Attention.HEAD_COUNT.format(arch=arch), 0) or 0),
-            "num_key_value_heads": int(
-                _field_value(
-                    self.reader,
-                    gguf.Keys.Attention.HEAD_COUNT_KV.format(arch=arch),
-                    _field_value(self.reader, gguf.Keys.Attention.HEAD_COUNT.format(arch=arch), 0),
-                )
-                or 0
-            ),
-            "rms_norm_eps": float(
-                _field_value(
-                    self.reader,
-                    gguf.Keys.Attention.LAYERNORM_RMS_EPS.format(arch=arch),
-                    _field_value(self.reader, gguf.Keys.Attention.LAYERNORM_EPS.format(arch=arch), 1e-6),
-                )
-                or 1e-6
-            ),
-            "rope_theta": float(_field_value(self.reader, gguf.Keys.Rope.FREQ_BASE.format(arch=arch), 10000.0) or 10000.0),
+            "model_type": model_type,
+            "gguf_arch_original": arch,
+            "gguf_arch_resolved": discovered_arch,
+            "vocab_size": int(vocab_size or len(tokens)),
+            "max_position_embeddings": int(context_len or 0),
+            "num_hidden_layers": int(num_layers or 0),
+            "hidden_size": int(hidden_size or 0),
+            "intermediate_size": int(inter_size or 0),
+            "num_attention_heads": int(num_heads or 0),
+            "num_key_value_heads": int(kv_heads or 0),
+            "rms_norm_eps": float(rms_eps or 1e-6),
+            "rope_theta": float(rope_theta or 10000.0),
             "bos_token_id": int(bos_id) if bos_id is not None else None,
             "eos_token_id": int(eos_id) if eos_id is not None else None,
             "tie_word_embeddings": "output.weight" not in self.tensor_by_name,
         }
-        if arch == "qwen35":
+        if os.getenv("VSPEC_GGUF_DIAG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            print(
+                "[gguf diag] arch_original=", arch,
+                "arch_resolved=", discovered_arch,
+                "model_type=", model_type,
+                "hidden=", int(cfg["hidden_size"]),
+                "layers=", int(cfg["num_hidden_layers"]),
+                "heads=", int(cfg["num_attention_heads"]),
+                "kv_heads=", int(cfg["num_key_value_heads"]),
+            )
+        if model_type == "qwen35" and has_qwen35_ssm:
             num_layers = int(cfg.get("num_hidden_layers", 0) or 0)
-            ssm_group_count = int(_field_value(self.reader, f"{arch}.ssm.group_count", 0) or 0)
-            ssm_time_step_rank = int(_field_value(self.reader, f"{arch}.ssm.time_step_rank", 0) or 0)
-            ssm_inner_size = int(_field_value(self.reader, f"{arch}.ssm.inner_size", 0) or 0)
+            ssm_group_count = int(_field_value(self.reader, f"{discovered_arch}.ssm.group_count", 0) or 0)
+            ssm_time_step_rank = int(_field_value(self.reader, f"{discovered_arch}.ssm.time_step_rank", 0) or 0)
+            ssm_inner_size = int(_field_value(self.reader, f"{discovered_arch}.ssm.inner_size", 0) or 0)
             layer_types: list[str] = []
             for layer_idx in range(num_layers):
                 prefix = f"blk.{layer_idx}."
@@ -209,14 +324,14 @@ class GGUFArchive:
                 else:
                     layer_types.append("unknown")
             cfg.update({
-                "head_dim": int(_field_value(self.reader, f"{arch}.attention.key_length", 0) or 0),
-                "rope_dimension_count": int(_field_value(self.reader, f"{arch}.rope.dimension_count", 0) or 0),
-                "rope_dimension_sections": list(_field_value(self.reader, f"{arch}.rope.dimension_sections", []) or []),
+                "head_dim": int(_field_value(self.reader, f"{discovered_arch}.attention.key_length", 0) or 0),
+                "rope_dimension_count": int(_field_value(self.reader, f"{discovered_arch}.rope.dimension_count", 0) or 0),
+                "rope_dimension_sections": list(_field_value(self.reader, f"{discovered_arch}.rope.dimension_sections", []) or []),
                 "linear_num_key_heads": ssm_group_count,
                 "linear_num_value_heads": ssm_time_step_rank,
-                "linear_key_head_dim": int(_field_value(self.reader, f"{arch}.ssm.state_size", 0) or 0),
+                "linear_key_head_dim": int(_field_value(self.reader, f"{discovered_arch}.ssm.state_size", 0) or 0),
                 "linear_value_head_dim": (ssm_inner_size // ssm_time_step_rank) if ssm_time_step_rank > 0 else 0,
-                "linear_conv_kernel_dim": int(_field_value(self.reader, f"{arch}.ssm.conv_kernel", 0) or 0),
+                "linear_conv_kernel_dim": int(_field_value(self.reader, f"{discovered_arch}.ssm.conv_kernel", 0) or 0),
                 "layer_types": layer_types,
             })
         return cfg

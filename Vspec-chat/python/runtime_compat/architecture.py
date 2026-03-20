@@ -211,7 +211,8 @@ def resolve_runtime_target(
                 reason="hybrid_qwen35_detected",
             )
 
-        fallback_cfg = dict(enriched_cfg)
+        # Keep generic fallback close to original config to avoid leaking partial hybrid assumptions.
+        fallback_cfg = dict(cfg)
         fallback_cfg["model_type"] = "generic"
         warnings = ["qwen35_hybrid_fallback_to_generic"]
         warnings.extend(issues)

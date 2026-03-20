@@ -48,6 +48,8 @@ add_library(vspec_engine
     src/quant/int3.c
     src/quant/dynamic_map.c
     src/quant/quant.c
+    src/quant/formats/q4_k.c
+    src/quant/formats/special_quant.c
     src/validation/perplexity.c
     src/validation/drift_analyzer.c
     src/validation/quant_sensitivity.c
@@ -188,6 +190,12 @@ add_executable(vspec_quant_pack_demo
 )
 
 target_link_libraries(vspec_quant_pack_demo PRIVATE vspec_engine)
+
+add_executable(vspec_special_quant_demo
+    examples/special_quant_demo.c
+)
+
+target_link_libraries(vspec_special_quant_demo PRIVATE vspec_engine)
 
 add_executable(vspec_attention_demo
     examples/attention_demo.c

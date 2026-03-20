@@ -22,6 +22,9 @@ int vspec_multi_gpu_plan_build(
 );
 uint32_t vspec_multi_gpu_plan_stage_for_layer(const VspecMultiGpuPlan* plan, uint32_t layer_id);
 uint32_t vspec_multi_gpu_plan_device_for_layer(const VspecMultiGpuPlan* plan, uint32_t layer_id);
+uint32_t vspec_multi_gpu_plan_device_for_layer_shard(const VspecMultiGpuPlan* plan, uint32_t layer_id, uint32_t shard_id);
+int vspec_multi_gpu_plan_stage_layer_range(const VspecMultiGpuPlan* plan, uint32_t stage_id, uint32_t* start_layer, uint32_t* end_layer);
+int vspec_multi_gpu_plan_validate(const VspecMultiGpuPlan* plan);
 uint32_t vspec_multi_gpu_plan_shard_width(const VspecMultiGpuPlan* plan, uint32_t hidden_size);
 
 #endif

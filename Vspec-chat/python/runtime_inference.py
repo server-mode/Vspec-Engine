@@ -140,6 +140,95 @@ def _infer_model_family(config: dict) -> str:
     return "generic"
 
 
+def _diag_enabled() -> bool:
+    return os.getenv("VSPEC_RUNTIME_DIAG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _diag_print(*parts) -> None:
+    if _diag_enabled():
+        print("[runtime diag]", *parts)
+
+
+def _diag_logits_once(runtime_name: str, position: int, logits: "np.ndarray") -> None:
+    if not _diag_enabled():
+        return
+    if int(position) != 1:
+        return
+    try:
+        logits_np = np.asarray(logits, dtype=np.float32).reshape(-1)
+        if logits_np.size == 0:
+            _diag_print("logits_step1", "runtime=", runtime_name, "empty")
+            return
+        head = logits_np[:10]
+        top_id = int(np.argmax(logits_np))
+        top_val = float(logits_np[top_id])
+        _diag_print(
+            "logits_step1",
+            "runtime=", runtime_name,
+            "top_id=", top_id,
+            "top_val=", f"{top_val:.5f}",
+            "head10=", ",".join(f"{float(v):.5f}" for v in head),
+        )
+    except Exception:
+        return
+
+
+def _validate_config_or_warn(config: dict, runtime_name: str) -> list[str]:
+    issues: list[str] = []
+
+    def _as_int(name: str, fallback: int = 0) -> int:
+        try:
+            return int(config.get(name, fallback) or fallback)
+        except Exception:
+            return fallback
+
+    hidden = _as_int("hidden_size")
+    layers = _as_int("num_hidden_layers")
+    heads = _as_int("num_attention_heads")
+    kv_heads = _as_int("num_key_value_heads")
+
+    if hidden <= 0:
+        issues.append("invalid_hidden_size")
+    if layers <= 0:
+        issues.append("invalid_num_hidden_layers")
+    if heads <= 0:
+        issues.append("invalid_num_attention_heads")
+    if runtime_name in {"generic", "qwen35"} and kv_heads <= 0:
+        issues.append("invalid_num_key_value_heads")
+
+    if runtime_name == "qwen35":
+        for key in [
+            "head_dim",
+            "rope_dimension_count",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+        ]:
+            if _as_int(key) <= 0:
+                issues.append(f"invalid_{key}")
+
+    if issues:
+        _diag_print(
+            "config_invalid",
+            "runtime=", runtime_name,
+            "model_type=", str(config.get("model_type", "")),
+            "issues=", ",".join(issues),
+        )
+    else:
+        _diag_print(
+            "config_ok",
+            "runtime=", runtime_name,
+            "hidden=", hidden,
+            "layers=", layers,
+            "heads=", heads,
+            "kv_heads=", kv_heads,
+        )
+
+    return issues
+
+
 def _stabilize_logits(logits: "np.ndarray", logit_clip: float, entropy_target: float, margin_floor: float, margin_gain: float) -> "np.ndarray":
     if logits.size == 0:
         return logits
@@ -306,20 +395,27 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
         percentile = 0.995
     percentile = max(0.95, min(1.0, percentile))
 
-    abs_w = np.abs(w)
+    lo_q = 1.0 - percentile
     if percentile >= 0.9999:
-        rep_abs = np.max(abs_w, axis=1)
+        row_min = np.min(w, axis=1)
+        row_max = np.max(w, axis=1)
     else:
-        rep_abs = np.quantile(abs_w, percentile, axis=1)
-    rep_abs = np.maximum(rep_abs, 1e-8)
-    scales = (rep_abs / max_q).astype(np.float32)
-    q = np.round(w / scales[:, None])
-    q = np.clip(q, min_q, max_q).astype(np.int8)
+        row_min = np.quantile(w, lo_q, axis=1)
+        row_max = np.quantile(w, percentile, axis=1)
+
+    row_span = np.maximum(row_max - row_min, 1e-8)
+    levels = max(1.0, max_q - min_q)
+    scales = (row_span / levels).astype(np.float32, copy=False)
+
+    zero_points = np.round(min_q - (row_min / scales)).astype(np.float32, copy=False)
+    zero_points = np.clip(zero_points, min_q, max_q).astype(np.float32, copy=False)
+
+    q = np.round((w / scales[:, None]) + zero_points[:, None])
+    q = np.clip(q, min_q, max_q).astype(np.int8, copy=False)
 
     packed = _pack_signed_rowwise(q, bits)
-    zero_points = None
-    if bits in {3, 4}:
-        zero_points = np.mean(q.astype(np.float32, copy=False), axis=1).astype(np.float32, copy=False)
+    if bits not in {3, 4}:
+        zero_points = None
     return packed, scales, zero_points
 
 
@@ -398,7 +494,10 @@ class SimpleRuntime:
     def forward_logits(self, token_ids: list[int]) -> list[float]:
         if np is None:
             return []
-        return self.forward_logits_np(token_ids).astype(float, copy=False).tolist()
+        logits = self.forward_logits_np(token_ids)
+        if np is not None and hasattr(logits, "size") and logits.size > 0:
+            _diag_logits_once("simple", 1, logits.astype(np.float32, copy=False))
+        return logits.astype(float, copy=False).tolist()
 
 
 @dataclass
@@ -423,7 +522,7 @@ class LayerWeights:
     b3: Optional["np.ndarray"]
     norm1_bias: Optional["np.ndarray"]
     norm2_bias: Optional["np.ndarray"]
-    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int]] = field(default_factory=dict)
+    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]] = field(default_factory=dict)
 
 
 @dataclass
@@ -440,7 +539,7 @@ class GPT2LayerWeights:
     ln_1_bias: Optional["np.ndarray"]
     ln_2_weight: "np.ndarray"
     ln_2_bias: Optional["np.ndarray"]
-    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int]] = field(default_factory=dict)
+    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]] = field(default_factory=dict)
 
 
 @dataclass
@@ -466,7 +565,7 @@ class Qwen35LayerWeights:
     ssm_dt: Optional["np.ndarray"] = None
     ssm_norm: Optional["np.ndarray"] = None
     ssm_out: Optional["np.ndarray"] = None
-    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int]] = field(default_factory=dict)
+    packed: dict[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]] = field(default_factory=dict)
 
 
 def _apply_partial_rotary(q: "np.ndarray", k: "np.ndarray", position: int, rope_theta: float, rope_dim: int) -> tuple["np.ndarray", "np.ndarray"]:
@@ -487,10 +586,12 @@ def _split_qwen35_q_and_gate(q_proj: "np.ndarray", num_heads: int, head_dim: int
     total = int(proj.size)
 
     if total == expected_q * 2:
+        _diag_print("qwen35_split", "mode=dual", "num_heads=", int(num_heads), "head_dim=", int(head_dim), "total=", total)
         q_full = proj.reshape(int(num_heads), int(head_dim) * 2)
         return q_full[:, :head_dim], q_full[:, head_dim:]
 
     if total == expected_q:
+        _diag_print("qwen35_split", "mode=query_only", "num_heads=", int(num_heads), "head_dim=", int(head_dim), "total=", total)
         q = proj.reshape(int(num_heads), int(head_dim))
         gate = np.ones_like(q, dtype=np.float32)
         return q, gate
@@ -501,6 +602,7 @@ def _split_qwen35_q_and_gate(q_proj: "np.ndarray", num_heads: int, head_dim: int
         return q, gate
 
     per_head = max(1, total // int(num_heads))
+    _diag_print("qwen35_split", "mode=fallback", "num_heads=", int(num_heads), "head_dim=", int(head_dim), "total=", total, "per_head=", per_head)
     trimmed = proj[: per_head * int(num_heads)].reshape(int(num_heads), per_head)
     q = np.zeros((int(num_heads), int(head_dim)), dtype=np.float32)
     copy_q = min(int(head_dim), per_head)
@@ -773,6 +875,7 @@ class GenericTransformerRuntime:
         logits = self._forward_token(int(token_ids[-1]), return_logits=True)
         if logits is None or logits.size == 0:
             return []
+        _diag_logits_once("generic", int(self.position), logits)
         return logits.astype(float, copy=False).tolist()
 
     def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
@@ -909,6 +1012,7 @@ class GPT2Runtime:
         logits = self._forward_token(int(token_ids[-1]), return_logits=True)
         if logits is None or logits.size == 0:
             return []
+        _diag_logits_once("gpt2", int(self.position), logits)
         return logits.astype(float, copy=False).tolist()
 
     def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
@@ -1180,6 +1284,7 @@ class Qwen35Runtime:
         logits = self._forward_token(int(token_ids[-1]), return_logits=True)
         if logits is None or logits.size == 0:
             return []
+        _diag_logits_once("qwen35", int(self.position), logits)
         return logits.astype(float, copy=False).tolist()
 
     def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
@@ -1306,6 +1411,8 @@ class GenericTransformerRuntimeTorch:
             logits = self._forward_token(int(token_ids[-1]), return_logits=True)
         if logits is None or logits.numel() == 0:
             return []
+        if np is not None:
+            _diag_logits_once("generic_torch", int(self.position), logits.detach().cpu().numpy().astype(np.float32, copy=False))
         return logits.cpu().tolist()
 
     def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
@@ -1409,8 +1516,11 @@ def runtime_load_reason(weight_index: dict[str, WeightInfo], embed_names: list[s
 def _load_pair(weight_index: dict[str, WeightInfo], embed_names: list[str], lm_head_names: list[str]) -> Optional[SimpleRuntime]:
     embed_info = _select_weight(weight_index, embed_names)
     lm_head_info = _select_weight(weight_index, lm_head_names)
-    if not embed_info or not lm_head_info:
+    if not embed_info:
         return None
+    if lm_head_info is None:
+        # Many modern checkpoints tie output projection to token embeddings.
+        lm_head_info = embed_info
 
     embed = _load_tensor(embed_info)
     lm_head = _load_tensor(lm_head_info)
@@ -1813,6 +1923,8 @@ def _load_qwen35_runtime(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[Qwen35Runtime]:
     try:
+        if _validate_config_or_warn(config, "qwen35"):
+            return None
         embed = _load_pair(
             weight_index,
             ["model.embed_tokens.weight", "token_embd.weight"],
@@ -1875,6 +1987,17 @@ def _load_qwen35_runtime(
                 progress_cb("layer_load", idx + 1, num_layers)
         if not layers:
             return None
+
+        if _diag_enabled():
+            l0 = layers[0]
+            _diag_print(
+                "qwen35_layer0_shapes",
+                "wq=", (None if l0.wq is None else tuple(int(v) for v in l0.wq.shape)),
+                "wk=", (None if l0.wk is None else tuple(int(v) for v in l0.wk.shape)),
+                "wv=", (None if l0.wv is None else tuple(int(v) for v in l0.wv.shape)),
+                "wo=", (None if l0.wo is None else tuple(int(v) for v in l0.wo.shape)),
+                "wqkv=", (None if l0.wqkv is None else tuple(int(v) for v in l0.wqkv.shape)),
+            )
 
         lm_head = embed.lm_head
         hidden = int(embed.embed.shape[1])
@@ -2008,6 +2131,8 @@ def _load_gpt2_runtime(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[GPT2Runtime]:
     try:
+        if _validate_config_or_warn(config, "gpt2"):
+            return None
         embed = _load_first_available(weight_index, "transformer.wte.weight")
         pos_embed = _load_first_available(weight_index, "transformer.wpe.weight")
         lm_head = _load_first_available(weight_index, "lm_head.weight")
@@ -2111,6 +2236,8 @@ def _load_generic_transformer(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> Optional[GenericTransformerRuntime]:
     try:
+        if _validate_config_or_warn(config, "generic"):
+            return None
         embed = _load_pair(
             weight_index,
             [
@@ -2254,6 +2381,8 @@ def _load_generic_transformer_torch(
     if torch is None:
         return None
     try:
+        if _validate_config_or_warn(config, "generic"):
+            return None
         embed_info = _select_weight(weight_index, [
             "model.embed_tokens.weight",
             "tok_embeddings.weight",
@@ -2426,6 +2555,17 @@ def build_generic_runtime(
     quant_policy = resolve_quantization_source_policy(weight_index)
     runtime_config = runtime_target.config
     model_type = runtime_target.runtime_name
+    _diag_print(
+        "route",
+        "runtime=", model_type,
+        "reason=", runtime_target.reason,
+        "warnings=", ";".join(runtime_target.warnings),
+        "model_type=", str(runtime_config.get("model_type", "")),
+        "hidden=", int(runtime_config.get("hidden_size", 0) or 0),
+        "layers=", int(runtime_config.get("num_hidden_layers", 0) or 0),
+        "heads=", int(runtime_config.get("num_attention_heads", 0) or 0),
+        "head_dim=", int(runtime_config.get("head_dim", 0) or 0),
+    )
     if model_type == "gpt2":
         return _load_gpt2_runtime(
             runtime_config,

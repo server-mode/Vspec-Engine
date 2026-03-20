@@ -173,10 +173,15 @@ def _debug_compare_int4_kernel(
 
 def _quantize_rowwise_int4(weight: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"]:
     w = weight.astype(np.float32, copy=False)
-    max_abs = np.max(np.abs(w), axis=1)
-    scales = np.where(max_abs > 0.0, max_abs / 7.0, 1.0).astype(np.float32, copy=False)
-    q = np.clip(np.round(w / scales[:, None]), -8.0, 7.0).astype(np.int8, copy=False)
-    zero_points = np.mean(q.astype(np.float32, copy=False), axis=1).astype(np.float32, copy=False)
+    min_q = -8.0
+    max_q = 7.0
+    row_min = np.min(w, axis=1)
+    row_max = np.max(w, axis=1)
+    row_span = np.maximum(row_max - row_min, 1e-8)
+    scales = (row_span / (max_q - min_q)).astype(np.float32, copy=False)
+    zero_points = np.round(min_q - (row_min / scales)).astype(np.float32, copy=False)
+    zero_points = np.clip(zero_points, min_q, max_q).astype(np.float32, copy=False)
+    q = np.clip(np.round((w / scales[:, None]) + zero_points[:, None]), min_q, max_q).astype(np.int8, copy=False)
     packed = _pack_signed_rowwise_int4(q)
     dequant = ((q.astype(np.float32, copy=False) - zero_points[:, None]) * scales[:, None]).astype(np.float32, copy=False)
     return packed, scales, zero_points, dequant
@@ -226,6 +231,7 @@ def _run_int4_kernel_selftest() -> bool:
 
         ref = (vec @ dequant.T).astype(np.float32, copy=False)
         got = fused_linear_int4(vec, packed, scales, n).astype(np.float32, copy=False)
+        got = _apply_rowwise_zero_point_correction(got, vec, scales, zero_points)
 
         denom = float(np.max(np.abs(ref)) + 1e-6)
         rel_max = float(np.max(np.abs(got - ref)) / denom)
