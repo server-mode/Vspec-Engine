@@ -93,6 +93,36 @@ def _entropy_from_logits(logits_obj) -> float:
         return 0.0
 
 
+def _resolve_budget_step_cap(
+    requested_steps: int,
+    decode_budget_seconds: float,
+    prefill_tokens: int,
+    layer_count: int,
+    lowbit_enabled: bool,
+    fused_bits: int,
+) -> int:
+    if requested_steps <= 0:
+        return 1
+    if decode_budget_seconds <= 0.0:
+        return int(requested_steps)
+
+    # Conservative latency estimate (seconds/token) to keep decode within budget.
+    token_latency = 0.012 + (0.0018 * float(max(1, int(layer_count))))
+    if lowbit_enabled and int(fused_bits) in {3, 4}:
+        token_latency += 0.040
+    elif lowbit_enabled:
+        token_latency += 0.025
+    if int(prefill_tokens) >= 256:
+        token_latency *= 1.12
+    token_latency = max(0.010, min(2.000, token_latency))
+
+    reserve = max(3.0, min(20.0, float(decode_budget_seconds) * 0.15))
+    usable = max(0.5, float(decode_budget_seconds) - reserve)
+    cap = int(usable / token_latency)
+    cap = max(12, cap)
+    return max(1, min(int(requested_steps), cap))
+
+
 def _detect_lang(prompt: str) -> str:
     lower = prompt.lower()
     vi_chars = "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ"
@@ -1204,6 +1234,20 @@ def main() -> None:
             auto_budget = max(auto_budget, 60.0)
         decode_budget_seconds = min(240.0, max(20.0, auto_budget))
     print(f"[vspec-chat] decode_budget_seconds= {decode_budget_seconds:.1f}")
+    lowbit_plan = getattr(runtime, "lowbit_plan", None) if runtime is not None else None
+    lowbit_enabled = bool(getattr(lowbit_plan, "enabled", False))
+    fused_bits_runtime = int(getattr(runtime, "fused_bits", args.fused_bits) or args.fused_bits) if runtime is not None else int(args.fused_bits)
+    decode_step_cap = _resolve_budget_step_cap(
+        requested_steps=max_steps,
+        decode_budget_seconds=decode_budget_seconds,
+        prefill_tokens=max(0, len(token_ids) - 1),
+        layer_count=len(getattr(runtime, "layers", []) or []) if runtime is not None else 0,
+        lowbit_enabled=lowbit_enabled,
+        fused_bits=fused_bits_runtime,
+    )
+    if decode_step_cap != int(max_steps):
+        print(f"[vspec-chat] decode_step_cap= {decode_step_cap} (requested={int(max_steps)})")
+    max_steps = decode_step_cap
     core_decode = CoreDecodeSession.from_runtime(runtime, max_steps)
     scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
     if scheduler_enabled:

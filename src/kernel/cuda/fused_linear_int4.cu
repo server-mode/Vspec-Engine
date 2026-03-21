@@ -142,11 +142,13 @@ __global__ __launch_bounds__(256) static void fused_int4_kernel_tiled(
     const float* a,
     const uint8_t* b_packed,
     const float* scales,
+    const float* zero_points,
     float* c,
     size_t m,
     size_t n,
     size_t k,
-    size_t packed_k
+    size_t packed_k,
+    size_t n_blocks
 ) {
     const int TILE_M = 16;
     const int TILE_N = 16;
@@ -184,7 +186,12 @@ __global__ __launch_bounds__(256) static void fused_int4_kernel_tiled(
                 const uint8_t byte = b_row[g_k >> 1U];
                 const uint8_t nibble = (g_k & 1U) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
                 const int8_t wq = (nibble & 0x08) ? (int8_t)(nibble - 16) : (int8_t)nibble;
-                w = (float)wq * scales[g_j];
+                const size_t block_id = (n_blocks > 1U) ? ((g_k * n_blocks) / k) : 0U;
+                const size_t sb = (block_id < n_blocks) ? block_id : (n_blocks - 1U);
+                const size_t idx = g_j * n_blocks + sb;
+                const float scale = scales[idx];
+                const float zp = (zero_points != NULL) ? zero_points[idx] : 0.0f;
+                w = ((float)wq - zp) * scale;
             }
             sB[r][c_local] = w;
         }
@@ -209,10 +216,12 @@ __global__ __launch_bounds__(256) static void fused_int4_kernel_tiled(
 __global__ static void dequant_int4_rowwise_kernel(
     const uint8_t* b_packed,
     const float* scales,
+    const float* zero_points,
     float* w_f32,
     size_t n,
     size_t k,
-    size_t packed_k
+    size_t packed_k,
+    size_t n_blocks
 ) {
     const size_t row = (size_t)(blockIdx.y * blockDim.y + threadIdx.y);
     const size_t packed_col = (size_t)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -222,25 +231,39 @@ __global__ static void dequant_int4_rowwise_kernel(
 
     const size_t base_packed = row * packed_k;
     const uint8_t byte = b_packed[base_packed + packed_col];
-    const float scale = scales[row];
-
     const size_t t0 = packed_col * 2U;
     const size_t t1 = t0 + 1U;
+
+    size_t block_id0 = (n_blocks > 1U) ? ((t0 * n_blocks) / k) : 0U;
+    if (block_id0 >= n_blocks) {
+        block_id0 = n_blocks - 1U;
+    }
+    const size_t idx0 = row * n_blocks + block_id0;
+    const float scale0 = scales[idx0];
+    const float zp0 = (zero_points != NULL) ? zero_points[idx0] : 0.0f;
 
     int8_t q0 = (int8_t)(byte & 0x0F);
     if (q0 >= 8) {
         q0 = (int8_t)(q0 - 16);
     }
     if (t0 < k) {
-        w_f32[row * k + t0] = (float)q0 * scale;
+        w_f32[row * k + t0] = ((float)q0 - zp0) * scale0;
     }
+
+    size_t block_id1 = (n_blocks > 1U) ? ((t1 * n_blocks) / k) : 0U;
+    if (block_id1 >= n_blocks) {
+        block_id1 = n_blocks - 1U;
+    }
+    const size_t idx1 = row * n_blocks + block_id1;
+    const float scale1 = scales[idx1];
+    const float zp1 = (zero_points != NULL) ? zero_points[idx1] : 0.0f;
 
     int8_t q1 = (int8_t)((byte >> 4) & 0x0F);
     if (q1 >= 8) {
         q1 = (int8_t)(q1 - 16);
     }
     if (t1 < k) {
-        w_f32[row * k + t1] = (float)q1 * scale;
+        w_f32[row * k + t1] = ((float)q1 - zp1) * scale1;
     }
 }
 
@@ -253,13 +276,18 @@ extern "C" void vspec_cuda_fused_linear_int4_device(
     const float* d_a,
     const unsigned char* d_b_packed,
     const float* d_scales,
+    const float* d_zero_points,
     float* d_c,
     size_t m,
     size_t n,
-    size_t k
+    size_t k,
+    size_t n_blocks
 ) {
     if (!d_a || !d_b_packed || !d_scales || !d_c || m == 0U || n == 0U || k == 0U) {
         return;
+    }
+    if (n_blocks == 0U) {
+        n_blocks = 1U;
     }
     const size_t packed_k = (k + 1U) / 2U;
     size_t block_x = vspec_env_size_or_default("VSPEC_INT4_BLOCK_X", 16U);
@@ -271,23 +299,28 @@ extern "C" void vspec_cuda_fused_linear_int4_device(
 
     dim3 block((unsigned)block_x, (unsigned)block_y);
     dim3 grid((unsigned)((n + 15U) / 16U), (unsigned)((m + 15U) / 16U));
-    fused_int4_kernel_tiled<<<grid, block>>>(d_a, d_b_packed, d_scales, d_c, m, n, k, packed_k);
+    fused_int4_kernel_tiled<<<grid, block>>>(d_a, d_b_packed, d_scales, d_zero_points, d_c, m, n, k, packed_k, n_blocks);
 }
 
 extern "C" void vspec_cuda_dequant_int4_to_f32_device(
     const unsigned char* d_b_packed,
     const float* d_scales,
+    const float* d_zero_points,
     float* d_w_f32,
     size_t n,
-    size_t k
+    size_t k,
+    size_t n_blocks
 ) {
     if (!d_b_packed || !d_scales || !d_w_f32 || n == 0U || k == 0U) {
         return;
     }
+    if (n_blocks == 0U) {
+        n_blocks = 1U;
+    }
     const size_t packed_k = (k + 1U) / 2U;
     dim3 block(128, 1);
     dim3 grid((unsigned)((packed_k + block.x - 1U) / block.x), (unsigned)n);
-    dequant_int4_rowwise_kernel<<<grid, block>>>(d_b_packed, d_scales, d_w_f32, n, k, packed_k);
+    dequant_int4_rowwise_kernel<<<grid, block>>>(d_b_packed, d_scales, d_zero_points, d_w_f32, n, k, packed_k, n_blocks);
 }
 
 extern "C" void vspec_cuda_expand_int3_to_int4_device(
@@ -388,7 +421,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
         d_input = d_a_clamped;
     }
 
-    vspec_cuda_fused_linear_int4_device(d_input, d_b, d_s, d_c, m, n, k);
+    vspec_cuda_fused_linear_int4_device(d_input, d_b, d_s, NULL, d_c, m, n, k, 1U);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);
@@ -487,7 +520,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
         d_input = d_a_clamped;
     }
 
-    vspec_cuda_fused_linear_int4_device(d_input, d_b4, d_s, d_c, m, n, k);
+    vspec_cuda_fused_linear_int4_device(d_input, d_b4, d_s, NULL, d_c, m, n, k, 1U);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);

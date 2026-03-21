@@ -403,17 +403,59 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
         row_min = np.quantile(w, lo_q, axis=1)
         row_max = np.quantile(w, percentile, axis=1)
 
-    row_span = np.maximum(row_max - row_min, 1e-8)
     levels = max(1.0, max_q - min_q)
-    scales = (row_span / levels).astype(np.float32, copy=False)
 
-    zero_points = np.round(min_q - (row_min / scales)).astype(np.float32, copy=False)
-    zero_points = np.clip(zero_points, min_q, max_q).astype(np.float32, copy=False)
+    # Int4 default path: block-wise quantization (Q4_K-like granularity) to reduce outlier damage.
+    # This materially improves factual stability vs coarse per-row scaling.
+    blockwise_int4 = bits == 4 and os.getenv("VSPEC_INT4_BLOCKWISE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if blockwise_int4:
+        block_size_raw = os.getenv("VSPEC_INT4_BLOCK_SIZE", "32").strip()
+        try:
+            block_size = max(8, int(block_size_raw))
+        except Exception:
+            block_size = 32
+        n, k = w.shape
+        n_blocks = (k + block_size - 1) // block_size
+        scales_2d = np.empty((n, n_blocks), dtype=np.float32)
+        zero_points_2d = np.empty((n, n_blocks), dtype=np.float32)
+        q = np.empty((n, k), dtype=np.int8)
 
-    q = np.round((w / scales[:, None]) + zero_points[:, None])
-    q = np.clip(q, min_q, max_q).astype(np.int8, copy=False)
+        for b in range(n_blocks):
+            s0 = b * block_size
+            s1 = min(k, s0 + block_size)
+            wb = w[:, s0:s1]
+            if percentile >= 0.9999:
+                b_min = np.min(wb, axis=1)
+                b_max = np.max(wb, axis=1)
+            else:
+                b_min = np.quantile(wb, lo_q, axis=1)
+                b_max = np.quantile(wb, percentile, axis=1)
+            b_span = np.maximum(b_max - b_min, 1e-8)
+            b_scale = (b_span / levels).astype(np.float32, copy=False)
+            b_zp = np.round(min_q - (b_min / b_scale)).astype(np.float32, copy=False)
+            b_zp = np.clip(b_zp, min_q, max_q).astype(np.float32, copy=False)
 
-    packed = _pack_signed_rowwise(q, bits)
+            qb = np.round((wb / b_scale[:, None]) + b_zp[:, None])
+            qb = np.clip(qb, min_q, max_q).astype(np.int8, copy=False)
+
+            q[:, s0:s1] = qb
+            scales_2d[:, b] = b_scale
+            zero_points_2d[:, b] = b_zp
+
+        packed = _pack_signed_rowwise(q, bits)
+        scales = scales_2d.reshape(-1)
+        zero_points = zero_points_2d.reshape(-1)
+    else:
+        row_span = np.maximum(row_max - row_min, 1e-8)
+        scales = (row_span / levels).astype(np.float32, copy=False)
+
+        zero_points = np.round(min_q - (row_min / scales)).astype(np.float32, copy=False)
+        zero_points = np.clip(zero_points, min_q, max_q).astype(np.float32, copy=False)
+
+        q = np.round((w / scales[:, None]) + zero_points[:, None])
+        q = np.clip(q, min_q, max_q).astype(np.int8, copy=False)
+        packed = _pack_signed_rowwise(q, bits)
+
     if bits not in {3, 4}:
         zero_points = None
     return packed, scales, zero_points
@@ -436,7 +478,15 @@ def _packed_cache_key(prefix: str, key: str, bits: int, w: "np.ndarray") -> str:
     head = np.ascontiguousarray(flat[:512], dtype=np.float32)
     tail = np.ascontiguousarray(flat[-512:], dtype=np.float32)
     digest = hashlib.sha1(head.tobytes() + tail.tobytes()).hexdigest()[:16]
-    return f"{prefix}{key}.b{bits}.{w.shape[0]}x{w.shape[1]}.{digest}"
+    mode = "row"
+    if bits == 4 and os.getenv("VSPEC_INT4_BLOCKWISE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        block_size_raw = os.getenv("VSPEC_INT4_BLOCK_SIZE", "32").strip()
+        try:
+            block_size = max(8, int(block_size_raw))
+        except Exception:
+            block_size = 32
+        mode = f"blk{block_size}"
+    return f"{prefix}{key}.b{bits}.{mode}.{w.shape[0]}x{w.shape[1]}.{digest}"
 
 
 def _load_packed_cache(cache_key: str) -> tuple["np.ndarray", "np.ndarray", "np.ndarray | None"] | None:

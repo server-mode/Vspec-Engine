@@ -141,27 +141,37 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
   const float* input,
   const unsigned char* packed_weight,
   const float* scales,
+  const float* zero_points,
   size_t m,
   size_t k,
   size_t n,
+  size_t n_blocks,
   float* output
 ) {
   if (!input || !packed_weight || !scales || !output || m == 0 || k == 0 || n == 0) {
     return 0;
   }
+  if (n_blocks == 0U) {
+    n_blocks = 1U;
+  }
   typedef struct Cache4 {
     const unsigned char* host_w;
     const float* host_s;
+    const float* host_zp;
     unsigned char* d_w;
     float* d_s;
+    float* d_zp;
     float* d_w_f32;
     size_t bytes_w;
     size_t bytes_s;
+    size_t bytes_zp;
     size_t bytes_w_f32;
     size_t n;
     size_t k;
+    size_t n_blocks;
     uint64_t fp_w;
     uint64_t fp_s;
+    uint64_t fp_zp;
     uint64_t last_used;
   } Cache4;
   static const size_t kCacheCap4 = 128U;
@@ -178,11 +188,13 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
 
   const size_t packed_k = (k + 1U) / 2U;
   const size_t bytes_w = n * packed_k * sizeof(unsigned char);
-  const size_t bytes_s = n * sizeof(float);
+  const size_t bytes_s = n * n_blocks * sizeof(float);
+  const size_t bytes_zp = n * n_blocks * sizeof(float);
   const size_t bytes_in = m * k * sizeof(float);
   const size_t bytes_out = m * n * sizeof(float);
   const uint64_t fp_w = vspec_hash_sample_bytes(packed_weight, bytes_w, 128U);
   const uint64_t fp_s = vspec_hash_sample_bytes(scales, bytes_s, 64U);
+  const uint64_t fp_zp = vspec_hash_sample_bytes(zero_points, bytes_zp, 64U);
 
   Cache4* entry = NULL;
   Cache4* stale_entry = NULL;
@@ -206,14 +218,15 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
 #endif
 
   for (size_t i = 0; i < cache_count; ++i) {
-    if (cache[i].host_w == packed_weight && cache[i].host_s == scales &&
+    if (cache[i].host_w == packed_weight && cache[i].host_s == scales && cache[i].host_zp == zero_points &&
         cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s &&
-        cache[i].fp_w == fp_w && cache[i].fp_s == fp_s) {
+        cache[i].bytes_zp == bytes_zp &&
+        cache[i].fp_w == fp_w && cache[i].fp_s == fp_s && cache[i].fp_zp == fp_zp) {
       entry = &cache[i];
       break;
     }
-    if (cache[i].host_w == packed_weight && cache[i].host_s == scales &&
-        cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s) {
+    if (cache[i].host_w == packed_weight && cache[i].host_s == scales && cache[i].host_zp == zero_points &&
+        cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s && cache[i].bytes_zp == bytes_zp) {
       stale_entry = &cache[i];
     }
   }
@@ -236,25 +249,36 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
     }
     if (entry->d_w) cudaFree(entry->d_w);
     if (entry->d_s) cudaFree(entry->d_s);
+    if (entry->d_zp) cudaFree(entry->d_zp);
     if (entry->d_w_f32) cudaFree(entry->d_w_f32);
     memset(entry, 0, sizeof(*entry));
     entry->host_w = packed_weight;
     entry->host_s = scales;
+    entry->host_zp = zero_points;
     entry->bytes_w = bytes_w;
     entry->bytes_s = bytes_s;
+    entry->bytes_zp = bytes_zp;
     entry->bytes_w_f32 = n * k * sizeof(float);
     entry->n = n;
     entry->k = k;
+    entry->n_blocks = n_blocks;
     entry->fp_w = fp_w;
     entry->fp_s = fp_s;
+    entry->fp_zp = fp_zp;
     if (cudaMalloc((void**)&entry->d_w, bytes_w) != cudaSuccess) return 0;
     if (cudaMalloc((void**)&entry->d_s, bytes_s) != cudaSuccess) return 0;
+    if (cudaMalloc((void**)&entry->d_zp, bytes_zp) != cudaSuccess) return 0;
     if (cudaMemcpy(entry->d_w, packed_weight, bytes_w, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     if (cudaMemcpy(entry->d_s, scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (zero_points) {
+      if (cudaMemcpy(entry->d_zp, zero_points, bytes_zp, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    } else {
+      if (cudaMemset(entry->d_zp, 0, bytes_zp) != cudaSuccess) return 0;
+    }
 
     if (use_dequant_cublas) {
       if (cudaMalloc((void**)&entry->d_w_f32, entry->bytes_w_f32) != cudaSuccess) return 0;
-      vspec_cuda_dequant_int4_to_f32_device(entry->d_w, entry->d_s, entry->d_w_f32, n, k);
+      vspec_cuda_dequant_int4_to_f32_device(entry->d_w, entry->d_s, entry->d_zp, entry->d_w_f32, n, k, n_blocks);
       if (cudaDeviceSynchronize() != cudaSuccess) return 0;
     }
   }
@@ -265,7 +289,7 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
     entry->n = n;
     entry->k = k;
     if (cudaMalloc((void**)&entry->d_w_f32, entry->bytes_w_f32) != cudaSuccess) return 0;
-    vspec_cuda_dequant_int4_to_f32_device(entry->d_w, entry->d_s, entry->d_w_f32, n, k);
+    vspec_cuda_dequant_int4_to_f32_device(entry->d_w, entry->d_s, entry->d_zp, entry->d_w_f32, n, k, n_blocks);
     if (cudaDeviceSynchronize() != cudaSuccess) return 0;
   }
 
@@ -312,11 +336,11 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
     );
     if (st != CUBLAS_STATUS_SUCCESS) return 0;
   } else {
-    vspec_cuda_fused_linear_int4_device(d_in, entry->d_w, entry->d_s, d_out, m, n, k);
+    vspec_cuda_fused_linear_int4_device(d_in, entry->d_w, entry->d_s, entry->d_zp, d_out, m, n, k, n_blocks);
   }
 #else
   (void)use_dequant_cublas;
-  vspec_cuda_fused_linear_int4_device(d_in, entry->d_w, entry->d_s, d_out, m, n, k);
+  vspec_cuda_fused_linear_int4_device(d_in, entry->d_w, entry->d_s, entry->d_zp, d_out, m, n, k, n_blocks);
 #endif
 
   if (cudaMemcpy(output, d_out, bytes_out, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;

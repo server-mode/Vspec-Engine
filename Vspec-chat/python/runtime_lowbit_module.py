@@ -103,17 +103,29 @@ def _unpack_int4_rowwise(
     scales_flat = np.ascontiguousarray(scales.reshape(-1), dtype=np.float32)
     packed_k = (k + 1) // 2
     expected = out_n * packed_k
-    if packed_flat.size < expected or scales_flat.size < out_n:
+    if packed_flat.size < expected:
         raise ValueError("invalid packed/scales shape for int4 unpack")
+
+    # Row-wise layout: scales=[out_n], zero_points=[out_n]
+    # Block-wise layout: scales=[out_n*n_blocks], zero_points=[out_n*n_blocks]
+    n_blocks = 1
+    if out_n > 0 and scales_flat.size >= out_n and (scales_flat.size % out_n) == 0:
+        n_blocks = max(1, int(scales_flat.size // out_n))
+    if scales_flat.size < out_n * n_blocks:
+        raise ValueError("invalid scales shape for int4 unpack")
+
+    block_size = max(1, (k + n_blocks - 1) // n_blocks)
 
     w = np.zeros((out_n, k), dtype=np.float32)
     for j in range(out_n):
         base = j * packed_k
-        scale = float(scales_flat[j])
-        zp = 0.0
-        if zero_points is not None and zero_points.size > j:
-            zp = float(zero_points[j])
         for t in range(k):
+            blk = min(n_blocks - 1, t // block_size)
+            s_idx = j * n_blocks + blk
+            scale = float(scales_flat[s_idx])
+            zp = 0.0
+            if zero_points is not None and zero_points.size > s_idx:
+                zp = float(zero_points[s_idx])
             byte = int(packed_flat[base + (t >> 1)])
             nibble = ((byte >> 4) & 0x0F) if (t & 1) else (byte & 0x0F)
             if nibble >= 8:
@@ -158,11 +170,10 @@ def _debug_compare_int4_kernel(
         k = int(vec_np.shape[-1])
         w_deq = _unpack_int4_rowwise(packed_w, scales, int(out_n), k, zero_points=zero_points)
         ref = np.ascontiguousarray(vec_np @ w_deq.T, dtype=np.float32)
-        got = np.ascontiguousarray(fused_linear_int4(vec_np, packed_w, scales, int(out_n)), dtype=np.float32)
-        if zero_points is not None and zero_points.size == int(out_n):
-            vec_sum = np.sum(vec_np.astype(np.float32, copy=False), axis=-1, keepdims=True)
-            zp_scale = np.ascontiguousarray(zero_points.astype(np.float32, copy=False) * scales.astype(np.float32, copy=False))
-            got = got - (vec_sum * zp_scale[None, :])
+        got = np.ascontiguousarray(
+            fused_linear_int4(vec_np, packed_w, scales, int(out_n), zero_points=zero_points),
+            dtype=np.float32,
+        )
         err_abs = float(np.max(np.abs(ref - got)))
         denom = float(np.max(np.abs(ref)) + 1e-6)
         err_rel = float(err_abs / denom)
@@ -200,11 +211,19 @@ def _apply_rowwise_zero_point_correction(output, vec, scales: "np.ndarray", zero
         v = np.ascontiguousarray(vec.astype(np.float32, copy=False))
         if v.ndim == 1:
             v = v[None, :]
-        vec_sum = np.sum(v, axis=-1, keepdims=True)
-        corr = vec_sum * (s * zp)[None, :]
         out = np.ascontiguousarray(output.astype(np.float32, copy=False))
         if out.ndim == 1:
             out = out[None, :]
+
+        out_n = int(out.shape[-1]) if out.ndim >= 2 else int(out.shape[0])
+        # Block-wise layout is corrected in-kernel (CUDA) or during CPU dequant ref path.
+        # Keep this post-correction only for legacy row-wise layout where scales match output rows.
+        if out_n <= 0 or s.size != out_n:
+            return output
+
+        vec_sum = np.sum(v, axis=-1, keepdims=True)
+        corr = vec_sum * (s * zp)[None, :]
+        if out.ndim == 1:
             return (out - corr)[0]
         return out - corr
     except Exception:
@@ -230,8 +249,7 @@ def _run_int4_kernel_selftest() -> bool:
         packed, scales, zero_points, dequant = _quantize_rowwise_int4(w)
 
         ref = (vec @ dequant.T).astype(np.float32, copy=False)
-        got = fused_linear_int4(vec, packed, scales, n).astype(np.float32, copy=False)
-        got = _apply_rowwise_zero_point_correction(got, vec, scales, zero_points)
+        got = fused_linear_int4(vec, packed, scales, n, zero_points=zero_points).astype(np.float32, copy=False)
 
         denom = float(np.max(np.abs(ref)) + 1e-6)
         rel_max = float(np.max(np.abs(got - ref)) / denom)
@@ -304,8 +322,7 @@ def lowbit_linear_project(
         if bits == 4 and fused_linear_int4_available():
             _debug_compare_int4_kernel(vec, packed_w, scales, out_n, layer_idx, key, zero_points=zero_points)
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
-            out = fused_linear_int4(vec, packed_w, scales, out_n)
-            out = _apply_rowwise_zero_point_correction(out, vec, scales, zero_points)
+            out = fused_linear_int4(vec, packed_w, scales, out_n, zero_points=zero_points)
             return _unwrap_single_batch(out)
         if bits == 3 and fused_linear_int3_available():
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1

@@ -166,6 +166,32 @@ def _generate(
         auto = decode_budget * 0.55
         return min(72.0, max(8.0, auto))
 
+    def _resolve_budget_step_cap(requested_steps: int, decode_budget_seconds: float, prefill_tokens: int, layer_count: int) -> int:
+        if requested_steps <= 0:
+            return 1
+        if decode_budget_seconds <= 0.0:
+            return int(requested_steps)
+
+        lowbit_plan = getattr(runtime, "lowbit_plan", None)
+        lowbit_enabled = bool(getattr(lowbit_plan, "enabled", False))
+        fused_bits = int(getattr(runtime, "fused_bits", 0) or 0)
+
+        # Conservative latency estimate (seconds/token) to prevent hard timeout loops.
+        token_latency = 0.012 + (0.0018 * float(max(1, int(layer_count))))
+        if lowbit_enabled and fused_bits in {3, 4}:
+            token_latency += 0.040
+        elif lowbit_enabled:
+            token_latency += 0.025
+        if int(prefill_tokens) >= 256:
+            token_latency *= 1.12
+        token_latency = max(0.010, min(2.000, token_latency))
+
+        reserve = max(3.0, min(20.0, decode_budget_seconds * 0.15))
+        usable = max(0.5, decode_budget_seconds - reserve)
+        cap = int(usable / token_latency)
+        cap = max(12, cap)
+        return max(1, min(int(requested_steps), cap))
+
     def _should_quality_retry(candidate: str) -> bool:
         repaired = assurance.repair(candidate, prompt)
         if _is_runtime_fallback_text(repaired, lang_mode):
@@ -446,8 +472,11 @@ def _generate(
     prefill_tokens = max(0, len(base_tokens) - 1)
     decode_budget = _resolve_decode_budget_seconds(prefill_tokens, layer_count)
     retry_budget = _resolve_retry_budget_seconds(decode_budget)
+    decode_step_cap = _resolve_budget_step_cap(max_tokens, decode_budget, prefill_tokens, layer_count)
     print(f"[session] decode_budget_seconds= {decode_budget:.1f}")
     print(f"[session] retry_budget_seconds= {retry_budget:.1f}")
+    if decode_step_cap != int(max_tokens):
+        print(f"[session] decode_step_cap= {decode_step_cap} (requested={int(max_tokens)})")
 
     effective_disable_structure_guard = bool(disable_structure_guard)
     if (not effective_disable_structure_guard) and prioritize_english and lang_mode == "en":
@@ -540,7 +569,7 @@ def _generate(
         local_no_repeat_ngram=no_repeat_ngram,
         local_stream=stream,
         decode_budget_seconds=decode_budget,
-        max_steps=max_tokens,
+        max_steps=decode_step_cap,
         disable_structure_guard_local=effective_disable_structure_guard,
     )
 
@@ -551,7 +580,7 @@ def _generate(
         rescue_rep = max(1.18, repetition_penalty)
         rescue_window = max(48, repeat_window)
         rescue_ngram = max(3, no_repeat_ngram)
-        rescue_steps = max(8, min(max_tokens, 64))
+        rescue_steps = max(8, min(decode_step_cap, 64))
 
         rescue_result = _run_native_safe_rescue(
             reason="decode-failure",
@@ -595,7 +624,7 @@ def _generate(
                 rescue_rep = max(1.20, repetition_penalty)
                 rescue_window = max(40, repeat_window)
                 rescue_ngram = max(3, no_repeat_ngram)
-                rescue_steps = max(12, min(48, max_tokens // 2 if max_tokens > 1 else 12))
+                rescue_steps = max(12, min(48, decode_step_cap // 2 if decode_step_cap > 1 else 12))
 
                 rescue_result = _run_native_safe_rescue(
                     reason="timeout",
@@ -665,7 +694,7 @@ def _generate(
 
         rescue_result = _run_native_safe_rescue(
             reason="quality",
-            decode_steps=max(8, min(max_tokens, 64)),
+            decode_steps=max(8, min(decode_step_cap, 64)),
             decode_temp=safe_temp,
             decode_top_k=safe_top_k,
             decode_lang_top_n=safe_lang_top_n,
@@ -676,7 +705,7 @@ def _generate(
         if rescue_result is None:
             rescue_result = _run_torch_rescue(
                 reason="quality",
-                decode_steps=max(8, min(max_tokens, 64)),
+                decode_steps=max(8, min(decode_step_cap, 64)),
                 decode_temp=safe_temp,
                 decode_top_k=safe_top_k,
                 decode_lang_top_n=safe_lang_top_n,
@@ -698,7 +727,7 @@ def _generate(
                 local_no_repeat_ngram=safe_ngram,
                 local_stream=False,
                 decode_budget_seconds=retry_budget,
-                max_steps=max(8, min(max_tokens, 64)),
+                max_steps=max(8, min(decode_step_cap, 64)),
                 disable_structure_guard_local=effective_disable_structure_guard,
             )
 

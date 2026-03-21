@@ -26,7 +26,8 @@ class ThreeBitRuntimeModule:
     def is_active(self) -> bool:
         if not self.enabled:
             return False
-        return self.fused_bits == 3 or self.target_bits == 3
+        # Only apply 3-bit sampling heuristics when execution is truly 3-bit.
+        return self.fused_bits == 3
 
     def tune_sampling(
         self,

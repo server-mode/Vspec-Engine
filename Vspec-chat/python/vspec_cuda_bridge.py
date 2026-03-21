@@ -121,6 +121,8 @@ if _lib is not None:
             POINTER(c_float),
             ctypes.POINTER(ctypes.c_ubyte),
             POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
             c_size_t,
             c_size_t,
             c_size_t,
@@ -392,7 +394,13 @@ def fused_linear_int3_available() -> bool:
     return _lib is not None and _HAS_FUSED_INT3
 
 
-def fused_linear_int4(input_array: np.ndarray, packed_weight: np.ndarray, scales: np.ndarray, n: int) -> np.ndarray:
+def fused_linear_int4(
+    input_array: np.ndarray,
+    packed_weight: np.ndarray,
+    scales: np.ndarray,
+    n: int,
+    zero_points: np.ndarray | None = None,
+) -> np.ndarray:
     if _lib is None or not _HAS_FUSED_INT4:
         raise RuntimeError("vspec_cuda_bridge.dll not found")
     if input_array.dtype != np.float32:
@@ -401,6 +409,10 @@ def fused_linear_int4(input_array: np.ndarray, packed_weight: np.ndarray, scales
         packed_weight = packed_weight.astype(np.uint8)
     if scales.dtype != np.float32:
         scales = scales.astype(np.float32)
+    if zero_points is None:
+        zero_points = np.zeros((n,), dtype=np.float32)
+    elif zero_points.dtype != np.float32:
+        zero_points = zero_points.astype(np.float32)
 
     if input_array.ndim == 1:
         input_array = input_array[None, :]
@@ -408,16 +420,22 @@ def fused_linear_int4(input_array: np.ndarray, packed_weight: np.ndarray, scales
     input_array = np.ascontiguousarray(input_array)
     packed_weight = np.ascontiguousarray(packed_weight)
     scales = np.ascontiguousarray(scales)
+    zero_points = np.ascontiguousarray(zero_points)
 
     m, k = input_array.shape
+    n_blocks = 1
+    if int(n) > 0 and int(scales.size) >= int(n) and (int(scales.size) % int(n)) == 0:
+        n_blocks = max(1, int(scales.size // int(n)))
     output = np.empty((m, n), dtype=np.float32)
     ok = _lib.vspec_cuda_fused_linear_int4_bridge(
         input_array.ctypes.data_as(POINTER(c_float)),
         packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
         scales.ctypes.data_as(POINTER(c_float)),
+        zero_points.ctypes.data_as(POINTER(c_float)),
         c_size_t(m),
         c_size_t(k),
         c_size_t(n),
+        c_size_t(n_blocks),
         output.ctypes.data_as(POINTER(c_float)),
     )
     if ok != 1:

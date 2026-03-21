@@ -60,9 +60,9 @@ def _resolve_family_defaults(model_family: str) -> RuntimeStabilityProfile:
             attention_logit_clip=20.0,
             residual_feedback_gain=0.06,
             residual_clamp_alpha=0.0,
-            logit_entropy_target=5.6,
-            logit_margin_floor=0.10,
-            logit_margin_gain=0.28,
+            logit_entropy_target=0.0,
+            logit_margin_floor=0.0,
+            logit_margin_gain=0.0,
             ssm_warmup_tokens=0,
         )
     if family == "qwen":
@@ -70,9 +70,9 @@ def _resolve_family_defaults(model_family: str) -> RuntimeStabilityProfile:
             attention_logit_clip=24.0,
             residual_feedback_gain=0.10,
             residual_clamp_alpha=0.0,
-            logit_entropy_target=7.0,
-            logit_margin_floor=0.18,
-            logit_margin_gain=0.55,
+            logit_entropy_target=0.0,
+            logit_margin_floor=0.0,
+            logit_margin_gain=0.0,
             ssm_warmup_tokens=0,
         )
     if family == "llama":
@@ -80,9 +80,9 @@ def _resolve_family_defaults(model_family: str) -> RuntimeStabilityProfile:
             attention_logit_clip=22.0,
             residual_feedback_gain=0.08,
             residual_clamp_alpha=0.0,
-            logit_entropy_target=6.8,
-            logit_margin_floor=0.14,
-            logit_margin_gain=0.45,
+            logit_entropy_target=0.0,
+            logit_margin_floor=0.0,
+            logit_margin_gain=0.0,
             ssm_warmup_tokens=0,
         )
     if family == "qwen35":
@@ -90,18 +90,18 @@ def _resolve_family_defaults(model_family: str) -> RuntimeStabilityProfile:
             attention_logit_clip=24.0,
             residual_feedback_gain=0.12,
             residual_clamp_alpha=0.0,
-            logit_entropy_target=7.5,
-            logit_margin_floor=0.20,
-            logit_margin_gain=0.60,
+            logit_entropy_target=0.0,
+            logit_margin_floor=0.0,
+            logit_margin_gain=0.0,
             ssm_warmup_tokens=8,
         )
     return RuntimeStabilityProfile(
         attention_logit_clip=22.0,
         residual_feedback_gain=0.08,
         residual_clamp_alpha=0.0,
-        logit_entropy_target=6.5,
-        logit_margin_floor=0.12,
-        logit_margin_gain=0.40,
+        logit_entropy_target=0.0,
+        logit_margin_floor=0.0,
+        logit_margin_gain=0.0,
         ssm_warmup_tokens=0,
     )
 
