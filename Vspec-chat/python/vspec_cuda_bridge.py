@@ -34,6 +34,7 @@ def _load_lib() -> ctypes.CDLL | None:
 _lib = _load_lib()
 _HAS_FUSED_INT4 = False
 _HAS_FUSED_INT3 = False
+_INT4_BRIDGE_ABI = "unknown"
 
 if _lib is not None:
     _lib.vspec_cuda_rmsnorm_f32_bridge.argtypes = [
@@ -401,6 +402,7 @@ def fused_linear_int4(
     n: int,
     zero_points: np.ndarray | None = None,
 ) -> np.ndarray:
+    global _INT4_BRIDGE_ABI
     if _lib is None or not _HAS_FUSED_INT4:
         raise RuntimeError("vspec_cuda_bridge.dll not found")
     if input_array.dtype != np.float32:
@@ -427,19 +429,78 @@ def fused_linear_int4(
     if int(n) > 0 and int(scales.size) >= int(n) and (int(scales.size) % int(n)) == 0:
         n_blocks = max(1, int(scales.size // int(n)))
     output = np.empty((m, n), dtype=np.float32)
-    ok = _lib.vspec_cuda_fused_linear_int4_bridge(
-        input_array.ctypes.data_as(POINTER(c_float)),
-        packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
-        scales.ctypes.data_as(POINTER(c_float)),
-        zero_points.ctypes.data_as(POINTER(c_float)),
-        c_size_t(m),
-        c_size_t(k),
-        c_size_t(n),
-        c_size_t(n_blocks),
-        output.ctypes.data_as(POINTER(c_float)),
-    )
-    if ok != 1:
+
+    bridge = _lib.vspec_cuda_fused_linear_int4_bridge
+
+    def _call_new_abi() -> int:
+        bridge.argtypes = [
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        bridge.restype = c_int
+        return bridge(
+            input_array.ctypes.data_as(POINTER(c_float)),
+            packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+            scales.ctypes.data_as(POINTER(c_float)),
+            zero_points.ctypes.data_as(POINTER(c_float)),
+            c_size_t(m),
+            c_size_t(k),
+            c_size_t(n),
+            c_size_t(n_blocks),
+            output.ctypes.data_as(POINTER(c_float)),
+        )
+
+    def _call_legacy_abi() -> int:
+        bridge.argtypes = [
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        bridge.restype = c_int
+        return bridge(
+            input_array.ctypes.data_as(POINTER(c_float)),
+            packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+            scales.ctypes.data_as(POINTER(c_float)),
+            c_size_t(m),
+            c_size_t(k),
+            c_size_t(n),
+            output.ctypes.data_as(POINTER(c_float)),
+        )
+
+    if _INT4_BRIDGE_ABI in {"unknown", "new"}:
+        ok_new = _call_new_abi()
+        if ok_new == 1:
+            _INT4_BRIDGE_ABI = "new"
+            return output
+
+    ok_legacy = _call_legacy_abi()
+    if ok_legacy != 1:
         raise RuntimeError("vspec_cuda_fused_linear_int4_bridge failed")
+
+    _INT4_BRIDGE_ABI = "legacy"
+    # Legacy bridge applies row-wise scale only (no zero-point or n_blocks).
+    # Keep runtime stable by forcing row-wise quantization for subsequent packing.
+    os.environ["VSPEC_INT4_BLOCKWISE_ENABLE"] = "0"
+
+    if n_blocks > 1:
+        raise RuntimeError("legacy int4 bridge does not support block-wise scales")
+
+    # Emulate asymmetric zero-point correction for legacy bridge output.
+    if zero_points is not None and zero_points.size == int(n):
+        vec_sum = np.sum(input_array.astype(np.float32, copy=False), axis=-1, keepdims=True)
+        zp_scale = np.ascontiguousarray(zero_points.astype(np.float32, copy=False) * scales.astype(np.float32, copy=False))
+        output = output - (vec_sum * zp_scale[None, :])
     return output
 
 
