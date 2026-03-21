@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import time
 from typing import Callable, Optional
 
@@ -9,10 +10,24 @@ from decode_optimization_module import DecodeOptimizationModule
 from fast_output import FastOutputEngine, postprocess_output_text
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
-from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession
+from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, adaptive_step
 
 PHASE_PREFILL = 1
 PHASE_DECODE = 2
+
+
+def _entropy_from_logits(logits_obj) -> float:
+    try:
+        vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+        if not vals:
+            return 0.0
+        max_v = max(float(v) for v in vals)
+        exps = [math.exp(max(-60.0, min(60.0, float(v) - max_v))) for v in vals]
+        denom = max(1e-12, sum(exps))
+        probs = [v / denom for v in exps]
+        return float(-sum(p * math.log(max(1e-12, p)) for p in probs))
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -48,6 +63,9 @@ class ManagedGenerationRequest:
     state_snapshot: dict | None = None
     engine: FastOutputEngine | None = field(default=None, repr=False)
     decode_optimizer: DecodeOptimizationModule | None = field(default=None, repr=False)
+    adaptive_entropy_prev: float = 0.0
+    adaptive_latency_ms: float = 0.0
+    adaptive_quality_drift: float = 0.0
 
     @property
     def prefill_ids(self) -> list[int]:
@@ -232,6 +250,7 @@ class CoreBatchGenerationDriver:
         req.engine.begin_stream()
         try:
             for _ in range(max(0, int(quota))):
+                token_t0 = time.perf_counter()
                 elapsed = time.perf_counter() - req.started_at
                 if self.decode_budget_seconds > 0.0 and elapsed >= self.decode_budget_seconds:
                     req.timed_out = True
@@ -251,11 +270,49 @@ class CoreBatchGenerationDriver:
                 logits = self.threebit_module.denoise_logits(logits, len(req.generated))
                 logits = req.decode_optimizer.apply_generation_controls(logits, req.history)
                 sample_temperature = self.threebit_module.auto_temperature(logits, req.temperature)
-                next_id = req.engine.sample(logits, sample_temperature, req.top_k, req.greedy, req.lang_top_n)
+
+                entropy_now = _entropy_from_logits(logits)
+                entropy_collapse = max(0.0, req.adaptive_entropy_prev - entropy_now)
+                req.adaptive_entropy_prev = entropy_now
+                token_text = ""
+                try:
+                    token_text = self.tokenizer.decode([int(req.history[-1])])
+                except Exception:
+                    token_text = str(int(req.history[-1]))
+                decision = adaptive_step(
+                    token_text=token_text,
+                    token_entropy=entropy_now,
+                    attention_entropy_collapse=entropy_collapse,
+                    latency_ms=req.adaptive_latency_ms,
+                    vram_pressure=0.5,
+                    quality_drift=req.adaptive_quality_drift,
+                    layer_type=0,
+                )
+
+                sample_top_k = int(req.top_k)
+                sample_greedy = bool(req.greedy)
+                if decision is not None:
+                    setattr(self.runtime, "adaptive_target_bits", int(decision.target_bits))
+                    setattr(self.runtime, "adaptive_routed_bits", int(decision.routed_bits))
+                    setattr(self.runtime, "adaptive_reduce_attention_depth", bool(decision.reduce_attention_depth))
+                    setattr(self.runtime, "adaptive_attention_depth_hint", int(decision.attention_depth_hint))
+                    setattr(self.runtime, "adaptive_enable_kv_compression", bool(decision.enable_kv_compression))
+                    if decision.reduce_attention_depth and decision.attention_depth_hint > 0:
+                        sample_top_k = min(sample_top_k, max(8, int(decision.attention_depth_hint) * 4))
+                    if decision.skip_compute:
+                        sample_greedy = True
+                    bit_hint = int(decision.routed_bits if decision.routed_bits > 0 else decision.target_bits)
+                    if bit_hint > 0:
+                        temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
+                        sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
+
+                next_id = req.engine.sample(logits, sample_temperature, sample_top_k, sample_greedy, req.lang_top_n)
                 req.generated.append(next_id)
                 req.token_ids.append(next_id)
                 req.engine.stream_token(next_id)
                 req.decode_optimizer.observe_token(req.history)
+                req.adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
+                req.adaptive_quality_drift = min(1.0, 0.6 * req.adaptive_quality_drift + 0.4 * entropy_collapse)
                 generated_now += 1
                 if self.adapter.eos_token_id is not None and next_id == self.adapter.eos_token_id:
                     req.reached_eos = True

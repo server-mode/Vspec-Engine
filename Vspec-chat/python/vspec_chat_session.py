@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 import time
@@ -15,7 +16,7 @@ from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projecti
 from runtime_threebit_module import ThreeBitRuntimeModule
 from decode_contract import sanitize_and_validate_logits
 from native_safe_decode import build_native_safe_runtime
-from runtime_core_bridge import CoreDecodeSession
+from runtime_core_bridge import CoreDecodeSession, adaptive_step
 from model_adapters import select_adapter
 from model_loader import (
     build_weight_index,
@@ -107,6 +108,19 @@ def _generate(
 
     assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=allow_semantic_rescue)
     prompt_chars = len((prompt or "").strip())
+
+    def _entropy_from_logits(logits_obj) -> float:
+        try:
+            vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+            if not vals:
+                return 0.0
+            max_v = max(float(v) for v in vals)
+            exps = [math.exp(max(-60.0, min(60.0, float(v) - max_v))) for v in vals]
+            denom = max(1e-12, sum(exps))
+            probs = [v / denom for v in exps]
+            return float(-sum(p * math.log(max(1e-12, p)) for p in probs))
+        except Exception:
+            return 0.0
 
     def _is_meaningful_partial(candidate: str, generated_tokens: int) -> bool:
         out = (candidate or "").strip()
@@ -318,6 +332,9 @@ def _generate(
         total_steps = max(1, int(max_steps))
         core_decode = CoreDecodeSession.from_runtime(runtime_obj, total_steps)
         scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(local_tokens) - 1), max_new_tokens=total_steps)
+        adaptive_entropy_prev = 0.0
+        adaptive_latency_ms = 0.0
+        adaptive_quality_drift = 0.0
 
         try:
             for step in range(total_steps):
@@ -335,6 +352,7 @@ def _generate(
 
                 reached_eos = False
                 for _ in range(quota):
+                    token_t0 = time.perf_counter()
                     logits = decode_optimizer.fetch_logits(runtime_obj, local_tokens[-1], tokenizer.get_vocab_size())
                     logits, contract = sanitize_and_validate_logits(logits, tokenizer.get_vocab_size())
                     if not contract.ok:
@@ -354,12 +372,50 @@ def _generate(
 
                     logits = threebit_module.denoise_logits(logits, step)
                     logits = decode_optimizer.apply_generation_controls(logits, local_tokens)
+
+                    entropy_now = _entropy_from_logits(logits)
+                    entropy_collapse = max(0.0, adaptive_entropy_prev - entropy_now)
+                    adaptive_entropy_prev = entropy_now
+                    token_text = ""
+                    try:
+                        token_text = tokenizer.decode([int(local_tokens[-1])])
+                    except Exception:
+                        token_text = str(int(local_tokens[-1]))
+                    decision = adaptive_step(
+                        token_text=token_text,
+                        token_entropy=entropy_now,
+                        attention_entropy_collapse=entropy_collapse,
+                        latency_ms=adaptive_latency_ms,
+                        vram_pressure=0.5,
+                        quality_drift=adaptive_quality_drift,
+                        layer_type=0,
+                    )
+
                     sample_temperature = threebit_module.auto_temperature(logits, local_temperature)
-                    next_id = engine.sample(logits, sample_temperature, local_top_k, local_greedy, local_lang_top_n)
+                    sample_top_k = int(local_top_k)
+                    sample_greedy = bool(local_greedy)
+                    if decision is not None:
+                        setattr(runtime_obj, "adaptive_target_bits", int(decision.target_bits))
+                        setattr(runtime_obj, "adaptive_routed_bits", int(decision.routed_bits))
+                        setattr(runtime_obj, "adaptive_reduce_attention_depth", bool(decision.reduce_attention_depth))
+                        setattr(runtime_obj, "adaptive_attention_depth_hint", int(decision.attention_depth_hint))
+                        setattr(runtime_obj, "adaptive_enable_kv_compression", bool(decision.enable_kv_compression))
+                        if decision.reduce_attention_depth and decision.attention_depth_hint > 0:
+                            sample_top_k = min(sample_top_k, max(8, int(decision.attention_depth_hint) * 4))
+                        if decision.skip_compute:
+                            sample_greedy = True
+                        bit_hint = int(decision.routed_bits if decision.routed_bits > 0 else decision.target_bits)
+                        if bit_hint > 0:
+                            temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
+                            sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
+
+                    next_id = engine.sample(logits, sample_temperature, sample_top_k, sample_greedy, local_lang_top_n)
                     generated.append(next_id)
                     local_tokens.append(next_id)
                     engine.stream_token(next_id)
                     decode_optimizer.observe_token(local_tokens)
+                    adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
+                    adaptive_quality_drift = min(1.0, 0.6 * adaptive_quality_drift + 0.4 * entropy_collapse)
                     reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
                     if scheduler_enabled:
                         core_decode.commit(1, reached_eos)

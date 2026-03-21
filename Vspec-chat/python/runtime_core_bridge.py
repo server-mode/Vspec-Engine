@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import os
-from ctypes import POINTER, c_char_p, c_float, c_int, c_size_t, c_uint64, create_string_buffer
+from ctypes import POINTER, c_char_p, c_float, c_int, c_size_t, c_uint32, c_uint64, c_uint8, create_string_buffer
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -77,6 +78,120 @@ if _lib is not None:
     _lib.vspec_py_continuous_batch_cancel.restype = c_int
     _lib.vspec_py_continuous_batch_stats.argtypes = [c_int, POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_size_t), POINTER(c_size_t), POINTER(c_size_t)]
     _lib.vspec_py_continuous_batch_stats.restype = c_int
+    _lib.vspec_py_runtime_adaptive_step.argtypes = [
+        c_char_p,
+        c_float,
+        c_float,
+        c_float,
+        c_float,
+        c_float,
+        c_uint32,
+        POINTER(c_uint8),
+        POINTER(c_uint8),
+        POINTER(c_uint8),
+        POINTER(c_uint8),
+        POINTER(c_uint8),
+        POINTER(c_uint32),
+        POINTER(c_uint32),
+        POINTER(c_float),
+        POINTER(c_uint32),
+    ]
+    _lib.vspec_py_runtime_adaptive_step.restype = c_int
+    _lib.vspec_py_plugin_load_dynamic.argtypes = [c_char_p, c_char_p, ctypes.c_char_p, c_size_t]
+    _lib.vspec_py_plugin_load_dynamic.restype = c_int
+    _lib.vspec_py_plugin_unload_dynamic.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
+    _lib.vspec_py_plugin_unload_dynamic.restype = c_int
+
+
+@dataclass
+class AdaptiveStepDecision:
+    target_bits: int
+    skip_compute: bool
+    reduce_attention_depth: bool
+    enable_kv_compression: bool
+    routed_bits: int
+    attention_depth_hint: int
+    token_tier: int
+    token_importance: float
+    kv_action: int
+
+
+def adaptive_step(
+    token_text: str,
+    token_entropy: float,
+    attention_entropy_collapse: float,
+    latency_ms: float,
+    vram_pressure: float,
+    quality_drift: float,
+    layer_type: int = 0,
+) -> AdaptiveStepDecision | None:
+    if _lib is None:
+        return None
+    out_target_bits = c_uint8(0)
+    out_skip_compute = c_uint8(0)
+    out_reduce_attention_depth = c_uint8(0)
+    out_enable_kv_compression = c_uint8(0)
+    out_routed_bits = c_uint8(0)
+    out_attention_depth_hint = c_uint32(0)
+    out_token_tier = c_uint32(0)
+    out_token_importance = c_float(0.0)
+    out_kv_action = c_uint32(0)
+    ok = _lib.vspec_py_runtime_adaptive_step(
+        (token_text or "").encode("utf-8", errors="ignore"),
+        c_float(float(token_entropy)),
+        c_float(float(attention_entropy_collapse)),
+        c_float(float(latency_ms)),
+        c_float(float(vram_pressure)),
+        c_float(float(quality_drift)),
+        c_uint32(max(0, int(layer_type))),
+        ctypes.byref(out_target_bits),
+        ctypes.byref(out_skip_compute),
+        ctypes.byref(out_reduce_attention_depth),
+        ctypes.byref(out_enable_kv_compression),
+        ctypes.byref(out_routed_bits),
+        ctypes.byref(out_attention_depth_hint),
+        ctypes.byref(out_token_tier),
+        ctypes.byref(out_token_importance),
+        ctypes.byref(out_kv_action),
+    )
+    if not ok:
+        return None
+    return AdaptiveStepDecision(
+        target_bits=int(out_target_bits.value),
+        skip_compute=bool(out_skip_compute.value),
+        reduce_attention_depth=bool(out_reduce_attention_depth.value),
+        enable_kv_compression=bool(out_enable_kv_compression.value),
+        routed_bits=int(out_routed_bits.value),
+        attention_depth_hint=int(out_attention_depth_hint.value),
+        token_tier=int(out_token_tier.value),
+        token_importance=float(out_token_importance.value),
+        kv_action=int(out_kv_action.value),
+    )
+
+
+def plugin_load_dynamic(path: str, symbol_name: str = "") -> tuple[bool, str]:
+    if _lib is None:
+        return False, "bridge_unavailable"
+    msg = create_string_buffer(256)
+    ok = _lib.vspec_py_plugin_load_dynamic(
+        str(path or "").encode("utf-8", errors="ignore"),
+        str(symbol_name or "").encode("utf-8", errors="ignore"),
+        msg,
+        c_size_t(len(msg)),
+    )
+    return bool(ok), msg.value.decode("utf-8", errors="ignore")
+
+
+def plugin_unload_dynamic(name: str) -> tuple[bool, str]:
+    if _lib is None:
+        return False, "bridge_unavailable"
+    msg = create_string_buffer(256)
+    ok = _lib.vspec_py_plugin_unload_dynamic(
+        str(name or "").encode("utf-8", errors="ignore"),
+        msg,
+        c_size_t(len(msg)),
+    )
+    return bool(ok), msg.value.decode("utf-8", errors="ignore")
 
 
 def sample_candidate_available() -> bool:

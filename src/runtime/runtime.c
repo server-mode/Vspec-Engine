@@ -9,6 +9,10 @@ static VspecLanguageStructureGuard g_language_guard;
 static int g_language_guard_enabled = 0;
 static VspecRuntimeBehaviorMonitor g_behavior_monitor;
 static VspecRuntimeUltimateState g_ultimate_state;
+static VspecRuntimeController g_runtime_controller;
+static VspecTokenScheduler g_token_scheduler;
+static VspecPrecisionRouter g_precision_router;
+static VspecMemoryPolicy g_memory_policy;
 
 static void vspec_runtime_enable_language_guard_auto(void) {
     const char* disable = getenv("VSPEC_LANGUAGE_GUARD_DISABLE");
@@ -133,6 +137,42 @@ void vspec_runtime_init_with_hw_config(const char* config_path) {
     vspec_adaptive_precision_reset();
     g_hw_state.config_loaded_from_file = vspec_runtime_hw_config_load_file(config_path, &g_hw_state.config);
     vspec_runtime_apply_hw_env_hints(&g_hw_state.config);
+    {
+        VspecRuntimeControllerConfig ctrl_cfg;
+        vspec_runtime_controller_config_default(&ctrl_cfg);
+        ctrl_cfg.max_bits = (uint8_t)((g_hw_state.config.lowbit_target_bits >= 2U && g_hw_state.config.lowbit_target_bits <= 4U)
+            ? g_hw_state.config.lowbit_target_bits
+            : 4U);
+        ctrl_cfg.min_bits = (ctrl_cfg.max_bits > 2U) ? (uint8_t)(ctrl_cfg.max_bits - 2U) : 2U;
+        ctrl_cfg.latency_budget_ms = 30.0f + (float)(g_hw_state.config.dispatch_batch_hint * 0.5f);
+        vspec_runtime_controller_init(&g_runtime_controller, &ctrl_cfg);
+    }
+    {
+        VspecTokenSchedulerConfig sched_cfg;
+        vspec_token_scheduler_config_default(&sched_cfg);
+        sched_cfg.max_attention_depth = (unsigned int)(64U + g_hw_state.config.dispatch_batch_hint * 2U);
+        if (sched_cfg.max_attention_depth < sched_cfg.base_attention_depth) {
+            sched_cfg.max_attention_depth = sched_cfg.base_attention_depth;
+        }
+        vspec_token_scheduler_init(&g_token_scheduler, &sched_cfg);
+    }
+    {
+        VspecPrecisionRouterConfig pr_cfg;
+        vspec_precision_router_config_default(&pr_cfg);
+        pr_cfg.max_bits = (uint8_t)((g_hw_state.config.lowbit_target_bits >= 2U && g_hw_state.config.lowbit_target_bits <= 4U)
+            ? g_hw_state.config.lowbit_target_bits
+            : 4U);
+        pr_cfg.min_bits = (pr_cfg.max_bits > 2U) ? (uint8_t)(pr_cfg.max_bits - 2U) : 2U;
+        pr_cfg.pressure_guard = g_hw_state.config.max_vram_utilization;
+        vspec_precision_router_init(&g_precision_router, &pr_cfg);
+    }
+    {
+        VspecMemoryPolicyConfig mem_cfg;
+        vspec_memory_policy_config_default(&mem_cfg);
+        mem_cfg.pressure_compress = g_hw_state.config.precision_downgrade_trigger;
+        mem_cfg.pressure_recompute = g_hw_state.config.cache_compression_trigger;
+        vspec_memory_policy_init(&g_memory_policy, &mem_cfg);
+    }
     vspec_runtime_ultimate_init(&g_ultimate_state, &g_hw_state.config);
     vspec_qlora_adapter_clear();
     g_hw_state.active_backend_name = "cpu";
@@ -311,4 +351,28 @@ int vspec_runtime_qlora_load_manifest_json(const char* manifest_path) {
 
 void vspec_runtime_qlora_clear(void) {
     vspec_qlora_adapter_clear();
+}
+
+void vspec_runtime_adaptive_observe(const VspecRuntimeAdaptiveTelemetry* telemetry) {
+    vspec_runtime_controller_observe(&g_runtime_controller, telemetry);
+}
+
+VspecRuntimeAdaptiveDecision vspec_runtime_adaptive_decide(void) {
+    VspecRuntimeAdaptiveDecision d = vspec_runtime_controller_decide(&g_runtime_controller);
+    vspec_plugin_emit_controller_decision(&g_runtime_controller.last, &d);
+    return d;
+}
+
+VspecTokenScheduleDecision vspec_runtime_schedule_token(const char* token_text, float entropy_hint) {
+    VspecTokenScheduleDecision d = vspec_token_scheduler_schedule_token(&g_token_scheduler, token_text, entropy_hint);
+    vspec_plugin_emit_token_scheduled(token_text, &d);
+    return d;
+}
+
+uint8_t vspec_runtime_route_precision(const VspecPrecisionRouteHint* hint) {
+    return vspec_precision_router_select_bits(&g_precision_router, hint);
+}
+
+VspecKvPolicyAction vspec_runtime_memory_decide(const VspecMemoryPolicyInput* input) {
+    return vspec_memory_policy_decide(&g_memory_policy, input);
 }

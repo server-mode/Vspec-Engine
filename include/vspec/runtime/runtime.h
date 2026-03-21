@@ -10,6 +10,11 @@
 #include "vspec/runtime/torch_compat_module.h"
 #include "vspec/runtime/ultimate_optimizer.h"
 #include "vspec/runtime/qlora_adapter.h"
+#include "vspec/runtime/adaptive/runtime_controller.h"
+#include "vspec/runtime/adaptive/token_scheduler.h"
+#include "vspec/runtime/adaptive/precision_router.h"
+#include "vspec/runtime/adaptive/memory_policy.h"
+#include "vspec/runtime/plugin/plugin_api.h"
 
 void vspec_runtime_init_default(void);
 void vspec_runtime_init_with_hw_config(const char* config_path);
@@ -54,5 +59,11 @@ void vspec_runtime_get_ultimate_report(VspecRuntimeUltimateReport* report);
 int vspec_runtime_qlora_load_file(const char* path);
 int vspec_runtime_qlora_load_manifest_json(const char* manifest_path);
 void vspec_runtime_qlora_clear(void);
+
+void vspec_runtime_adaptive_observe(const VspecRuntimeAdaptiveTelemetry* telemetry);
+VspecRuntimeAdaptiveDecision vspec_runtime_adaptive_decide(void);
+VspecTokenScheduleDecision vspec_runtime_schedule_token(const char* token_text, float entropy_hint);
+uint8_t vspec_runtime_route_precision(const VspecPrecisionRouteHint* hint);
+VspecKvPolicyAction vspec_runtime_memory_decide(const VspecMemoryPolicyInput* input);
 
 #endif

@@ -113,6 +113,28 @@ VSPEC_PY_API int vspec_py_continuous_batch_stats(
   size_t* out_reserved_vram
 );
 
+VSPEC_PY_API int vspec_py_runtime_adaptive_step(
+  const char* token_text,
+  float token_entropy,
+  float attention_entropy_collapse,
+  float latency_ms,
+  float vram_pressure,
+  float quality_drift,
+  uint32_t layer_type,
+  uint8_t* out_target_bits,
+  uint8_t* out_skip_compute,
+  uint8_t* out_reduce_attention_depth,
+  uint8_t* out_enable_kv_compression,
+  uint8_t* out_routed_bits,
+  uint32_t* out_attention_depth_hint,
+  uint32_t* out_token_tier,
+  float* out_token_importance,
+  uint32_t* out_kv_action
+);
+
+VSPEC_PY_API int vspec_py_plugin_load_dynamic(const char* path, const char* symbol_name, char* out_msg, size_t out_msg_size);
+VSPEC_PY_API int vspec_py_plugin_unload_dynamic(const char* name, char* out_msg, size_t out_msg_size);
+
 #ifdef __cplusplus
 }
 #endif

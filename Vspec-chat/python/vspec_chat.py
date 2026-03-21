@@ -32,7 +32,7 @@ from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projecti
 from runtime_threebit_module import ThreeBitRuntimeModule
 from decode_contract import sanitize_and_validate_logits
 from native_safe_decode import resolve_native_safe_max_layers
-from runtime_core_bridge import CoreDecodeSession
+from runtime_core_bridge import CoreDecodeSession, adaptive_step
 from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
 
 
@@ -77,6 +77,20 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     if detail:
         msg += f" | {detail}"
     print(msg)
+
+
+def _entropy_from_logits(logits_obj) -> float:
+    try:
+        vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+        if not vals:
+            return 0.0
+        max_v = max(float(v) for v in vals)
+        exps = [math.exp(max(-60.0, min(60.0, float(v) - max_v))) for v in vals]
+        denom = max(1e-12, sum(exps))
+        probs = [v / denom for v in exps]
+        return float(-sum(p * math.log(max(1e-12, p)) for p in probs))
+    except Exception:
+        return 0.0
 
 
 def _detect_lang(prompt: str) -> str:
@@ -1194,6 +1208,9 @@ def main() -> None:
     scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
     if scheduler_enabled:
         print(f"[vspec-chat] core_scheduler= on reserve_bytes={core_decode.reserve_bytes}")
+    adaptive_entropy_prev = 0.0
+    adaptive_latency_ms = 0.0
+    adaptive_quality_drift = 0.0
     for step in range(max_steps):
         if scheduler_enabled:
             quota = core_decode.next_quota()
@@ -1207,6 +1224,7 @@ def main() -> None:
             break
         reached_eos = False
         for _ in range(quota):
+            token_t0 = time.perf_counter()
             if runtime is None:
                 logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
             else:
@@ -1225,11 +1243,55 @@ def main() -> None:
             logits = threebit_module.denoise_logits(logits, step)
             logits = decode_optimizer.apply_generation_controls(logits, token_ids)
             sample_temperature = threebit_module.auto_temperature(logits, args.temperature)
+
+            entropy_now = _entropy_from_logits(logits)
+            entropy_collapse = max(0.0, adaptive_entropy_prev - entropy_now)
+            adaptive_entropy_prev = entropy_now
+            token_text = ""
+            try:
+                token_text = tokenizer.decode([int(token_ids[-1])])
+            except Exception:
+                token_text = str(int(token_ids[-1]))
+            vram_pressure = 0.5
+            try:
+                mem_stats = cuda_mem_info()
+                if isinstance(mem_stats, dict):
+                    used = float(mem_stats.get("used", 0.0) or 0.0)
+                    total = float(mem_stats.get("total", 0.0) or 0.0)
+                    if total > 0.0:
+                        vram_pressure = max(0.0, min(1.0, used / total))
+            except Exception:
+                vram_pressure = 0.5
+            decision = adaptive_step(
+                token_text=token_text,
+                token_entropy=entropy_now,
+                attention_entropy_collapse=entropy_collapse,
+                latency_ms=adaptive_latency_ms,
+                vram_pressure=vram_pressure,
+                quality_drift=adaptive_quality_drift,
+                layer_type=0,
+            )
+            sample_top_k = int(effective_top_k)
+            sample_greedy = bool(args.greedy)
+            if decision is not None and runtime is not None:
+                setattr(runtime, "adaptive_target_bits", int(decision.target_bits))
+                setattr(runtime, "adaptive_routed_bits", int(decision.routed_bits))
+                setattr(runtime, "adaptive_reduce_attention_depth", bool(decision.reduce_attention_depth))
+                setattr(runtime, "adaptive_attention_depth_hint", int(decision.attention_depth_hint))
+                setattr(runtime, "adaptive_enable_kv_compression", bool(decision.enable_kv_compression))
+                if decision.reduce_attention_depth and decision.attention_depth_hint > 0:
+                    sample_top_k = min(sample_top_k, max(8, int(decision.attention_depth_hint) * 4))
+                if decision.skip_compute:
+                    sample_greedy = True
+                bit_hint = int(decision.routed_bits if decision.routed_bits > 0 else decision.target_bits)
+                if bit_hint > 0:
+                    temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
+                    sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
             next_id = fast_engine.sample(
                 logits,
                 sample_temperature,
-                effective_top_k,
-                args.greedy,
+                sample_top_k,
+                sample_greedy,
                 effective_lang_top_n,
             )
             generated.append(next_id)
@@ -1237,6 +1299,8 @@ def main() -> None:
             fast_engine.stream_token(next_id)
             token_ids.append(next_id)
             decode_optimizer.observe_token(token_ids)
+            adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
+            adaptive_quality_drift = min(1.0, 0.6 * adaptive_quality_drift + 0.4 * entropy_collapse)
             reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
             if scheduler_enabled:
                 core_decode.commit(1, reached_eos)

@@ -77,6 +77,11 @@ add_library(vspec_engine
     src/runtime/mixed_bit_runtime.c
     src/runtime/mixed_bit_policy.c
     src/runtime/adaptive_precision_engine.c
+    src/runtime/adaptive/runtime_controller.c
+    src/runtime/adaptive/token_scheduler.c
+    src/runtime/adaptive/precision_router.c
+    src/runtime/adaptive/memory_policy.c
+    src/runtime/plugin/plugin_api.c
     src/scheduler/dynamic.c
     src/scheduler/request_scheduler.c
     src/parallel/multi_gpu.c
@@ -128,6 +133,7 @@ add_library(vspec_engine_capi SHARED
     src/runtime/continuous_batch.c
     src/runtime/decode_session.c
     src/runtime/sampling_core.c
+    src/runtime/plugin/plugin_api.c
     src/graph/ir.c
 )
 
@@ -301,6 +307,18 @@ add_executable(vspec_phase3_demo
 
 target_link_libraries(vspec_phase3_demo PRIVATE vspec_engine)
 
+add_executable(vspec_adaptive_runtime_demo
+    examples/adaptive_runtime_demo.c
+)
+
+target_link_libraries(vspec_adaptive_runtime_demo PRIVATE vspec_engine)
+
+add_executable(vspec_adaptive_plugin_demo
+    examples/adaptive_plugin_demo.c
+)
+
+target_link_libraries(vspec_adaptive_plugin_demo PRIVATE vspec_engine)
+
 add_executable(vspec_torch_compat_demo
     examples/torch_compat_demo.c
 )
@@ -350,3 +368,9 @@ add_executable(vspec_memory_v2_demo
 )
 
 target_link_libraries(vspec_memory_v2_demo PRIVATE vspec_engine)
+
+add_executable(vspec_adaptive_profile_benchmark
+    tools/benchmark/adaptive_profile_benchmark.c
+)
+
+target_link_libraries(vspec_adaptive_profile_benchmark PRIVATE vspec_engine)

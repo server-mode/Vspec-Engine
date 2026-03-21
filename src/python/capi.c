@@ -12,6 +12,7 @@
 #include "vspec/runtime/continuous_batch.h"
 #include "vspec/runtime/decode_session.h"
 #include "vspec/runtime/sampling_core.h"
+#include "vspec/runtime/plugin/plugin_api.h"
 
 #define VSPEC_PY_MAX_KV_CACHE_HANDLES 16
 #define VSPEC_PY_MAX_DECODE_HANDLES 32
@@ -528,4 +529,119 @@ int vspec_py_continuous_batch_stats(
         *out_reserved_vram = stats.reserved_vram_bytes;
     }
     return 1;
+}
+
+int vspec_py_runtime_adaptive_step(
+    const char* token_text,
+    float token_entropy,
+    float attention_entropy_collapse,
+    float latency_ms,
+    float vram_pressure,
+    float quality_drift,
+    uint32_t layer_type,
+    uint8_t* out_target_bits,
+    uint8_t* out_skip_compute,
+    uint8_t* out_reduce_attention_depth,
+    uint8_t* out_enable_kv_compression,
+    uint8_t* out_routed_bits,
+    uint32_t* out_attention_depth_hint,
+    uint32_t* out_token_tier,
+    float* out_token_importance,
+    uint32_t* out_kv_action
+) {
+    (void)token_text;
+    (void)layer_type;
+
+    float pressure = vram_pressure;
+    float collapse = attention_entropy_collapse;
+    float drift = quality_drift;
+    float entropy = token_entropy;
+    uint8_t target_bits = 4U;
+    uint8_t skip_compute = 0U;
+    uint8_t reduce_attention_depth = 0U;
+    uint8_t enable_kv_compression = 0U;
+    uint8_t routed_bits = 4U;
+    uint32_t attention_depth_hint = 8U;
+    uint32_t token_tier = 1U;
+    float token_importance = 0.5f;
+    uint32_t kv_action = 0U;
+
+    if (entropy < 0.9f) {
+        token_tier = 2U;
+        token_importance = 0.78f;
+        attention_depth_hint = 16U;
+    } else if (entropy > 1.8f) {
+        token_tier = 0U;
+        token_importance = 0.24f;
+        attention_depth_hint = 4U;
+    }
+
+    if (pressure >= 0.88f || latency_ms >= 28.0f) {
+        target_bits = 2U;
+        skip_compute = 1U;
+        reduce_attention_depth = 1U;
+        enable_kv_compression = 1U;
+        kv_action = 2U;
+    } else if (pressure >= 0.72f || latency_ms >= 18.0f) {
+        target_bits = 3U;
+        reduce_attention_depth = 1U;
+        enable_kv_compression = 1U;
+        kv_action = 1U;
+    } else {
+        target_bits = 4U;
+        kv_action = 0U;
+    }
+
+    if (drift >= 0.65f || collapse >= 0.72f) {
+        if (target_bits < 4U) {
+            target_bits = 4U;
+        }
+        skip_compute = 0U;
+    }
+
+    routed_bits = target_bits;
+    if (token_tier == 2U && routed_bits < 4U) {
+        routed_bits = (uint8_t)(routed_bits + 1U);
+    }
+    if (token_tier == 0U && routed_bits > 2U) {
+        routed_bits = (uint8_t)(routed_bits - 1U);
+    }
+
+    if (out_target_bits) {
+        *out_target_bits = target_bits;
+    }
+    if (out_skip_compute) {
+        *out_skip_compute = skip_compute;
+    }
+    if (out_reduce_attention_depth) {
+        *out_reduce_attention_depth = reduce_attention_depth;
+    }
+    if (out_enable_kv_compression) {
+        *out_enable_kv_compression = enable_kv_compression;
+    }
+    if (out_routed_bits) {
+        *out_routed_bits = routed_bits;
+    }
+    if (out_attention_depth_hint) {
+        *out_attention_depth_hint = attention_depth_hint;
+    }
+    if (out_token_tier) {
+        *out_token_tier = token_tier;
+    }
+    if (out_token_importance) {
+        *out_token_importance = token_importance;
+    }
+    if (out_kv_action) {
+        *out_kv_action = kv_action;
+    }
+
+    return 1;
+}
+
+int vspec_py_plugin_load_dynamic(const char* path, const char* symbol_name, char* out_msg, size_t out_msg_size) {
+    return vspec_plugin_load_dynamic(path, symbol_name, out_msg, out_msg_size);
+}
+
+int vspec_py_plugin_unload_dynamic(const char* name, char* out_msg, size_t out_msg_size) {
+    return vspec_plugin_unload_dynamic(name, out_msg, out_msg_size);
 }
