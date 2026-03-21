@@ -4,6 +4,7 @@
 #include "vspec/kernel/context.h"
 #include "vspec/runtime/hw_performance_manager.h"
 #include "vspec/runtime/language_structure_guard.h"
+#include "vspec/runtime/output_guard.h"
 #include "vspec/runtime/runtime_behavior_monitor.h"
 #include "vspec/runtime/adaptive_precision_engine.h"
 #include "vspec/runtime/three_bit_runtime_modules.h"
@@ -27,6 +28,12 @@ int vspec_runtime_language_guard_allow(const char* token_text);
 float vspec_runtime_language_guard_compensate(const char* token_text);
 void vspec_runtime_language_guard_observe(const char* token_text);
 void vspec_runtime_language_guard_report(VspecLanguageStructureGuardReport* report);
+
+void vspec_runtime_output_guard_init(float strictness);
+int vspec_runtime_output_guard_allow(const char* text_fragment);
+float vspec_runtime_output_guard_score_adjustment(const char* text_fragment);
+void vspec_runtime_output_guard_observe(const char* text_fragment);
+void vspec_runtime_output_guard_report(VspecRuntimeOutputGuardReport* report);
 
 void vspec_runtime_behavior_observe(
 	float observed_gpu_utilization,

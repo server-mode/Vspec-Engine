@@ -70,6 +70,7 @@ add_library(vspec_engine
     src/runtime/sampling_core.c
     src/runtime/hw_performance_manager.c
     src/runtime/language_structure_guard.c
+    src/runtime/output_guard.c
     src/runtime/runtime_behavior_monitor.c
     src/runtime/ultimate_optimizer.c
     src/runtime/qlora_adapter.c

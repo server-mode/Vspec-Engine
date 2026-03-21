@@ -1,9 +1,17 @@
 @echo off
 set SCRIPT_DIR=%~dp0
 set VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe
-if exist "%VENV_PY%" (
-	"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+if "%~1"=="" (
+	if exist "%VENV_PY%" (
+		"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
+	) else (
+		python "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
+	)
 ) else (
-	python "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+	if exist "%VENV_PY%" (
+		"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+	) else (
+		python "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+	)
 )
 exit /b %ERRORLEVEL%

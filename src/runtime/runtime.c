@@ -7,6 +7,8 @@
 static VspecRuntimeHwState g_hw_state;
 static VspecLanguageStructureGuard g_language_guard;
 static int g_language_guard_enabled = 0;
+static VspecRuntimeOutputGuard g_output_guard;
+static int g_output_guard_enabled = 0;
 static VspecRuntimeBehaviorMonitor g_behavior_monitor;
 static VspecRuntimeUltimateState g_ultimate_state;
 static VspecRuntimeController g_runtime_controller;
@@ -33,6 +35,29 @@ static void vspec_runtime_enable_language_guard_auto(void) {
         }
     }
     vspec_runtime_language_guard_init(NULL, strictness);
+}
+
+static void vspec_runtime_enable_output_guard_auto(void) {
+    const char* disable = getenv("VSPEC_OUTPUT_GUARD_DISABLE");
+    if (disable && (disable[0] == '1' || disable[0] == 'y' || disable[0] == 'Y' || disable[0] == 't' || disable[0] == 'T')) {
+        g_output_guard_enabled = 0;
+        return;
+    }
+
+    {
+        const char* strictness_env = getenv("VSPEC_OUTPUT_GUARD_STRICTNESS");
+        float strictness = 0.55f;
+        if (strictness_env && strictness_env[0] != '\0') {
+            strictness = (float)atof(strictness_env);
+            if (strictness < 0.0f) {
+                strictness = 0.0f;
+            }
+            if (strictness > 1.0f) {
+                strictness = 1.0f;
+            }
+        }
+        vspec_runtime_output_guard_init(strictness);
+    }
 }
 
 static void vspec_runtime_apply_hw_env_hints(const VspecRuntimeHwConfig* cfg) {
@@ -177,6 +202,7 @@ void vspec_runtime_init_with_hw_config(const char* config_path) {
     vspec_qlora_adapter_clear();
     g_hw_state.active_backend_name = "cpu";
     vspec_runtime_enable_language_guard_auto();
+    vspec_runtime_enable_output_guard_auto();
 
     VspecBackend backend = vspec_make_cpu_backend();
     if (vspec_runtime_hw_pick_backend(&g_hw_state.config, &backend)) {
@@ -224,24 +250,34 @@ void vspec_runtime_language_guard_init(const char* prompt_text, float strictness
 }
 
 int vspec_runtime_language_guard_allow(const char* token_text) {
-    if (!g_language_guard_enabled) {
-        return 1;
+    int allow = 1;
+    if (g_language_guard_enabled) {
+        allow = vspec_language_structure_guard_allow_text(&g_language_guard, token_text);
     }
-    return vspec_language_structure_guard_allow_text(&g_language_guard, token_text);
+    if (allow && g_output_guard_enabled) {
+        allow = vspec_output_guard_allow(&g_output_guard, token_text);
+    }
+    return allow;
 }
 
 float vspec_runtime_language_guard_compensate(const char* token_text) {
-    if (!g_language_guard_enabled) {
-        return 0.0f;
+    float score = 0.0f;
+    if (g_language_guard_enabled) {
+        score += vspec_language_structure_guard_token_compensation(&g_language_guard, token_text);
     }
-    return vspec_language_structure_guard_token_compensation(&g_language_guard, token_text);
+    if (g_output_guard_enabled) {
+        score += vspec_output_guard_score_adjustment(&g_output_guard, token_text);
+    }
+    return score;
 }
 
 void vspec_runtime_language_guard_observe(const char* token_text) {
-    if (!g_language_guard_enabled) {
-        return;
+    if (g_language_guard_enabled) {
+        vspec_language_structure_guard_observe_text(&g_language_guard, token_text);
     }
-    vspec_language_structure_guard_observe_text(&g_language_guard, token_text);
+    if (g_output_guard_enabled) {
+        vspec_output_guard_observe(&g_output_guard, token_text);
+    }
 }
 
 void vspec_runtime_language_guard_report(VspecLanguageStructureGuardReport* report) {
@@ -355,6 +391,53 @@ void vspec_runtime_qlora_clear(void) {
 
 void vspec_runtime_adaptive_observe(const VspecRuntimeAdaptiveTelemetry* telemetry) {
     vspec_runtime_controller_observe(&g_runtime_controller, telemetry);
+}
+
+void vspec_runtime_output_guard_init(float strictness) {
+    VspecRuntimeOutputGuardConfig cfg;
+    vspec_output_guard_config_default(&cfg);
+    cfg.strictness = strictness;
+    if (cfg.strictness < 0.0f) {
+        cfg.strictness = 0.0f;
+    }
+    if (cfg.strictness > 1.0f) {
+        cfg.strictness = 1.0f;
+    }
+    vspec_output_guard_init(&g_output_guard, &cfg);
+    g_output_guard_enabled = 1;
+}
+
+int vspec_runtime_output_guard_allow(const char* text_fragment) {
+    if (!g_output_guard_enabled) {
+        return 1;
+    }
+    return vspec_output_guard_allow(&g_output_guard, text_fragment);
+}
+
+float vspec_runtime_output_guard_score_adjustment(const char* text_fragment) {
+    if (!g_output_guard_enabled) {
+        return 0.0f;
+    }
+    return vspec_output_guard_score_adjustment(&g_output_guard, text_fragment);
+}
+
+void vspec_runtime_output_guard_observe(const char* text_fragment) {
+    if (!g_output_guard_enabled) {
+        return;
+    }
+    vspec_output_guard_observe(&g_output_guard, text_fragment);
+}
+
+void vspec_runtime_output_guard_report(VspecRuntimeOutputGuardReport* report) {
+    if (!report) {
+        return;
+    }
+    if (!g_output_guard_enabled) {
+        (void)memset(report, 0, sizeof(*report));
+        report->integrity_pass = 1;
+        return;
+    }
+    vspec_output_guard_report(&g_output_guard, report);
 }
 
 VspecRuntimeAdaptiveDecision vspec_runtime_adaptive_decide(void) {
