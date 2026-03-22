@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -461,6 +462,155 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
     return packed, scales, zero_points
 
 
+def _combine_packed_entries(
+    entries: list[tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]],
+) -> tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"] | None:
+    if np is None or not entries:
+        return None
+
+    bits_ref: Optional[int] = None
+    packed_row_bytes_ref: Optional[int] = None
+    scales_per_row_ref: Optional[int] = None
+    zps_per_row_ref: Optional[int] = None
+
+    packed_rows: list["np.ndarray"] = []
+    scale_rows: list["np.ndarray"] = []
+    zp_rows: list["np.ndarray"] = []
+    has_zero_points = True
+    total_rows = 0
+
+    for entry in entries:
+        packed, scales, bits, out_n, zero_points = entry
+        out_rows = int(out_n)
+        if out_rows <= 0:
+            return None
+        packed_flat = np.ascontiguousarray(packed.reshape(-1), dtype=np.uint8)
+        scales_flat = np.ascontiguousarray(scales.reshape(-1), dtype=np.float32)
+        if packed_flat.size % out_rows != 0 or scales_flat.size % out_rows != 0:
+            return None
+
+        packed_row_bytes = int(packed_flat.size // out_rows)
+        scales_per_row = int(scales_flat.size // out_rows)
+        if packed_row_bytes <= 0 or scales_per_row <= 0:
+            return None
+
+        if zero_points is None:
+            has_zero_points = False
+            zps_flat = None
+            zps_per_row = 0
+        else:
+            zps_flat = np.ascontiguousarray(zero_points.reshape(-1), dtype=np.float32)
+            if zps_flat.size % out_rows != 0:
+                return None
+            zps_per_row = int(zps_flat.size // out_rows)
+
+        if bits_ref is None:
+            bits_ref = int(bits)
+            packed_row_bytes_ref = packed_row_bytes
+            scales_per_row_ref = scales_per_row
+            zps_per_row_ref = zps_per_row
+        else:
+            if int(bits) != bits_ref:
+                return None
+            if packed_row_bytes != packed_row_bytes_ref:
+                return None
+            if scales_per_row != scales_per_row_ref:
+                return None
+            if zps_per_row != zps_per_row_ref:
+                return None
+
+        packed_rows.append(packed_flat.reshape(out_rows, packed_row_bytes))
+        scale_rows.append(scales_flat.reshape(out_rows, scales_per_row))
+        if zps_flat is not None:
+            zp_rows.append(zps_flat.reshape(out_rows, zps_per_row))
+        total_rows += out_rows
+
+    if bits_ref is None or packed_row_bytes_ref is None or scales_per_row_ref is None:
+        return None
+
+    packed_out = np.ascontiguousarray(np.concatenate(packed_rows, axis=0).reshape(-1), dtype=np.uint8)
+    scales_out = np.ascontiguousarray(np.concatenate(scale_rows, axis=0).reshape(-1), dtype=np.float32)
+    zero_points_out: "np.ndarray | None" = None
+    if has_zero_points and zp_rows and zps_per_row_ref is not None and zps_per_row_ref > 0:
+        zero_points_out = np.ascontiguousarray(np.concatenate(zp_rows, axis=0).reshape(-1), dtype=np.float32)
+
+    return packed_out, scales_out, int(bits_ref), int(total_rows), zero_points_out
+
+
+def _maybe_add_packed_combo(
+    packed_map: dict[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]],
+    combo_key: str,
+    keys: list[str],
+) -> None:
+    entries: list[tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]] = []
+    for key in keys:
+        entry = packed_map.get(key)
+        if entry is None:
+            return
+        entries.append(entry)
+
+    combined = _combine_packed_entries(entries)
+    if combined is None:
+        return
+    packed_map[combo_key] = combined
+
+
+def _resolve_int4_precision_windows(total_layers: int) -> tuple[int, int, bool]:
+    # Prefer a speed-balanced default while allowing explicit quality mode via env.
+    mode = os.getenv("VSPEC_INT4_PRECISION_MODE", "balanced").strip().lower() or "balanced"
+    if mode in {"quality", "safe"}:
+        keep_first_default = 2
+        keep_last_default = 2
+        keep_sensitive_default = True
+    elif mode in {"aggressive", "speed"}:
+        keep_first_default = 0
+        keep_last_default = 0
+        keep_sensitive_default = False
+    else:
+        # balanced: keep only edge-most layers in FP and quantize sensitive matrices.
+        keep_first_default = 1
+        keep_last_default = 1
+        keep_sensitive_default = False
+
+    int4_keep_first = max(0, int(os.getenv("VSPEC_INT4_KEEP_FIRST_FP", str(keep_first_default)) or str(keep_first_default)))
+    int4_keep_last = max(0, int(os.getenv("VSPEC_INT4_KEEP_LAST_FP", str(keep_last_default)) or str(keep_last_default)))
+    int4_keep_sensitive = os.getenv("VSPEC_INT4_KEEP_SENSITIVE_FP", "1" if keep_sensitive_default else "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+    if total_layers > 0:
+        int4_keep_first = min(int4_keep_first, total_layers)
+        int4_keep_last = min(int4_keep_last, total_layers)
+    return int4_keep_first, int4_keep_last, int4_keep_sensitive
+
+
+def _resolve_pack_workers(task_count: int) -> int:
+    try:
+        env_raw = os.getenv("VSPEC_PACK_WORKERS", "0").strip()
+        env_workers = int(env_raw) if env_raw else 0
+    except Exception:
+        env_workers = 0
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    default_workers = min(4, cpu_count)
+    workers = env_workers if env_workers > 0 else default_workers
+    workers = max(1, min(workers, max(1, int(task_count))))
+    return workers
+
+
+def _resolve_layer_load_workers(layer_count: int) -> int:
+    try:
+        env_raw = os.getenv("VSPEC_LAYER_LOAD_WORKERS", "2").strip()
+        env_workers = int(env_raw) if env_raw else 2
+    except Exception:
+        env_workers = 2
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    workers = max(1, min(env_workers, cpu_count, max(1, int(layer_count))))
+    return workers
+
+
 def _packed_cache_root() -> Path:
     custom = os.getenv("VSPEC_PACK_CACHE_DIR", "").strip()
     if custom:
@@ -469,7 +619,8 @@ def _packed_cache_root() -> Path:
 
 
 def _packed_cache_write_enabled() -> bool:
-    flag = os.getenv("VSPEC_PACK_CACHE_WRITE", "0").strip().lower()
+    # Default-on persistent pack cache dramatically reduces repeated startup quantization time.
+    flag = os.getenv("VSPEC_PACK_CACHE_WRITE", "1").strip().lower()
     return flag in {"1", "true", "yes", "on"}
 
 
@@ -741,9 +892,29 @@ class GenericTransformerRuntime:
                     lowbit_plan=self.lowbit_plan,
                 )
 
-            q = _linear_native(x_norm, layer.wq, "wq")
-            k = _linear_native(x_norm, layer.wk, "wk")
-            v = _linear_native(x_norm, layer.wv, "wv")
+            def _linear_multi(vec: "np.ndarray", specs: list[tuple[str, "np.ndarray"]], combo_key: str) -> list["np.ndarray"]:
+                use_combo = (
+                    self.use_native_cuda_norm
+                    and self.lowbit_plan.enabled
+                    and self.lowbit_plan.bits in {3, 4}
+                    and combo_key in layer.packed
+                    and len(specs) >= 2
+                )
+                if use_combo:
+                    anchor_w = specs[0][1]
+                    merged = np.ascontiguousarray(_linear_native(vec, anchor_w, combo_key), dtype=np.float32).reshape(-1)
+                    split_sizes = [int(w.shape[0]) for _, w in specs]
+                    total = int(sum(split_sizes))
+                    if merged.size == total:
+                        cuts = np.cumsum(np.asarray(split_sizes[:-1], dtype=np.int64))
+                        return [part.astype(np.float32, copy=False) for part in np.split(merged, cuts)]
+                return [_linear_native(vec, w, key) for key, w in specs]
+
+            q, k, v = _linear_multi(
+                x_norm,
+                [("wq", layer.wq), ("wk", layer.wk), ("wv", layer.wv)],
+                "wq_wk_wv",
+            )
 
             if layer.bq is not None:
                 q = q + layer.bq
@@ -856,15 +1027,17 @@ class GenericTransformerRuntime:
                 x_norm = rmsnorm_f32(x[None, :], layer.norm2, self.rms_eps)[0]
             else:
                 x_norm = _rms_norm(x, layer.norm2, self.rms_eps, layer.norm2_bias)
-            gate = _linear_native(x_norm, layer.w1, "w1")
+            gate, up = _linear_multi(
+                x_norm,
+                [("w1", layer.w1), ("w3", layer.w3)],
+                "w1_w3",
+            )
             if layer.b1 is not None:
                 gate = gate + layer.b1
             if self.use_native_cuda_norm and silu_f32_available():
                 gate = silu_f32(gate)
             else:
                 gate = _silu(gate)
-
-            up = _linear_native(x_norm, layer.w3, "w3")
             if layer.b3 is not None:
                 up = up + layer.b3
 
@@ -909,8 +1082,23 @@ class GenericTransformerRuntime:
     def prefill_tokens(self, token_ids: list[int]) -> None:
         if np is None or not token_ids:
             return
+        try:
+            chunk_size = max(1, int(os.getenv("VSPEC_PREFILL_CHUNK_TOKENS", "64") or "64"))
+        except Exception:
+            chunk_size = 64
+        forward = self._forward_token
+        try:
+            ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+            total = int(ids.size)
+            for start in range(0, total, chunk_size):
+                end = min(total, start + chunk_size)
+                for token_id in ids[start:end]:
+                    forward(int(token_id), return_logits=False)
+            return
+        except Exception:
+            pass
         for token_id in token_ids:
-            self._forward_token(int(token_id), return_logits=False)
+            forward(int(token_id), return_logits=False)
 
     def reset_core_kv_mirrors(self) -> None:
         for mirror in list(getattr(self, "kv_core_mirrors", []) or []):
@@ -1049,8 +1237,23 @@ class GPT2Runtime:
     def prefill_tokens(self, token_ids: list[int]) -> None:
         if np is None or not token_ids:
             return
+        try:
+            chunk_size = max(1, int(os.getenv("VSPEC_PREFILL_CHUNK_TOKENS", "64") or "64"))
+        except Exception:
+            chunk_size = 64
+        forward = self._forward_token
+        try:
+            ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+            total = int(ids.size)
+            for start in range(0, total, chunk_size):
+                end = min(total, start + chunk_size)
+                for token_id in ids[start:end]:
+                    forward(int(token_id), return_logits=False)
+            return
+        except Exception:
+            pass
         for token_id in token_ids:
-            self._forward_token(int(token_id), return_logits=False)
+            forward(int(token_id), return_logits=False)
 
     def reset_core_kv_mirrors(self) -> None:
         self.conv_states = []
@@ -1152,12 +1355,34 @@ class Qwen35Runtime:
                     lowbit_plan=self.lowbit_plan,
                 )
 
+            def _linear_multi(vec: "np.ndarray", specs: list[tuple[str, "np.ndarray"]], combo_key: str) -> list["np.ndarray"]:
+                use_combo = (
+                    self.use_native_cuda_norm
+                    and self.lowbit_plan.enabled
+                    and self.lowbit_plan.bits in {3, 4}
+                    and combo_key in layer.packed
+                    and len(specs) >= 2
+                )
+                if use_combo:
+                    anchor_w = specs[0][1]
+                    merged = np.ascontiguousarray(_linear(vec, anchor_w, combo_key), dtype=np.float32).reshape(-1)
+                    split_sizes = [int(w.shape[0]) for _, w in specs]
+                    total = int(sum(split_sizes))
+                    if merged.size == total:
+                        cuts = np.cumsum(np.asarray(split_sizes[:-1], dtype=np.int64))
+                        return [part.astype(np.float32, copy=False) for part in np.split(merged, cuts)]
+                return [_linear(vec, w, key) for key, w in specs]
+
             if layer.layer_type == "full_attention":
                 assert layer.wq is not None and layer.wk is not None and layer.wv is not None and layer.wo is not None
-                q_proj = _linear(x_norm, layer.wq, "wq")
+                q_proj, k_proj, v_proj = _linear_multi(
+                    x_norm,
+                    [("wq", layer.wq), ("wk", layer.wk), ("wv", layer.wv)],
+                    "wq_wk_wv",
+                )
                 q, gate = _split_qwen35_q_and_gate(q_proj, self.num_heads, self.head_dim)
-                k = _linear(x_norm, layer.wk, "wk").reshape(self.num_kv_heads, self.head_dim)
-                v = _linear(x_norm, layer.wv, "wv").reshape(self.num_kv_heads, self.head_dim)
+                k = k_proj.reshape(self.num_kv_heads, self.head_dim)
+                v = v_proj.reshape(self.num_kv_heads, self.head_dim)
 
                 if layer.q_norm is not None:
                     q = _rms_norm(q, layer.q_norm, self.rms_eps, None)
@@ -1275,8 +1500,11 @@ class Qwen35Runtime:
             else:
                 x_norm = _rms_norm(x, layer.post_attention_norm, self.rms_eps, None)
 
-            gate = _linear(x_norm, layer.w1, "w1")
-            up = _linear(x_norm, layer.w3, "w3")
+            gate, up = _linear_multi(
+                x_norm,
+                [("w1", layer.w1), ("w3", layer.w3)],
+                "w1_w3",
+            )
             if self.use_native_cuda_norm and silu_f32_available():
                 gate = silu_f32(gate)
             else:
@@ -1322,8 +1550,23 @@ class Qwen35Runtime:
     def prefill_tokens(self, token_ids: list[int]) -> None:
         if np is None or not token_ids:
             return
+        try:
+            chunk_size = max(1, int(os.getenv("VSPEC_PREFILL_CHUNK_TOKENS", "64") or "64"))
+        except Exception:
+            chunk_size = 64
+        forward = self._forward_token
+        try:
+            ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+            total = int(ids.size)
+            for start in range(0, total, chunk_size):
+                end = min(total, start + chunk_size)
+                for token_id in ids[start:end]:
+                    forward(int(token_id), return_logits=False)
+            return
+        except Exception:
+            pass
         for token_id in token_ids:
-            self._forward_token(int(token_id), return_logits=False)
+            forward(int(token_id), return_logits=False)
 
     def reset_core_kv_mirrors(self) -> None:
         return
@@ -1718,10 +1961,9 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
         int4_allowed_keys = {k.strip().lower() for k in int4_keys_raw.split(",") if k.strip()}
         if not int4_allowed_keys:
             int4_allowed_keys = {"wq", "wk", "wv", "wo", "w1", "w2", "w3"}
-        int4_keep_first = max(0, int(os.getenv("VSPEC_INT4_KEEP_FIRST_FP", "0") or "0"))
-        int4_keep_last = max(0, int(os.getenv("VSPEC_INT4_KEEP_LAST_FP", "0") or "0"))
-        int4_keep_sensitive = (os.getenv("VSPEC_INT4_KEEP_SENSITIVE_FP", "0").strip().lower() not in {"0", "false", "no", "off"})
+        int4_keep_first, int4_keep_last, int4_keep_sensitive = _resolve_int4_precision_windows(total_layers)
         sensitive_int4_keys = {"wq", "wk", "wo"}
+        pack_jobs: list[tuple[str, "np.ndarray", int]] = []
         for key, w in {
             "wq": layer.wq,
             "wk": layer.wk,
@@ -1750,6 +1992,10 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
             if matrix_bits <= 0:
                 continue
 
+            pack_jobs.append((key, w, int(matrix_bits)))
+
+        def _pack_one(entry: tuple[str, "np.ndarray", int]) -> tuple[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]]:
+            key, w, matrix_bits = entry
             cache_key = _packed_cache_key(prefix, key, matrix_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
@@ -1757,7 +2003,23 @@ def _load_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fused_bits:
             else:
                 packed, scales, zero_points = _quantize_weight_rowwise(w, matrix_bits)
                 _save_packed_cache(cache_key, packed, scales, zero_points)
-            layer.packed[key] = (packed, scales, matrix_bits, int(w.shape[0]), zero_points)
+            return key, (packed, scales, matrix_bits, int(w.shape[0]), zero_points)
+
+        workers = _resolve_pack_workers(len(pack_jobs))
+        if workers <= 1 or len(pack_jobs) <= 1:
+            for job in pack_jobs:
+                key, packed_entry = _pack_one(job)
+                layer.packed[key] = packed_entry
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_pack_one, job) for job in pack_jobs]
+                for fut in as_completed(futures):
+                    key, packed_entry = fut.result()
+                    layer.packed[key] = packed_entry
+
+        # Reduce per-token kernel launches by combining compatible projections.
+        _maybe_add_packed_combo(layer.packed, "wq_wk_wv", ["wq", "wk", "wv"])
+        _maybe_add_packed_combo(layer.packed, "w1_w3", ["w1", "w3"])
 
     return layer
 
@@ -1923,17 +2185,71 @@ def _load_qwen35_layer(weight_index: dict[str, WeightInfo], layer_idx: int, fuse
         return None
 
     if fused_bits in {3, 4}:
+        total_layers_guess = 0
+        try:
+            qwen_layer_ids = {
+                int(name.split(".")[1])
+                for name in weight_index.keys()
+                if name.startswith("blk.") and len(name.split(".")) > 2 and name.split(".")[1].isdigit()
+            }
+            if qwen_layer_ids:
+                total_layers_guess = max(qwen_layer_ids) + 1
+        except Exception:
+            total_layers_guess = 0
+
+        int4_keep_first, int4_keep_last, int4_keep_sensitive = _resolve_int4_precision_windows(total_layers_guess)
+        int4_keys_raw = os.getenv("VSPEC_INT4_MATRIX_KEYS", "wq,wk,wv,wo,w1,w2,w3,wqkv,wgate,ssm_alpha,ssm_beta,ssm_out")
+        int4_allowed_keys = {k.strip().lower() for k in int4_keys_raw.split(",") if k.strip()}
+        if not int4_allowed_keys:
+            int4_allowed_keys = {"wq", "wk", "wv", "wo", "w1", "w2", "w3", "wqkv", "wgate", "ssm_alpha", "ssm_beta", "ssm_out"}
+        sensitive_int4_keys = {"wq", "wk", "wo", "wqkv", "ssm_out"}
+
+        pack_jobs: list[tuple[str, "np.ndarray", int]] = []
         for key, w in pack_targets.items():
             if w is None:
                 continue
-            cache_key = _packed_cache_key(f"qwen35.layers.{layer_idx}.", key, fused_bits, w)
+            matrix_bits = fused_bits
+            if fused_bits == 4:
+                in_first_window = int4_keep_first > 0 and layer_idx < int4_keep_first
+                in_last_window = int4_keep_last > 0 and total_layers_guess > 0 and layer_idx >= max(0, total_layers_guess - int4_keep_last)
+                if key.lower() not in int4_allowed_keys:
+                    matrix_bits = 0
+                elif in_first_window or in_last_window:
+                    matrix_bits = 0
+                elif int4_keep_sensitive and key in sensitive_int4_keys:
+                    matrix_bits = 0
+
+            if matrix_bits <= 0:
+                continue
+
+            pack_jobs.append((key, w, int(matrix_bits)))
+
+        def _pack_one(entry: tuple[str, "np.ndarray", int]) -> tuple[str, tuple["np.ndarray", "np.ndarray", int, int, "np.ndarray | None"]]:
+            key, w, matrix_bits = entry
+            cache_key = _packed_cache_key(f"qwen35.layers.{layer_idx}.", key, matrix_bits, w)
             cached = _load_packed_cache(cache_key)
             if cached is not None:
                 packed, scales, zero_points = cached
             else:
-                packed, scales, zero_points = _quantize_weight_rowwise(w, fused_bits)
+                packed, scales, zero_points = _quantize_weight_rowwise(w, matrix_bits)
                 _save_packed_cache(cache_key, packed, scales, zero_points)
-            layer.packed[key] = (packed, scales, fused_bits, int(w.shape[0]), zero_points)
+            return key, (packed, scales, matrix_bits, int(w.shape[0]), zero_points)
+
+        workers = _resolve_pack_workers(len(pack_jobs))
+        if workers <= 1 or len(pack_jobs) <= 1:
+            for job in pack_jobs:
+                key, packed_entry = _pack_one(job)
+                layer.packed[key] = packed_entry
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_pack_one, job) for job in pack_jobs]
+                for fut in as_completed(futures):
+                    key, packed_entry = fut.result()
+                    layer.packed[key] = packed_entry
+
+        if layer.layer_type == "full_attention":
+            _maybe_add_packed_combo(layer.packed, "wq_wk_wv", ["wq", "wk", "wv"])
+        _maybe_add_packed_combo(layer.packed, "w1_w3", ["w1", "w3"])
 
     return layer
 
@@ -2028,13 +2344,48 @@ def _load_qwen35_runtime(
         layers: list[Qwen35LayerWeights] = []
         if progress_cb is not None:
             progress_cb("layer_load", 0, num_layers)
-        for idx in range(num_layers):
-            layer = _load_qwen35_layer(weight_index, idx, fused_bits)
-            if layer is None:
-                break
-            layers.append(layer)
-            if progress_cb is not None:
-                progress_cb("layer_load", idx + 1, num_layers)
+        layer_load_workers = _resolve_layer_load_workers(num_layers)
+        if layer_load_workers <= 1 or num_layers <= 1:
+            for idx in range(num_layers):
+                layer = _load_qwen35_layer(weight_index, idx, fused_bits)
+                if layer is None:
+                    break
+                layers.append(layer)
+                if progress_cb is not None:
+                    progress_cb("layer_load", idx + 1, num_layers)
+        else:
+            layer_map: dict[int, Qwen35LayerWeights] = {}
+            try:
+                with ThreadPoolExecutor(max_workers=layer_load_workers) as executor:
+                    futures = {
+                        executor.submit(_load_qwen35_layer, weight_index, idx, fused_bits): idx
+                        for idx in range(num_layers)
+                    }
+                    completed = 0
+                    for fut in as_completed(futures):
+                        idx = futures[fut]
+                        layer = fut.result()
+                        if layer is not None:
+                            layer_map[idx] = layer
+                        completed += 1
+                        if progress_cb is not None:
+                            progress_cb("layer_load", min(completed, num_layers), num_layers)
+                for idx in range(num_layers):
+                    layer = layer_map.get(idx)
+                    if layer is None:
+                        break
+                    layers.append(layer)
+            except Exception:
+                layers = []
+                if progress_cb is not None:
+                    progress_cb("layer_load", 0, num_layers)
+                for idx in range(num_layers):
+                    layer = _load_qwen35_layer(weight_index, idx, fused_bits)
+                    if layer is None:
+                        break
+                    layers.append(layer)
+                    if progress_cb is not None:
+                        progress_cb("layer_load", idx + 1, num_layers)
         if not layers:
             return None
 
@@ -2352,13 +2703,48 @@ def _load_generic_transformer(
         layers: list[LayerWeights] = []
         if progress_cb is not None:
             progress_cb("layer_load", 0, num_layers)
-        for idx in range(num_layers):
-            layer = _load_layer(weight_index, idx, fused_bits, num_layers)
-            if layer is None:
-                break
-            layers.append(layer)
-            if progress_cb is not None:
-                progress_cb("layer_load", idx + 1, num_layers)
+        layer_load_workers = _resolve_layer_load_workers(num_layers)
+        if layer_load_workers <= 1 or num_layers <= 1:
+            for idx in range(num_layers):
+                layer = _load_layer(weight_index, idx, fused_bits, num_layers)
+                if layer is None:
+                    break
+                layers.append(layer)
+                if progress_cb is not None:
+                    progress_cb("layer_load", idx + 1, num_layers)
+        else:
+            layer_map: dict[int, LayerWeights] = {}
+            try:
+                with ThreadPoolExecutor(max_workers=layer_load_workers) as executor:
+                    futures = {
+                        executor.submit(_load_layer, weight_index, idx, fused_bits, num_layers): idx
+                        for idx in range(num_layers)
+                    }
+                    completed = 0
+                    for fut in as_completed(futures):
+                        idx = futures[fut]
+                        layer = fut.result()
+                        if layer is not None:
+                            layer_map[idx] = layer
+                        completed += 1
+                        if progress_cb is not None:
+                            progress_cb("layer_load", min(completed, num_layers), num_layers)
+                for idx in range(num_layers):
+                    layer = layer_map.get(idx)
+                    if layer is None:
+                        break
+                    layers.append(layer)
+            except Exception:
+                layers = []
+                if progress_cb is not None:
+                    progress_cb("layer_load", 0, num_layers)
+                for idx in range(num_layers):
+                    layer = _load_layer(weight_index, idx, fused_bits, num_layers)
+                    if layer is None:
+                        break
+                    layers.append(layer)
+                    if progress_cb is not None:
+                        progress_cb("layer_load", idx + 1, num_layers)
 
         if not layers:
             return None

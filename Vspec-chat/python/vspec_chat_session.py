@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -109,6 +110,40 @@ def _generate(
     assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=allow_semantic_rescue)
     prompt_chars = len((prompt or "").strip())
 
+    def _is_numeric_like_text(text: str) -> bool:
+        out = (text or "").strip()
+        if not out:
+            return False
+        compact = out.replace(" ", "")
+        return re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", compact) is not None
+
+    def _resolve_min_decode_tokens(prompt_text: str, language: str) -> int:
+        text = (prompt_text or "").strip()
+        words = len([w for w in text.split() if w])
+        chars = len(text)
+        if chars <= 36 or words <= 8:
+            return 2
+        if chars <= 90 or words <= 18:
+            return 6 if language == "en" else 5
+        return 10 if language == "en" else 8
+
+    brief_numeric_mode = False
+
+    def _looks_incomplete_stub(text: str) -> bool:
+        out = (text or "").strip()
+        if not out:
+            return True
+        if out.endswith((":", ";", ",", "-")) and len(out) <= 96:
+            return True
+        if out.count("(") != out.count(")") or out.count("[") != out.count("]") or out.count("{") != out.count("}"):
+            return True
+        if out.count('"') % 2 == 1:
+            return True
+        return False
+
+    decode_min_tokens = _resolve_min_decode_tokens(prompt, lang_mode)
+    brief_answer_mode = decode_min_tokens <= 2
+
     def _entropy_from_logits(logits_obj) -> float:
         try:
             vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
@@ -124,6 +159,8 @@ def _generate(
 
     def _is_meaningful_partial(candidate: str, generated_tokens: int) -> bool:
         out = (candidate or "").strip()
+        if brief_numeric_mode and _is_numeric_like_text(out):
+            return True
         if lang_mode == "en" and prioritize_english:
             letters = sum(1 for ch in out if ch.isalpha())
             words = [w for w in out.split() if w]
@@ -190,6 +227,8 @@ def _generate(
         usable = max(0.5, decode_budget_seconds - reserve)
         cap = int(usable / token_latency)
         cap = max(12, cap)
+        if brief_numeric_mode:
+            cap = min(cap, 12)
         return max(1, min(int(requested_steps), cap))
 
     def _should_quality_retry(candidate: str) -> bool:
@@ -199,6 +238,15 @@ def _generate(
         out = (repaired or "").strip()
         if not out or "�" in out:
             return True
+        if _looks_incomplete_stub(out):
+            return True
+        if brief_answer_mode and len(out) <= 24 and (not _looks_gibberish_output(out)):
+            return False
+        if brief_numeric_mode:
+            if _is_numeric_like_text(out):
+                return False
+            if len(out) <= 24 and (not _looks_gibberish_output(out)):
+                return False
         if lang_mode == "en" and prioritize_english:
             if len(out) < 12:
                 return True
@@ -297,6 +345,7 @@ def _generate(
         local_stream: bool,
         decode_budget_seconds: float,
         max_steps: int,
+        min_decode_tokens_local: int,
         disable_structure_guard_local: bool,
     ) -> tuple[str, int, float, dict | None, bool, bool]:
         debug_logits = os.getenv("VSPEC_DEBUG_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -399,6 +448,14 @@ def _generate(
                     logits = threebit_module.denoise_logits(logits, step)
                     logits = decode_optimizer.apply_generation_controls(logits, local_tokens)
 
+                    if adapter.eos_token_id is not None and len(generated) < int(max(0, min_decode_tokens_local)):
+                        eos_id = int(adapter.eos_token_id)
+                        try:
+                            if 0 <= eos_id < len(logits):
+                                logits[eos_id] = -1e9
+                        except Exception:
+                            pass
+
                     entropy_now = _entropy_from_logits(logits)
                     entropy_collapse = max(0.0, adaptive_entropy_prev - entropy_now)
                     adaptive_entropy_prev = entropy_now
@@ -473,10 +530,22 @@ def _generate(
     decode_budget = _resolve_decode_budget_seconds(prefill_tokens, layer_count)
     retry_budget = _resolve_retry_budget_seconds(decode_budget)
     decode_step_cap = _resolve_budget_step_cap(max_tokens, decode_budget, prefill_tokens, layer_count)
+    decode_temperature = temperature
+    decode_top_k = top_k
+    decode_lang_top_n = lang_top_n
+    decode_greedy = greedy
+    if brief_numeric_mode:
+        decode_temperature = min(0.35, max(0.05, float(temperature) * 0.55))
+        decode_top_k = max(1, min(8, int(top_k) if int(top_k) > 0 else 8))
+        decode_lang_top_n = max(16, min(int(lang_top_n), 48))
+        decode_greedy = True
+        decode_step_cap = min(decode_step_cap, 12)
     print(f"[session] decode_budget_seconds= {decode_budget:.1f}")
     print(f"[session] retry_budget_seconds= {retry_budget:.1f}")
     if decode_step_cap != int(max_tokens):
         print(f"[session] decode_step_cap= {decode_step_cap} (requested={int(max_tokens)})")
+    if brief_numeric_mode:
+        print("[session] concise_numeric_mode= on")
 
     effective_disable_structure_guard = bool(disable_structure_guard)
     if (not effective_disable_structure_guard) and prioritize_english and lang_mode == "en":
@@ -518,6 +587,7 @@ def _generate(
             local_stream=False,
             decode_budget_seconds=retry_budget,
             max_steps=decode_steps,
+            min_decode_tokens_local=decode_min_tokens,
             disable_structure_guard_local=effective_disable_structure_guard,
         )
 
@@ -554,22 +624,24 @@ def _generate(
             local_stream=False,
             decode_budget_seconds=retry_budget,
             max_steps=decode_steps,
+            min_decode_tokens_local=decode_min_tokens,
             disable_structure_guard_local=True,
         )
 
     text, gen_count, tps, report, timed_out_first, contract_failed_first = _decode_once(
         runtime_obj=runtime,
         local_tokens=list(base_tokens),
-        local_temperature=temperature,
-        local_top_k=top_k,
-        local_lang_top_n=lang_top_n,
-        local_greedy=greedy,
+        local_temperature=decode_temperature,
+        local_top_k=decode_top_k,
+        local_lang_top_n=decode_lang_top_n,
+        local_greedy=decode_greedy,
         local_rep_penalty=repetition_penalty,
         local_repeat_window=repeat_window,
         local_no_repeat_ngram=no_repeat_ngram,
         local_stream=stream,
         decode_budget_seconds=decode_budget,
         max_steps=decode_step_cap,
+        min_decode_tokens_local=decode_min_tokens,
         disable_structure_guard_local=effective_disable_structure_guard,
     )
 
@@ -582,16 +654,42 @@ def _generate(
         rescue_ngram = max(3, no_repeat_ngram)
         rescue_steps = max(8, min(decode_step_cap, 64))
 
-        rescue_result = _run_native_safe_rescue(
-            reason="decode-failure",
-            decode_steps=rescue_steps,
-            decode_temp=rescue_temp,
-            decode_top_k=rescue_top_k,
-            decode_lang_top_n=rescue_lang_top_n,
-            decode_rep_penalty=rescue_rep,
-            decode_repeat_window=rescue_window,
-            decode_no_repeat_ngram=rescue_ngram,
-        )
+        if brief_numeric_mode:
+            rescue_top_k = max(1, min(4, rescue_top_k))
+            rescue_lang_top_n = max(16, min(rescue_lang_top_n, 32))
+            rescue_temp = min(0.28, rescue_temp)
+            rescue_steps = max(2, min(rescue_steps, 8))
+
+        rescue_result = None
+        if brief_numeric_mode:
+            _prefill_runtime(runtime, base_tokens)
+            rescue_result = _decode_once(
+                runtime_obj=runtime,
+                local_tokens=list(base_tokens),
+                local_temperature=rescue_temp,
+                local_top_k=rescue_top_k,
+                local_lang_top_n=rescue_lang_top_n,
+                local_greedy=True,
+                local_rep_penalty=rescue_rep,
+                local_repeat_window=rescue_window,
+                local_no_repeat_ngram=rescue_ngram,
+                local_stream=False,
+                decode_budget_seconds=retry_budget,
+                max_steps=rescue_steps,
+                min_decode_tokens_local=decode_min_tokens,
+                disable_structure_guard_local=effective_disable_structure_guard,
+            )
+        if rescue_result is None:
+            rescue_result = _run_native_safe_rescue(
+                reason="decode-failure",
+                decode_steps=rescue_steps,
+                decode_temp=rescue_temp,
+                decode_top_k=rescue_top_k,
+                decode_lang_top_n=rescue_lang_top_n,
+                decode_rep_penalty=rescue_rep,
+                decode_repeat_window=rescue_window,
+                decode_no_repeat_ngram=rescue_ngram,
+            )
         if rescue_result is None:
             rescue_result = _run_torch_rescue(
                 reason="decode-failure",
@@ -662,6 +760,7 @@ def _generate(
                         local_stream=False,
                         decode_budget_seconds=retry_budget,
                         max_steps=rescue_steps,
+                        min_decode_tokens_local=decode_min_tokens,
                         disable_structure_guard_local=effective_disable_structure_guard,
                     )
 
@@ -728,6 +827,7 @@ def _generate(
                 local_stream=False,
                 decode_budget_seconds=retry_budget,
                 max_steps=max(8, min(decode_step_cap, 64)),
+                min_decode_tokens_local=decode_min_tokens,
                 disable_structure_guard_local=effective_disable_structure_guard,
             )
 

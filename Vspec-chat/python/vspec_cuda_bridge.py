@@ -35,6 +35,50 @@ _lib = _load_lib()
 _HAS_FUSED_INT4 = False
 _HAS_FUSED_INT3 = False
 _INT4_BRIDGE_ABI = "unknown"
+_INT4_BRIDGE_SIGNATURE = "unknown"
+
+
+def _ensure_c_array(arr: np.ndarray, dtype) -> np.ndarray:
+    if arr.dtype != dtype:
+        return np.ascontiguousarray(arr, dtype=dtype)
+    if not arr.flags.c_contiguous:
+        return np.ascontiguousarray(arr)
+    return arr
+
+
+def _set_int4_bridge_signature(signature: str) -> None:
+    global _INT4_BRIDGE_SIGNATURE
+    if _lib is None or not _HAS_FUSED_INT4:
+        return
+    if _INT4_BRIDGE_SIGNATURE == signature:
+        return
+    bridge = _lib.vspec_cuda_fused_linear_int4_bridge
+    if signature == "legacy":
+        bridge.argtypes = [
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        bridge.restype = c_int
+        _INT4_BRIDGE_SIGNATURE = "legacy"
+        return
+    bridge.argtypes = [
+        POINTER(c_float),
+        ctypes.POINTER(ctypes.c_ubyte),
+        POINTER(c_float),
+        POINTER(c_float),
+        c_size_t,
+        c_size_t,
+        c_size_t,
+        c_size_t,
+        POINTER(c_float),
+    ]
+    bridge.restype = c_int
+    _INT4_BRIDGE_SIGNATURE = "new"
 
 if _lib is not None:
     _lib.vspec_cuda_rmsnorm_f32_bridge.argtypes = [
@@ -130,6 +174,7 @@ if _lib is not None:
             POINTER(c_float),
         ]
         _lib.vspec_cuda_fused_linear_int4_bridge.restype = c_int
+        _INT4_BRIDGE_SIGNATURE = "new"
         _HAS_FUSED_INT4 = True
 
     if hasattr(_lib, "vspec_cuda_fused_linear_int3_bridge"):
@@ -405,24 +450,16 @@ def fused_linear_int4(
     global _INT4_BRIDGE_ABI
     if _lib is None or not _HAS_FUSED_INT4:
         raise RuntimeError("vspec_cuda_bridge.dll not found")
-    if input_array.dtype != np.float32:
-        input_array = input_array.astype(np.float32)
-    if packed_weight.dtype != np.uint8:
-        packed_weight = packed_weight.astype(np.uint8)
-    if scales.dtype != np.float32:
-        scales = scales.astype(np.float32)
-    if zero_points is None:
-        zero_points = np.zeros((n,), dtype=np.float32)
-    elif zero_points.dtype != np.float32:
-        zero_points = zero_points.astype(np.float32)
+    has_zero_points = zero_points is not None
 
     if input_array.ndim == 1:
         input_array = input_array[None, :]
 
-    input_array = np.ascontiguousarray(input_array)
-    packed_weight = np.ascontiguousarray(packed_weight)
-    scales = np.ascontiguousarray(scales)
-    zero_points = np.ascontiguousarray(zero_points)
+    input_array = _ensure_c_array(input_array, np.float32)
+    packed_weight = _ensure_c_array(packed_weight, np.uint8)
+    scales = _ensure_c_array(scales, np.float32)
+    zero_points_arr = _ensure_c_array(zero_points, np.float32) if has_zero_points else None
+    zp_ptr = zero_points_arr.ctypes.data_as(POINTER(c_float)) if zero_points_arr is not None else None
 
     m, k = input_array.shape
     n_blocks = 1
@@ -433,23 +470,12 @@ def fused_linear_int4(
     bridge = _lib.vspec_cuda_fused_linear_int4_bridge
 
     def _call_new_abi() -> int:
-        bridge.argtypes = [
-            POINTER(c_float),
-            ctypes.POINTER(ctypes.c_ubyte),
-            POINTER(c_float),
-            POINTER(c_float),
-            c_size_t,
-            c_size_t,
-            c_size_t,
-            c_size_t,
-            POINTER(c_float),
-        ]
-        bridge.restype = c_int
+        _set_int4_bridge_signature("new")
         return bridge(
             input_array.ctypes.data_as(POINTER(c_float)),
             packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
             scales.ctypes.data_as(POINTER(c_float)),
-            zero_points.ctypes.data_as(POINTER(c_float)),
+            zp_ptr,
             c_size_t(m),
             c_size_t(k),
             c_size_t(n),
@@ -458,16 +484,7 @@ def fused_linear_int4(
         )
 
     def _call_legacy_abi() -> int:
-        bridge.argtypes = [
-            POINTER(c_float),
-            ctypes.POINTER(ctypes.c_ubyte),
-            POINTER(c_float),
-            c_size_t,
-            c_size_t,
-            c_size_t,
-            POINTER(c_float),
-        ]
-        bridge.restype = c_int
+        _set_int4_bridge_signature("legacy")
         return bridge(
             input_array.ctypes.data_as(POINTER(c_float)),
             packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
@@ -478,7 +495,13 @@ def fused_linear_int4(
             output.ctypes.data_as(POINTER(c_float)),
         )
 
-    if _INT4_BRIDGE_ABI in {"unknown", "new"}:
+    if _INT4_BRIDGE_ABI == "new":
+        ok_new = _call_new_abi()
+        if ok_new == 1:
+            return output
+        _INT4_BRIDGE_ABI = "unknown"
+
+    if _INT4_BRIDGE_ABI == "unknown":
         ok_new = _call_new_abi()
         if ok_new == 1:
             _INT4_BRIDGE_ABI = "new"
@@ -497,9 +520,9 @@ def fused_linear_int4(
         raise RuntimeError("legacy int4 bridge does not support block-wise scales")
 
     # Emulate asymmetric zero-point correction for legacy bridge output.
-    if zero_points is not None and zero_points.size == int(n):
+    if zero_points_arr is not None and zero_points_arr.size == int(n):
         vec_sum = np.sum(input_array.astype(np.float32, copy=False), axis=-1, keepdims=True)
-        zp_scale = np.ascontiguousarray(zero_points.astype(np.float32, copy=False) * scales.astype(np.float32, copy=False))
+        zp_scale = np.ascontiguousarray(zero_points_arr.astype(np.float32, copy=False) * scales.astype(np.float32, copy=False))
         output = output - (vec_sum * zp_scale[None, :])
     return output
 
@@ -507,19 +530,12 @@ def fused_linear_int4(
 def fused_linear_int3(input_array: np.ndarray, packed_weight: np.ndarray, scales: np.ndarray, n: int) -> np.ndarray:
     if _lib is None or not _HAS_FUSED_INT3:
         raise RuntimeError("vspec_cuda_bridge.dll not found")
-    if input_array.dtype != np.float32:
-        input_array = input_array.astype(np.float32)
-    if packed_weight.dtype != np.uint8:
-        packed_weight = packed_weight.astype(np.uint8)
-    if scales.dtype != np.float32:
-        scales = scales.astype(np.float32)
-
     if input_array.ndim == 1:
         input_array = input_array[None, :]
 
-    input_array = np.ascontiguousarray(input_array)
-    packed_weight = np.ascontiguousarray(packed_weight)
-    scales = np.ascontiguousarray(scales)
+    input_array = _ensure_c_array(input_array, np.float32)
+    packed_weight = _ensure_c_array(packed_weight, np.uint8)
+    scales = _ensure_c_array(scales, np.float32)
 
     m, k = input_array.shape
     output = np.empty((m, n), dtype=np.float32)

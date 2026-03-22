@@ -14,12 +14,26 @@ class RuntimeMeaningfulResponseAssurance:
             return self._decode_error_response()
         if self._is_decode_failure_message(cleaned):
             return self._decode_error_response()
+        if self._looks_incomplete_stub(cleaned):
+            return self._decode_error_response()
         salvaged = self._salvage_prefix(cleaned)
         if salvaged and salvaged != cleaned:
             return salvaged
         if self._looks_hard_corrupted(cleaned):
             return self._decode_error_response()
         return cleaned
+
+    def _looks_incomplete_stub(self, text: str) -> bool:
+        s = (text or "").strip()
+        if not s:
+            return True
+        if s.endswith((":", ";", ",", "-")) and len(s) <= 96:
+            return True
+        if s.count("(") != s.count(")") or s.count("[") != s.count("]") or s.count("{") != s.count("}"):
+            return True
+        if s.count('"') % 2 == 1:
+            return True
+        return False
 
     def _is_decode_failure_message(self, text: str) -> bool:
         lowered = text.lower()
@@ -92,6 +106,8 @@ class RuntimeMeaningfulResponseAssurance:
         if len(sample) < 2 or len(sample) > 160:
             return False
         if "�" in sample:
+            return False
+        if self._looks_incomplete_stub(sample):
             return False
         if sample.lower().startswith("[vspec-decode-error]"):
             return False

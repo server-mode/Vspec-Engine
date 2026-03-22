@@ -32,7 +32,7 @@ from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projecti
 from runtime_threebit_module import ThreeBitRuntimeModule
 from decode_contract import sanitize_and_validate_logits
 from native_safe_decode import resolve_native_safe_max_layers
-from runtime_core_bridge import CoreDecodeSession, adaptive_step
+from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, adaptive_step
 from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
 
 
@@ -1046,6 +1046,11 @@ def main() -> None:
         print("[vspec-chat] batch_mode= prompts-file")
 
     start_ts = time.perf_counter()
+    runtime_load_elapsed = 0.0
+    prefill_elapsed = 0.0
+    prefill_tokens_total = 0
+    prefill_core_scheduler_used = False
+    prefill_core_steps = 0
     vram_before = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None
 
     def _runtime_progress(stage: str, current: int, total: int) -> None:
@@ -1056,6 +1061,7 @@ def main() -> None:
         pct = 36 + int((current / total) * 22)
         _progress(show_progress, min(58, pct), "runtime-load", f"layer {current}/{total}")
 
+    runtime_load_t0 = time.perf_counter()
     runtime = build_generic_runtime(
         config,
         weight_index,
@@ -1063,6 +1069,7 @@ def main() -> None:
         args.device,
         progress_cb=_runtime_progress,
     )
+    runtime_load_elapsed = max(0.0, time.perf_counter() - runtime_load_t0)
     runtime_mode = "stub"
     if runtime is None:
         reason = runtime_load_reason(
@@ -1156,6 +1163,7 @@ def main() -> None:
 
         # Prefill KV cache with prompt tokens so attention has context.
         if len(token_ids) > 1 and hasattr(runtime, "cache_k"):
+            prefill_ts = time.perf_counter()
             if hasattr(runtime, "reset_core_kv_mirrors"):
                 try:
                     runtime.reset_core_kv_mirrors()
@@ -1168,12 +1176,62 @@ def main() -> None:
             runtime.position = 0
             prefill_ids = token_ids[:-1]
             total_prefill = len(prefill_ids)
+            prefill_tokens_total = int(total_prefill)
             if hasattr(runtime, "prefill_tokens"):
-                runtime.prefill_tokens(prefill_ids)
+                run_prefill_direct = True
+                use_prefill_core_sched = os.getenv("VSPEC_PREFILL_CORE_SCHED", "0").strip().lower() not in {"0", "false", "no", "off"}
+                if use_prefill_core_sched and total_prefill > 0:
+                    print("[vspec-chat] prefill_core_scheduler_experimental= on")
+                    try:
+                        core_prefill = CoreContinuousBatcher.from_runtime(runtime, max_batch_items=1, max_batch_tokens=max(64, total_prefill))
+                        if core_prefill.available:
+                            reserve_prefill = CoreDecodeSession.estimate_reserve_bytes(runtime, 1)
+                            req_id = core_prefill.submit(
+                                reserve_bytes=reserve_prefill,
+                                prompt_tokens=total_prefill,
+                                max_new_tokens=1,
+                                priority=0,
+                            )
+                            if req_id > 0:
+                                consumed_total = 0
+                                while consumed_total < total_prefill:
+                                    items = core_prefill.next_batch(1)
+                                    if not items:
+                                        break
+                                    item = items[0]
+                                    phase = int(item.get("phase", 0))
+                                    if phase == 1:
+                                        cursor = max(0, int(item.get("prompt_cursor", consumed_total)))
+                                        quota = max(1, int(item.get("token_quota", 1)))
+                                        chunk = prefill_ids[cursor : min(total_prefill, cursor + quota)]
+                                        if chunk:
+                                            runtime.prefill_tokens(chunk)
+                                        consumed = len(chunk)
+                                        core_prefill.commit_prefill(req_id, consumed)
+                                        consumed_total = max(consumed_total, cursor + consumed)
+                                        prefill_core_steps += 1
+                                        if total_prefill > 0 and (consumed_total == total_prefill or consumed_total % max(1, total_prefill // 4) == 0):
+                                            pct = 60 + int((consumed_total / total_prefill) * 20)
+                                            _progress(show_progress, min(80, pct), "prefill-core", f"{consumed_total}/{total_prefill} tokens")
+                                        continue
+                                    core_prefill.cancel(req_id)
+                                    break
+                                if consumed_total >= total_prefill:
+                                    prefill_core_scheduler_used = True
+                                    run_prefill_direct = False
+                                    stats = core_prefill.stats()
+                                    if stats:
+                                        print("[vspec-chat] prefill_core_reserved_vram=", int(stats.get("reserved_vram", 0)))
+                            core_prefill.close()
+                    except Exception:
+                        run_prefill_direct = True
+
+                if run_prefill_direct:
+                    runtime.prefill_tokens(prefill_ids)
                 if total_prefill > 0:
                     _progress(show_progress, 80, "prefill", f"{total_prefill}/{total_prefill} tokens")
                 if not _cache_integrity_ok(runtime, total_prefill):
-                    print("[vspec-chat] prefill_cache_integrity= failed; replaying token-by-token")
+                    print("[vspec-chat] prefill_cache_integrity= failed; replaying in chunks")
                     if hasattr(runtime, "reset_core_kv_mirrors"):
                         try:
                             runtime.reset_core_kv_mirrors()
@@ -1184,17 +1242,31 @@ def main() -> None:
                     if hasattr(runtime, "cache_len"):
                         runtime.cache_len = []
                     runtime.position = 0
-                    for idx, tid in enumerate(prefill_ids, start=1):
-                        runtime.forward_logits([tid])
-                        if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
-                            pct = 60 + int((idx / total_prefill) * 20)
-                            _progress(show_progress, min(80, pct), "prefill-replay", f"{idx}/{total_prefill} tokens")
+                    try:
+                        replay_chunk = max(1, int(os.getenv("VSPEC_PREFILL_REPLAY_CHUNK", "64") or "64"))
+                    except Exception:
+                        replay_chunk = 64
+                    if hasattr(runtime, "prefill_tokens"):
+                        for start in range(0, total_prefill, replay_chunk):
+                            end = min(total_prefill, start + replay_chunk)
+                            runtime.prefill_tokens(prefill_ids[start:end])
+                            idx = end
+                            if total_prefill > 0 and (idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                                pct = 60 + int((idx / total_prefill) * 20)
+                                _progress(show_progress, min(80, pct), "prefill-replay", f"{idx}/{total_prefill} tokens")
+                    else:
+                        for idx, tid in enumerate(prefill_ids, start=1):
+                            runtime.forward_logits([tid])
+                            if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                                pct = 60 + int((idx / total_prefill) * 20)
+                                _progress(show_progress, min(80, pct), "prefill-replay", f"{idx}/{total_prefill} tokens")
             else:
                 for idx, tid in enumerate(prefill_ids, start=1):
                     runtime.forward_logits([tid])
                     if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
                         pct = 60 + int((idx / total_prefill) * 20)
                         _progress(show_progress, min(80, pct), "prefill", f"{idx}/{total_prefill} tokens")
+            prefill_elapsed = max(0.0, time.perf_counter() - prefill_ts)
             if hasattr(runtime, "cache_len"):
                 try:
                     cache_len_list = list(getattr(runtime, "cache_len") or [])
@@ -1371,7 +1443,11 @@ def main() -> None:
         text = "<tokens> " + " ".join(str(t) for t in generated[:16])
     text = postprocess_output_text(text, args.prompt, lang_mode)
 
-    needs_verify = decode_contract_failed or _is_runtime_fallback_text(text, lang_mode) or _looks_gibberish_output(text)
+    needs_verify = (
+        decode_contract_failed
+        or _is_runtime_fallback_text(text, lang_mode)
+        or _looks_gibberish_output(text)
+    )
     disable_native_safe_verify = os.getenv("VSPEC_DISABLE_NATIVE_SAFE_VERIFY", "0").strip().lower() in {"1", "true", "yes", "on"}
     if (not disable_native_safe_verify) and needs_verify and args.device in {"cuda", "cuda-native", "cpu"}:
         native_safe_text = _run_native_safe_verifier(args, args.prompt, lang_mode)
@@ -1437,12 +1513,15 @@ def main() -> None:
         print("[vspec-chat] structure_guard_code_fence_balanced=", structure_report.get("code_fence_balanced"))
         print("[vspec-chat] structure_guard_seen_sections=", structure_report.get("seen_sections"))
 
-    elapsed = time.perf_counter() - start_ts
+    end_ts = time.perf_counter()
+    elapsed = end_ts - start_ts
+    decode_elapsed = max(0.0, end_ts - decode_start_ts)
     vram_after = cuda_mem_info() if args.device in {"cuda", "cuda-native", "torch-cuda"} else None
     prompt_tok = len(token_ids) - len(generated)
     gen_tok = len(generated)
     total_tok = prompt_tok + gen_tok
-    tps = (gen_tok / elapsed) if elapsed > 0 else 0.0
+    tps_total = (gen_tok / elapsed) if elapsed > 0 else 0.0
+    tps_decode = (gen_tok / decode_elapsed) if decode_elapsed > 0 else 0.0
 
     print("[vspec-chat] runtime_mode=", runtime_mode)
     print("[vspec-chat] runtime_is_vspec=", runtime is not None)
@@ -1452,10 +1531,19 @@ def main() -> None:
         print("[vspec-chat] quant_runtime_disabled=", bool(getattr(runtime, "quant_runtime_disabled", False)))
         print("[vspec-chat] quant_policy_reason=", getattr(runtime, "quant_policy_reason", "unknown"))
     print("[vspec-chat] timing_sec=", round(elapsed, 4))
+    print("[vspec-chat] runtime_load_timing_sec=", round(runtime_load_elapsed, 4))
+    print("[vspec-chat] prefill_timing_sec=", round(prefill_elapsed, 4))
+    print("[vspec-chat] prefill_core_scheduler=", prefill_core_scheduler_used)
+    print("[vspec-chat] prefill_core_steps=", int(prefill_core_steps))
+    print("[vspec-chat] decode_timing_sec=", round(decode_elapsed, 4))
     print("[vspec-chat] tokens_prompt=", prompt_tok)
     print("[vspec-chat] tokens_generated=", gen_tok)
     print("[vspec-chat] tokens_total=", total_tok)
-    print("[vspec-chat] tokens_per_sec=", round(tps, 4))
+    print("[vspec-chat] tokens_per_sec=", round(tps_total, 4))
+    print("[vspec-chat] decode_tokens_per_sec=", round(tps_decode, 4))
+    prefill_tps = (prefill_tokens_total / prefill_elapsed) if prefill_elapsed > 0.0 else 0.0
+    print("[vspec-chat] prefill_tokens=", int(prefill_tokens_total))
+    print("[vspec-chat] prefill_tokens_per_sec=", round(prefill_tps, 4))
 
     low_bit = False
     if runtime is not None and hasattr(runtime, "layers"):
@@ -1479,7 +1567,8 @@ def main() -> None:
     if not low_bit:
         print("[vspec-chat] note=weights are not <=4-bit in this path (mostly fp16/bf16/fp32)")
     elif args.target_bits > 0:
-        print("[vspec-chat] note=low-bit policy telemetry enabled; kernel path remains quality-first")
+        int4_mode = os.getenv("VSPEC_INT4_PRECISION_MODE", "balanced").strip().lower() or "balanced"
+        print(f"[vspec-chat] note=low-bit policy telemetry enabled; int4_precision_mode={int4_mode}")
 
     if vram_before and vram_after:
         free_before, total_before = vram_before

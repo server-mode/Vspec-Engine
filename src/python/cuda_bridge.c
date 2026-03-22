@@ -174,8 +174,8 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
     uint64_t fp_zp;
     uint64_t last_used;
   } Cache4;
-  static const size_t kCacheCap4 = 128U;
-  static VSPEC_THREAD_LOCAL Cache4 cache[128];
+  static const size_t kCacheCap4 = 512U;
+  static VSPEC_THREAD_LOCAL Cache4 cache[512];
   static VSPEC_THREAD_LOCAL size_t cache_count = 0U;
   static VSPEC_THREAD_LOCAL uint64_t use_clock = 0U;
   static VSPEC_THREAD_LOCAL float* d_in = NULL;
@@ -370,8 +370,8 @@ VSPEC_CUDA_API int vspec_cuda_fused_linear_int3_bridge(
     uint64_t fp_s;
     uint64_t last_used;
   } Cache3;
-  static const size_t kCacheCap3 = 128U;
-  static VSPEC_THREAD_LOCAL Cache3 cache[128];
+  static const size_t kCacheCap3 = 512U;
+  static VSPEC_THREAD_LOCAL Cache3 cache[512];
   static VSPEC_THREAD_LOCAL size_t cache_count = 0U;
   static VSPEC_THREAD_LOCAL uint64_t use_clock = 0U;
   static VSPEC_THREAD_LOCAL float* d_in = NULL;
