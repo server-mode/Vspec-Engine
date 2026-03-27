@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
 from meaningful_output_guard import MeaningfulOutputGuard
-from runtime_core_bridge import sample_candidate, sample_candidate_available
+from runtime_core_bridge import (
+    native_output_guard_allow,
+    native_output_guard_available,
+    native_output_guard_init,
+    native_output_guard_observe,
+    native_output_guard_score_adjustment,
+    sample_candidate,
+    sample_candidate_available,
+)
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 
 try:
@@ -54,6 +62,14 @@ class FastOutputEngine:
         self._allowed_cache: dict[int, bool] = {}
         self._emitted_parts: list[str] = []
         self.simple_sampling = os.getenv("VSPEC_SAMPLING_SIMPLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.c_sampler_required = os.getenv("VSPEC_C_SAMPLER_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.native_output_guard_enabled = os.getenv("VSPEC_NATIVE_OUTPUT_GUARD", "1").strip().lower() in {"1", "true", "yes", "on"}
+        if self.native_output_guard_enabled and native_output_guard_available():
+            strictness_raw = os.getenv("VSPEC_NATIVE_OUTPUT_GUARD_STRICTNESS", "0.72")
+            try:
+                native_output_guard_init(float(strictness_raw))
+            except Exception:
+                native_output_guard_init(0.72)
 
     def _prime_decode_cache(self, token_ids: list[int]) -> None:
         if self.tokenizer is None or not token_ids:
@@ -100,6 +116,8 @@ class FastOutputEngine:
         if self.structure_guard is not None:
             self.structure_guard.observe_text(text)
         self.meaning_guard.observe_text(text)
+        if self.native_output_guard_enabled:
+            native_output_guard_observe(text)
         self._emitted_parts.append(text)
         if not self.stream:
             return
@@ -119,6 +137,9 @@ class FastOutputEngine:
             self._allowed_cache[token_id] = False
             return False
         if not self.meaning_guard.allow_text(text):
+            self._allowed_cache[token_id] = False
+            return False
+        if self.native_output_guard_enabled and (not native_output_guard_allow(text)):
             self._allowed_cache[token_id] = False
             return False
         if self.lang_mode == "auto":
@@ -207,6 +228,8 @@ class FastOutputEngine:
             if self.structure_guard is not None:
                 bonus += self.structure_guard.score_adjustment(text)
             bonus += self.meaning_guard.score_adjustment(text)
+            if self.native_output_guard_enabled:
+                bonus += native_output_guard_score_adjustment(text)
             final_score = float(scaled + bonus)
             if not math.isfinite(final_score):
                 final_score = -1e9
@@ -227,6 +250,9 @@ class FastOutputEngine:
             )
             if sampled is not None:
                 return int(sampled)
+
+        if self.c_sampler_required:
+            return int(scored[0][0])
 
         max_logit = scored[0][1]
         if not math.isfinite(float(max_logit)):

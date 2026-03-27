@@ -1,6 +1,6 @@
 import ctypes
 import os
-from ctypes import c_float, c_int, c_size_t, POINTER
+from ctypes import c_float, c_int, c_size_t, c_uint64, POINTER
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +36,8 @@ _HAS_FUSED_INT4 = False
 _HAS_FUSED_INT3 = False
 _INT4_BRIDGE_ABI = "unknown"
 _INT4_BRIDGE_SIGNATURE = "unknown"
+_HAS_INT4_REGISTERED = False
+_HAS_INT4_REGISTERED_MANY = False
 
 
 def _ensure_c_array(arr: np.ndarray, dtype) -> np.ndarray:
@@ -161,6 +163,16 @@ if _lib is not None:
     _lib.vspec_cuda_mem_info_bridge.argtypes = [POINTER(c_size_t), POINTER(c_size_t)]
     _lib.vspec_cuda_mem_info_bridge.restype = c_int
 
+    _HAS_DEVICE_CAP = hasattr(_lib, "vspec_cuda_device_capability_bridge")
+    if _HAS_DEVICE_CAP:
+        _lib.vspec_cuda_device_capability_bridge.argtypes = [POINTER(c_int), POINTER(c_int), POINTER(c_int)]
+        _lib.vspec_cuda_device_capability_bridge.restype = c_int
+
+    _HAS_INT4_TENSORCORE = hasattr(_lib, "vspec_cuda_int4_tensorcore_available_bridge")
+    if _HAS_INT4_TENSORCORE:
+        _lib.vspec_cuda_int4_tensorcore_available_bridge.argtypes = []
+        _lib.vspec_cuda_int4_tensorcore_available_bridge.restype = c_int
+
     if hasattr(_lib, "vspec_cuda_fused_linear_int4_bridge"):
         _lib.vspec_cuda_fused_linear_int4_bridge.argtypes = [
             POINTER(c_float),
@@ -177,6 +189,55 @@ if _lib is not None:
         _INT4_BRIDGE_SIGNATURE = "new"
         _HAS_FUSED_INT4 = True
 
+    _HAS_INT4_REGISTERED = hasattr(_lib, "vspec_cuda_fused_linear_int4_register_weight_bridge") and hasattr(_lib, "vspec_cuda_fused_linear_int4_cached_bridge")
+    if _HAS_INT4_REGISTERED:
+        _lib.vspec_cuda_fused_linear_int4_register_weight_bridge.argtypes = [
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+        ]
+        _lib.vspec_cuda_fused_linear_int4_register_weight_bridge.restype = c_int
+
+        _lib.vspec_cuda_fused_linear_int4_cached_bridge.argtypes = [
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_int,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        _lib.vspec_cuda_fused_linear_int4_cached_bridge.restype = c_int
+
+        _HAS_INT4_REGISTERED_MANY = hasattr(_lib, "vspec_cuda_fused_linear_int4_cached_many_bridge")
+        if _HAS_INT4_REGISTERED_MANY:
+            _lib.vspec_cuda_fused_linear_int4_cached_many_bridge.argtypes = [
+                POINTER(c_float),
+                c_size_t,
+                c_size_t,
+                POINTER(c_int),
+                POINTER(c_size_t),
+                c_size_t,
+                POINTER(c_float),
+            ]
+            _lib.vspec_cuda_fused_linear_int4_cached_many_bridge.restype = c_int
+        else:
+            _HAS_INT4_REGISTERED_MANY = False
+
+    _HAS_INT4_CACHED_STATS = hasattr(_lib, "vspec_cuda_int4_cached_stats_bridge")
+    if _HAS_INT4_CACHED_STATS:
+        _lib.vspec_cuda_int4_cached_stats_bridge.argtypes = [
+            POINTER(c_uint64),
+            POINTER(c_uint64),
+            POINTER(c_uint64),
+            POINTER(c_uint64),
+            POINTER(c_uint64),
+            POINTER(c_uint64),
+        ]
+        _lib.vspec_cuda_int4_cached_stats_bridge.restype = c_int
+
     if hasattr(_lib, "vspec_cuda_fused_linear_int3_bridge"):
         _lib.vspec_cuda_fused_linear_int3_bridge.argtypes = [
             POINTER(c_float),
@@ -192,6 +253,10 @@ if _lib is not None:
 else:
     _HAS_FUSED_ATTN = False
     _HAS_FLASH_ATTN = False
+    _HAS_DEVICE_CAP = False
+    _HAS_INT4_TENSORCORE = False
+    _HAS_INT4_CACHED_STATS = False
+    _HAS_INT4_REGISTERED_MANY = False
 
 
 def rmsnorm_f32_available() -> bool:
@@ -432,12 +497,182 @@ def cuda_mem_info() -> tuple[int, int] | None:
     return int(free_b.value), int(total_b.value)
 
 
+def cuda_device_capability() -> tuple[int, int, int] | None:
+    if _lib is None or not _HAS_DEVICE_CAP:
+        return None
+    major = c_int(0)
+    minor = c_int(0)
+    multiprocessors = c_int(0)
+    ok = _lib.vspec_cuda_device_capability_bridge(ctypes.byref(major), ctypes.byref(minor), ctypes.byref(multiprocessors))
+    if ok != 1:
+        return None
+    return int(major.value), int(minor.value), int(multiprocessors.value)
+
+
+def int4_tensorcore_available() -> bool:
+    if _lib is None or not _HAS_INT4_TENSORCORE:
+        return False
+    return bool(_lib.vspec_cuda_int4_tensorcore_available_bridge())
+
+
+def int4_compute_mode() -> str:
+    return str(os.getenv("VSPEC_INT4_COMPUTE_MODE", "kernel")).strip().lower() or "kernel"
+
+
 def fused_linear_int4_available() -> bool:
     return _lib is not None and _HAS_FUSED_INT4
 
 
 def fused_linear_int3_available() -> bool:
     return _lib is not None and _HAS_FUSED_INT3
+
+
+def fused_linear_int4_registered_available() -> bool:
+    return _lib is not None and _HAS_FUSED_INT4 and _HAS_INT4_REGISTERED
+
+
+def fused_linear_int4_cached_many_available() -> bool:
+    return _lib is not None and _HAS_FUSED_INT4 and _HAS_INT4_REGISTERED and _HAS_INT4_REGISTERED_MANY
+
+
+def fused_linear_int4_register_weight(
+    packed_weight: np.ndarray,
+    scales: np.ndarray,
+    n: int,
+    k: int,
+    zero_points: np.ndarray | None = None,
+) -> int:
+    if _lib is None or not fused_linear_int4_registered_available():
+        return 0
+
+    packed_weight = _ensure_c_array(packed_weight, np.uint8)
+    scales = _ensure_c_array(scales, np.float32)
+    zero_points_arr = _ensure_c_array(zero_points, np.float32) if zero_points is not None else None
+    zp_ptr = zero_points_arr.ctypes.data_as(POINTER(c_float)) if zero_points_arr is not None else None
+
+    n_blocks = 1
+    if int(n) > 0 and int(scales.size) >= int(n) and (int(scales.size) % int(n)) == 0:
+        n_blocks = max(1, int(scales.size // int(n)))
+
+    return int(
+        _lib.vspec_cuda_fused_linear_int4_register_weight_bridge(
+            packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+            scales.ctypes.data_as(POINTER(c_float)),
+            zp_ptr,
+            c_size_t(int(k)),
+            c_size_t(int(n)),
+            c_size_t(int(n_blocks)),
+        )
+    )
+
+
+def fused_linear_int4_cached(input_array: np.ndarray, weight_handle: int, n: int) -> np.ndarray:
+    if _lib is None or not fused_linear_int4_registered_available():
+        raise RuntimeError("int4 registered bridge unavailable")
+    if int(weight_handle) <= 0:
+        raise RuntimeError("invalid int4 weight handle")
+
+    if input_array.ndim == 1:
+        input_array = input_array[None, :]
+    input_array = _ensure_c_array(input_array, np.float32)
+    m, k = input_array.shape
+    output = np.empty((m, int(n)), dtype=np.float32)
+    ok = _lib.vspec_cuda_fused_linear_int4_cached_bridge(
+        input_array.ctypes.data_as(POINTER(c_float)),
+        c_size_t(int(m)),
+        c_size_t(int(k)),
+        c_int(int(weight_handle)),
+        c_size_t(int(n)),
+        output.ctypes.data_as(POINTER(c_float)),
+    )
+    if ok != 1:
+        raise RuntimeError("vspec_cuda_fused_linear_int4_cached_bridge failed")
+    return output
+
+
+def fused_linear_int4_cached_many(input_array: np.ndarray, weight_handles: list[int], output_dims: list[int]) -> list[np.ndarray]:
+    if _lib is None or not fused_linear_int4_cached_many_available():
+        raise RuntimeError("int4 registered multi bridge unavailable")
+    if not weight_handles or len(weight_handles) != len(output_dims):
+        raise RuntimeError("invalid int4 multi dispatch arguments")
+
+    if input_array.ndim == 1:
+        input_array = input_array[None, :]
+    input_array = _ensure_c_array(input_array, np.float32)
+    m, k = input_array.shape
+
+    handles_arr = (c_int * len(weight_handles))(*[int(h) for h in weight_handles])
+    dims_arr = (c_size_t * len(output_dims))(*[max(1, int(n)) for n in output_dims])
+    total_n = int(sum(max(1, int(n)) for n in output_dims))
+    output = np.empty((m, total_n), dtype=np.float32)
+
+    ok = _lib.vspec_cuda_fused_linear_int4_cached_many_bridge(
+        input_array.ctypes.data_as(POINTER(c_float)),
+        c_size_t(int(m)),
+        c_size_t(int(k)),
+        handles_arr,
+        dims_arr,
+        c_size_t(int(len(weight_handles))),
+        output.ctypes.data_as(POINTER(c_float)),
+    )
+    if ok != 1:
+        raise RuntimeError("vspec_cuda_fused_linear_int4_cached_many_bridge failed")
+
+    results: list[np.ndarray] = []
+    offset = 0
+    for n in output_dims:
+        nn = int(n)
+        results.append(np.ascontiguousarray(output[:, offset:offset + nn], dtype=np.float32))
+        offset += nn
+    return results
+
+
+def int4_cached_stats() -> dict[str, int]:
+    if _lib is None or not _HAS_INT4_CACHED_STATS:
+        return {}
+    dispatch_calls = c_uint64(0)
+    dispatch_hits = c_uint64(0)
+    dispatch_misses = c_uint64(0)
+    register_calls = c_uint64(0)
+    register_reuse = c_uint64(0)
+    register_evictions = c_uint64(0)
+    ok = _lib.vspec_cuda_int4_cached_stats_bridge(
+        ctypes.byref(dispatch_calls),
+        ctypes.byref(dispatch_hits),
+        ctypes.byref(dispatch_misses),
+        ctypes.byref(register_calls),
+        ctypes.byref(register_reuse),
+        ctypes.byref(register_evictions),
+    )
+    if ok != 1:
+        return {}
+    return {
+        "dispatch_calls": int(dispatch_calls.value),
+        "dispatch_hits": int(dispatch_hits.value),
+        "dispatch_misses": int(dispatch_misses.value),
+        "register_calls": int(register_calls.value),
+        "register_reuse": int(register_reuse.value),
+        "register_evictions": int(register_evictions.value),
+    }
+
+
+def configure_lowbit_bridge_cache_caps(int4_cap: int | None = None, int3_cap: int | None = None) -> None:
+    if int4_cap is not None:
+        os.environ["VSPEC_INT4_BRIDGE_CACHE_CAP"] = str(max(1, int(int4_cap)))
+    if int3_cap is not None:
+        os.environ["VSPEC_INT3_BRIDGE_CACHE_CAP"] = str(max(1, int(int3_cap)))
+
+
+def get_lowbit_bridge_cache_caps() -> tuple[int, int]:
+    def _read(name: str, fallback: int) -> int:
+        raw = os.getenv(name, str(fallback)).strip()
+        try:
+            val = int(raw)
+            return max(1, val)
+        except Exception:
+            return fallback
+
+    return _read("VSPEC_INT4_BRIDGE_CACHE_CAP", 256), _read("VSPEC_INT3_BRIDGE_CACHE_CAP", 256)
 
 
 def fused_linear_int4(

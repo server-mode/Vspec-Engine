@@ -264,6 +264,7 @@ class CoreBatchGenerationDriver:
                     req.finished = True
                     break
                 if req.decode_optimizer.logits_empty(logits):
+                    req.contract_failed = True
                     req.finished = True
                     break
 

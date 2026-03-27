@@ -1,5 +1,6 @@
 import json
 import importlib
+import os
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -64,6 +65,15 @@ class _TransformersTokenizerAdapter:
 def find_snapshot_dir(model_dir: Path) -> Path:
     if is_gguf_path(model_dir):
         return model_dir
+
+    prefer_gguf = os.getenv("VSPEC_PREFER_GGUF_DIRECT", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if prefer_gguf and model_dir.exists() and model_dir.is_dir():
+        gguf_candidates = sorted(model_dir.glob("*.gguf"))
+        if not gguf_candidates:
+            gguf_candidates = sorted(model_dir.rglob("*.gguf"))
+        if gguf_candidates:
+            return gguf_candidates[0]
+
     snapshot_root = model_dir / "snapshots"
     if not snapshot_root.exists():
         return model_dir

@@ -550,6 +550,40 @@ def _run_chat(selected_model: ModelCandidate) -> int:
     print("  - VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP=3")
     print("\n[startup] launching interactive chat...\n")
 
+    native_repl_enabled = os.getenv("VSPEC_NATIVE_CHAT_REPL", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if native_repl_enabled:
+        root = Path(__file__).resolve().parents[2]
+        native_exe_candidates = [
+            root / "build" / "Release" / "vspec_native_session_chat.exe",
+            root / "build" / "Debug" / "vspec_native_session_chat.exe",
+            root / "build" / "vspec_native_session_chat",
+        ]
+        native_exe = next((p for p in native_exe_candidates if p.exists()), None)
+
+        resolved_model = selected_model.path
+        if selected_model.kind == "vspec":
+            try:
+                resolved_model = Path(resolve_model_for_runtime(str(selected_model.path)))
+            except Exception:
+                resolved_model = selected_model.path
+
+        native_model = None
+        if resolved_model.exists() and resolved_model.is_dir():
+            shards = sorted(resolved_model.glob("model-*.safetensors"))
+            if shards:
+                native_model = shards[0]
+            else:
+                safes = sorted(resolved_model.glob("*.safetensors"))
+                if safes:
+                    native_model = safes[0]
+
+        if native_exe is not None and native_model is not None:
+            print(f"[startup] native chat repl enabled: {native_exe.name}")
+            proc = subprocess.run([str(native_exe), str(native_model), "256"])
+            return int(proc.returncode)
+
+        print("[startup] native chat repl requested but unavailable, fallback to python session.")
+
     run_args = VspecRunArgs(
         model=str(selected_model.path),
         prompt="",

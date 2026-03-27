@@ -28,6 +28,7 @@ def _load_lib() -> ctypes.CDLL | None:
 
 
 _lib = _load_lib()
+_HAS_GRAPH_CACHE_STATS = False
 
 if _lib is not None:
     _lib.vspec_py_weight_canonical_name.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
@@ -62,6 +63,26 @@ if _lib is not None:
     _lib.vspec_py_decode_session_is_active.restype = c_int
     _lib.vspec_py_decode_session_remaining_tokens.argtypes = [c_int]
     _lib.vspec_py_decode_session_remaining_tokens.restype = c_size_t
+    _lib.vspec_py_native_decode_loop_create.argtypes = [c_size_t, c_size_t, c_size_t, c_size_t]
+    _lib.vspec_py_native_decode_loop_create.restype = c_int
+    _lib.vspec_py_native_decode_loop_destroy.argtypes = [c_int]
+    _lib.vspec_py_native_decode_loop_destroy.restype = None
+    _lib.vspec_py_native_decode_loop_begin.argtypes = [c_int, c_size_t, c_size_t, c_size_t, ctypes.c_uint16, c_uint64]
+    _lib.vspec_py_native_decode_loop_begin.restype = c_int
+    _lib.vspec_py_native_decode_loop_next_quota.argtypes = [c_int]
+    _lib.vspec_py_native_decode_loop_next_quota.restype = c_size_t
+    _lib.vspec_py_native_decode_loop_commit.argtypes = [c_int, c_size_t, c_int]
+    _lib.vspec_py_native_decode_loop_commit.restype = c_int
+    _lib.vspec_py_native_decode_loop_cancel.argtypes = [c_int]
+    _lib.vspec_py_native_decode_loop_cancel.restype = c_int
+    _lib.vspec_py_native_decode_loop_stats.argtypes = [c_int, POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64)]
+    _lib.vspec_py_native_decode_loop_stats.restype = c_int
+    _HAS_GRAPH_CACHE_STATS = hasattr(_lib, "vspec_py_native_decode_loop_graph_cache_stats")
+    if _HAS_GRAPH_CACHE_STATS:
+        _lib.vspec_py_native_decode_loop_graph_cache_stats.argtypes = [c_int, POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_int)]
+        _lib.vspec_py_native_decode_loop_graph_cache_stats.restype = c_int
+    else:
+        _HAS_GRAPH_CACHE_STATS = False
     _lib.vspec_py_continuous_batch_create.argtypes = [c_size_t, c_size_t, c_size_t, c_size_t, c_size_t, c_size_t]
     _lib.vspec_py_continuous_batch_create.restype = c_int
     _lib.vspec_py_continuous_batch_destroy.argtypes = [c_int]
@@ -97,6 +118,20 @@ if _lib is not None:
         POINTER(c_uint32),
     ]
     _lib.vspec_py_runtime_adaptive_step.restype = c_int
+    _lib.vspec_py_runtime_output_guard_init.argtypes = [c_float]
+    _lib.vspec_py_runtime_output_guard_init.restype = c_int
+    _lib.vspec_py_runtime_output_guard_allow.argtypes = [c_char_p]
+    _lib.vspec_py_runtime_output_guard_allow.restype = c_int
+    _lib.vspec_py_runtime_output_guard_score_adjustment.argtypes = [c_char_p]
+    _lib.vspec_py_runtime_output_guard_score_adjustment.restype = c_float
+    _lib.vspec_py_runtime_output_guard_observe.argtypes = [c_char_p]
+    _lib.vspec_py_runtime_output_guard_observe.restype = c_int
+    _lib.vspec_py_native_forward_create.argtypes = [c_char_p, c_uint64]
+    _lib.vspec_py_native_forward_create.restype = c_int
+    _lib.vspec_py_native_forward_destroy.argtypes = [c_int]
+    _lib.vspec_py_native_forward_destroy.restype = None
+    _lib.vspec_py_native_forward_step.argtypes = [c_int, c_char_p, c_size_t, POINTER(c_int), POINTER(c_float), c_size_t, c_float, POINTER(c_float)]
+    _lib.vspec_py_native_forward_step.restype = c_int
     _lib.vspec_py_plugin_load_dynamic.argtypes = [c_char_p, c_char_p, ctypes.c_char_p, c_size_t]
     _lib.vspec_py_plugin_load_dynamic.restype = c_int
     _lib.vspec_py_plugin_unload_dynamic.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
@@ -196,6 +231,39 @@ def plugin_unload_dynamic(name: str) -> tuple[bool, str]:
 
 def sample_candidate_available() -> bool:
     return _lib is not None and np is not None
+
+
+def native_output_guard_available() -> bool:
+    return _lib is not None
+
+
+def native_output_guard_init(strictness: float) -> bool:
+    if _lib is None:
+        return False
+    try:
+        value = float(strictness)
+    except Exception:
+        value = 0.72
+    value = max(0.0, min(1.0, value))
+    return bool(_lib.vspec_py_runtime_output_guard_init(c_float(value)))
+
+
+def native_output_guard_allow(text_fragment: str) -> bool:
+    if _lib is None:
+        return True
+    return bool(_lib.vspec_py_runtime_output_guard_allow(str(text_fragment or "").encode("utf-8", errors="ignore")))
+
+
+def native_output_guard_score_adjustment(text_fragment: str) -> float:
+    if _lib is None:
+        return 0.0
+    return float(_lib.vspec_py_runtime_output_guard_score_adjustment(str(text_fragment or "").encode("utf-8", errors="ignore")))
+
+
+def native_output_guard_observe(text_fragment: str) -> bool:
+    if _lib is None:
+        return False
+    return bool(_lib.vspec_py_runtime_output_guard_observe(str(text_fragment or "").encode("utf-8", errors="ignore")))
 
 
 def sample_candidate(token_ids: list[int], scores: list[float], greedy: bool, random_bits: int) -> int | None:
@@ -398,6 +466,118 @@ class CoreDecodeSession:
             pass
 
 
+class CoreNativeDecodeLoop:
+    def __init__(self, total_vram_bytes: int, max_active: int = 1, max_batch_tokens: int = 8, token_quantum: int = 1) -> None:
+        self.handle = 0 if _lib is None else int(
+            _lib.vspec_py_native_decode_loop_create(
+                c_size_t(max(1, int(total_vram_bytes))),
+                c_size_t(max(1, int(max_active))),
+                c_size_t(max(1, int(max_batch_tokens))),
+                c_size_t(max(1, int(token_quantum))),
+            )
+        )
+        self.reserve_bytes = 1
+
+    @property
+    def available(self) -> bool:
+        return bool(_lib is not None and self.handle > 0)
+
+    @classmethod
+    def from_runtime(cls, runtime, max_new_tokens: int):
+        total_vram = 8 * 1024 * 1024 * 1024
+        try:
+            total_vram = int(os.getenv("VSPEC_SCHED_TOTAL_BYTES", "0") or "0") or total_vram
+        except Exception:
+            pass
+        max_active = int(os.getenv("VSPEC_SCHED_MAX_ACTIVE", "1") or "1")
+        max_batch_tokens = int(os.getenv("VSPEC_SCHED_MAX_BATCH_TOKENS", "8") or "8")
+        token_quantum = int(os.getenv("VSPEC_SCHED_TOKEN_QUANTUM", "1") or "1")
+        session = cls(total_vram, max_active=max_active, max_batch_tokens=max_batch_tokens, token_quantum=token_quantum)
+        session.reserve_bytes = CoreDecodeSession.estimate_reserve_bytes(runtime, max_new_tokens)
+        return session
+
+    def begin(self, prompt_tokens: int, max_new_tokens: int, graph_signature: int, reserve_bytes: int | None = None, priority: int = 0) -> bool:
+        if not self.available:
+            return False
+        budget = int(reserve_bytes if reserve_bytes is not None else self.reserve_bytes)
+        return bool(
+            _lib.vspec_py_native_decode_loop_begin(
+                int(self.handle),
+                c_size_t(max(1, budget)),
+                c_size_t(max(0, int(prompt_tokens))),
+                c_size_t(max(1, int(max_new_tokens))),
+                ctypes.c_uint16(max(0, min(65535, int(priority)))),
+                c_uint64(int(graph_signature) & 0xFFFFFFFFFFFFFFFF),
+            )
+        )
+
+    def next_quota(self) -> int:
+        if not self.available:
+            return 0
+        return int(_lib.vspec_py_native_decode_loop_next_quota(int(self.handle)))
+
+    def commit(self, generated_tokens: int = 1, reached_eos: bool = False) -> bool:
+        if not self.available:
+            return False
+        return bool(_lib.vspec_py_native_decode_loop_commit(int(self.handle), c_size_t(max(0, int(generated_tokens))), c_int(1 if reached_eos else 0)))
+
+    def cancel(self) -> bool:
+        if not self.available:
+            return False
+        return bool(_lib.vspec_py_native_decode_loop_cancel(int(self.handle)))
+
+    def stats(self) -> dict[str, int]:
+        if not self.available:
+            return {}
+        out_sig = c_uint64(0)
+        out_hits = c_uint64(0)
+        out_misses = c_uint64(0)
+        out_steps = c_uint64(0)
+        out_captures = c_uint64(0)
+        out_replays = c_uint64(0)
+        out_cached = c_uint64(0)
+        out_enabled = c_int(0)
+        ok = _lib.vspec_py_native_decode_loop_stats(
+            int(self.handle),
+            ctypes.byref(out_sig),
+            ctypes.byref(out_hits),
+            ctypes.byref(out_misses),
+            ctypes.byref(out_steps),
+        )
+        if not ok:
+            return {}
+        ok_cache = 0
+        if _HAS_GRAPH_CACHE_STATS:
+            ok_cache = _lib.vspec_py_native_decode_loop_graph_cache_stats(
+                int(self.handle),
+                ctypes.byref(out_captures),
+                ctypes.byref(out_replays),
+                ctypes.byref(out_cached),
+                ctypes.byref(out_enabled),
+            )
+        return {
+            "graph_signature": int(out_sig.value),
+            "graph_reuse_hits": int(out_hits.value),
+            "graph_reuse_misses": int(out_misses.value),
+            "steps": int(out_steps.value),
+            "graph_captures": int(out_captures.value) if ok_cache else 0,
+            "graph_replays": int(out_replays.value) if ok_cache else 0,
+            "graph_cached_signatures": int(out_cached.value) if ok_cache else 0,
+            "graph_capture_enabled": int(out_enabled.value) if ok_cache else 0,
+        }
+
+    def close(self) -> None:
+        if _lib is not None and self.handle > 0:
+            _lib.vspec_py_native_decode_loop_destroy(int(self.handle))
+            self.handle = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class CoreContinuousBatcher:
     def __init__(
         self,
@@ -536,6 +716,66 @@ class CoreContinuousBatcher:
     def close(self) -> None:
         if _lib is not None and self.handle > 0:
             _lib.vspec_py_continuous_batch_destroy(int(self.handle))
+            self.handle = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class CoreNativeForwardContext:
+    def __init__(self, model_path: str, seed: int = 0) -> None:
+        self.model_path = str(model_path or "")
+        self.handle = 0
+        if _lib is not None and self.model_path:
+            self.handle = int(
+                _lib.vspec_py_native_forward_create(
+                    self.model_path.encode("utf-8", errors="ignore"),
+                    c_uint64(int(seed) & 0xFFFFFFFFFFFFFFFF),
+                )
+            )
+
+    @property
+    def available(self) -> bool:
+        return bool(_lib is not None and self.handle > 0 and np is not None)
+
+    def blend_candidates(
+        self,
+        prompt: str,
+        produced_tokens: int,
+        candidate_ids: list[int],
+        base_scores: list[float],
+        blend: float,
+    ) -> list[float] | None:
+        if not self.available:
+            return None
+        if not candidate_ids:
+            return None
+        if len(candidate_ids) != len(base_scores):
+            return None
+
+        ids_arr = (c_int * len(candidate_ids))(*[int(v) for v in candidate_ids])
+        base_np = np.ascontiguousarray(base_scores, dtype=np.float32)
+        out_np = np.empty((len(candidate_ids),), dtype=np.float32)
+        ok = _lib.vspec_py_native_forward_step(
+            int(self.handle),
+            str(prompt or "").encode("utf-8", errors="ignore"),
+            c_size_t(max(0, int(produced_tokens))),
+            ids_arr,
+            base_np.ctypes.data_as(POINTER(c_float)),
+            c_size_t(len(candidate_ids)),
+            c_float(float(blend)),
+            out_np.ctypes.data_as(POINTER(c_float)),
+        )
+        if not ok:
+            return None
+        return out_np.astype(float, copy=False).tolist()
+
+    def close(self) -> None:
+        if _lib is not None and self.handle > 0:
+            _lib.vspec_py_native_forward_destroy(int(self.handle))
             self.handle = 0
 
     def __del__(self) -> None:

@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct VspecKVCache {
     float* key;
     float* value;
@@ -47,5 +51,9 @@ const float* vspec_kv_cache_key_at(const VspecKVCache* cache, size_t token_idx, 
 const float* vspec_kv_cache_value_at(const VspecKVCache* cache, size_t token_idx, size_t head_idx);
 
 void vspec_kv_cache_reset(VspecKVCache* cache);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

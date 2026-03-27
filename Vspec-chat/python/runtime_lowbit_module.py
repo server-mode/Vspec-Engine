@@ -14,6 +14,12 @@ try:
         fused_linear_int3_available,
         fused_linear_int4,
         fused_linear_int4_available,
+        fused_linear_int4_cached,
+        fused_linear_int4_cached_many,
+        fused_linear_int4_cached_many_available,
+        fused_linear_int4_register_weight,
+        fused_linear_int4_registered_available,
+        int4_cached_stats,
         gemm_f32,
         gemm_f32_available,
     )
@@ -22,6 +28,12 @@ except Exception:  # pragma: no cover
     fused_linear_int3_available = lambda: False
     fused_linear_int4 = None
     fused_linear_int4_available = lambda: False
+    fused_linear_int4_cached = None
+    fused_linear_int4_cached_many = None
+    fused_linear_int4_cached_many_available = lambda: False
+    fused_linear_int4_register_weight = lambda *args, **kwargs: 0
+    fused_linear_int4_registered_available = lambda: False
+    int4_cached_stats = lambda: {}
     gemm_f32 = None
     gemm_f32_available = lambda: False
 
@@ -46,6 +58,10 @@ class LowbitModulePlan:
 _LOWBIT_PROJECTION_STATS = {
     "calls": 0,
     "lowbit_calls": 0,
+    "int4_registered_calls": 0,
+    "int4_registered_many_calls": 0,
+    "int4_registered_registers": 0,
+    "int4_registered_failures": 0,
     "fallback_gemm_calls": 0,
     "fallback_matmul_calls": 0,
 }
@@ -54,6 +70,10 @@ _LOWBIT_PROJECTION_STATS = {
 def lowbit_projection_stats_reset() -> None:
     _LOWBIT_PROJECTION_STATS["calls"] = 0
     _LOWBIT_PROJECTION_STATS["lowbit_calls"] = 0
+    _LOWBIT_PROJECTION_STATS["int4_registered_calls"] = 0
+    _LOWBIT_PROJECTION_STATS["int4_registered_many_calls"] = 0
+    _LOWBIT_PROJECTION_STATS["int4_registered_registers"] = 0
+    _LOWBIT_PROJECTION_STATS["int4_registered_failures"] = 0
     _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] = 0
     _LOWBIT_PROJECTION_STATS["fallback_matmul_calls"] = 0
 
@@ -62,8 +82,13 @@ def lowbit_projection_stats_snapshot() -> dict[str, int]:
     return {
         "calls": int(_LOWBIT_PROJECTION_STATS["calls"]),
         "lowbit_calls": int(_LOWBIT_PROJECTION_STATS["lowbit_calls"]),
+        "int4_registered_calls": int(_LOWBIT_PROJECTION_STATS["int4_registered_calls"]),
+        "int4_registered_many_calls": int(_LOWBIT_PROJECTION_STATS["int4_registered_many_calls"]),
+        "int4_registered_registers": int(_LOWBIT_PROJECTION_STATS["int4_registered_registers"]),
+        "int4_registered_failures": int(_LOWBIT_PROJECTION_STATS["int4_registered_failures"]),
         "fallback_gemm_calls": int(_LOWBIT_PROJECTION_STATS["fallback_gemm_calls"]),
         "fallback_matmul_calls": int(_LOWBIT_PROJECTION_STATS["fallback_matmul_calls"]),
+        "int4_cached_bridge": int4_cached_stats() if callable(int4_cached_stats) else {},
     }
 
 
@@ -315,13 +340,42 @@ def lowbit_linear_project(
     if use_native_cuda_norm and lowbit_plan.enabled and lowbit_plan.bits in {3, 4} and key in packed:
         entry = packed[key]
         if len(entry) >= 5:
-            packed_w, scales, bits, out_n, zero_points = entry
+            packed_w, scales, bits, out_n, zero_points = entry[:5]
         else:
-            packed_w, scales, bits, out_n = entry
+            packed_w, scales, bits, out_n = entry[:4]
             zero_points = None
         if bits == 4 and fused_linear_int4_available():
             _debug_compare_int4_kernel(vec, packed_w, scales, out_n, layer_idx, key, zero_points=zero_points)
             _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
+            handle = 0
+            if len(entry) >= 6:
+                try:
+                    handle = int(entry[5] or 0)
+                except Exception:
+                    handle = 0
+
+            if handle <= 0 and fused_linear_int4_registered_available():
+                try:
+                    vec_shape = np.ascontiguousarray(vec, dtype=np.float32)
+                    if vec_shape.ndim == 1:
+                        k_in = int(vec_shape.shape[0])
+                    else:
+                        k_in = int(vec_shape.shape[-1])
+                    handle = int(fused_linear_int4_register_weight(packed_w, scales, int(out_n), k_in, zero_points=zero_points) or 0)
+                    if handle > 0:
+                        _LOWBIT_PROJECTION_STATS["int4_registered_registers"] += 1
+                        packed[key] = (packed_w, scales, bits, out_n, zero_points, handle)
+                except Exception:
+                    handle = 0
+
+            if handle > 0 and fused_linear_int4_registered_available():
+                try:
+                    out = fused_linear_int4_cached(vec, handle, int(out_n))
+                    _LOWBIT_PROJECTION_STATS["int4_registered_calls"] += 1
+                    return _unwrap_single_batch(out)
+                except Exception:
+                    _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+
             out = fused_linear_int4(vec, packed_w, scales, out_n, zero_points=zero_points)
             return _unwrap_single_batch(out)
         if bits == 3 and fused_linear_int3_available():
@@ -336,3 +390,72 @@ def lowbit_linear_project(
 
     _LOWBIT_PROJECTION_STATS["fallback_matmul_calls"] += 1
     return vec @ w.T
+
+
+def lowbit_linear_project_many(
+    vec,
+    specs: list[tuple[str, "np.ndarray"]],
+    layer_idx: int,
+    packed: dict,
+    use_native_cuda_norm: bool,
+    lowbit_plan: LowbitModulePlan,
+):
+    if np is None or len(specs) < 2:
+        return None
+    if not use_native_cuda_norm or not lowbit_plan.enabled or int(lowbit_plan.bits) != 4:
+        return None
+    if not fused_linear_int4_registered_available() or not fused_linear_int4_cached_many_available():
+        return None
+
+    handles: list[int] = []
+    out_dims: list[int] = []
+    try:
+        vec_shape = np.ascontiguousarray(vec, dtype=np.float32)
+        if vec_shape.ndim == 1:
+            k_in = int(vec_shape.shape[0])
+        else:
+            k_in = int(vec_shape.shape[-1])
+    except Exception:
+        return None
+
+    for key, _w in specs:
+        entry = packed.get(key)
+        if entry is None or len(entry) < 4:
+            return None
+
+        if len(entry) >= 5:
+            packed_w, scales, bits, out_n, zero_points = entry[:5]
+        else:
+            packed_w, scales, bits, out_n = entry[:4]
+            zero_points = None
+
+        if int(bits) != 4:
+            return None
+
+        handle = 0
+        if len(entry) >= 6:
+            try:
+                handle = int(entry[5] or 0)
+            except Exception:
+                handle = 0
+
+        if handle <= 0:
+            handle = int(fused_linear_int4_register_weight(packed_w, scales, int(out_n), k_in, zero_points=zero_points) or 0)
+            if handle <= 0:
+                _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                return None
+            _LOWBIT_PROJECTION_STATS["int4_registered_registers"] += 1
+            packed[key] = (packed_w, scales, bits, out_n, zero_points, handle)
+
+        handles.append(handle)
+        out_dims.append(int(out_n))
+
+    try:
+        many_out = fused_linear_int4_cached_many(vec, handles, out_dims)
+    except Exception:
+        _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+        return None
+
+    _LOWBIT_PROJECTION_STATS["int4_registered_many_calls"] += 1
+    _LOWBIT_PROJECTION_STATS["int4_registered_calls"] += len(handles)
+    return [_unwrap_single_batch(out) for out in many_out]

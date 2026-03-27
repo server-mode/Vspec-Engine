@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct VspecQloraLayerConfig {
     uint32_t layer_id;
     size_t in_dim;
@@ -35,5 +39,9 @@ void vspec_qlora_adapter_apply_layer_f32(
     size_t n,
     float* output
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

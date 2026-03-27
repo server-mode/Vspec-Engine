@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "vspec/python/capi.h"
 #include "vspec/attention/kv_paged_cache.h"
@@ -11,12 +12,15 @@
 #include "vspec/graph/ir.h"
 #include "vspec/runtime/continuous_batch.h"
 #include "vspec/runtime/decode_session.h"
+#include "vspec/runtime/native_inference.h"
 #include "vspec/runtime/sampling_core.h"
 #include "vspec/runtime/plugin/plugin_api.h"
 
 #define VSPEC_PY_MAX_KV_CACHE_HANDLES 16
 #define VSPEC_PY_MAX_DECODE_HANDLES 32
 #define VSPEC_PY_MAX_CONT_BATCH_HANDLES 16
+#define VSPEC_PY_MAX_NATIVE_LOOP_HANDLES 16
+#define VSPEC_PY_MAX_NATIVE_FORWARD_HANDLES 8
 
 typedef struct VspecPyKVPagedHandle {
     int active;
@@ -37,6 +41,34 @@ typedef struct VspecPyDecodeHandle {
 } VspecPyDecodeHandle;
 
 static VspecPyDecodeHandle g_decode_handles[VSPEC_PY_MAX_DECODE_HANDLES];
+
+typedef struct VspecPyNativeDecodeLoopHandle {
+    int active;
+    VspecDecodeSession session;
+    uint64_t graph_signature;
+    uint64_t graph_reuse_hits;
+    uint64_t graph_reuse_misses;
+    uint64_t graph_captures;
+    uint64_t graph_replays;
+    uint64_t graph_cache_slots[16];
+    size_t graph_cache_count;
+    size_t graph_cache_cursor;
+    int graph_capture_enabled;
+    int graph_replay_active;
+    uint64_t steps;
+    int started;
+} VspecPyNativeDecodeLoopHandle;
+
+static VspecPyNativeDecodeLoopHandle g_native_loop_handles[VSPEC_PY_MAX_NATIVE_LOOP_HANDLES];
+
+typedef struct VspecPyNativeForwardHandle {
+    int active;
+    VspecCompatModel model;
+    VspecNativeForwardContext ctx;
+    char model_path[1024];
+} VspecPyNativeForwardHandle;
+
+static VspecPyNativeForwardHandle g_native_forward_handles[VSPEC_PY_MAX_NATIVE_FORWARD_HANDLES];
 
 typedef struct VspecPyContinuousBatchHandle {
     int active;
@@ -73,6 +105,91 @@ static VspecPyContinuousBatchHandle* vspec_py_get_cont_batch_handle(int handle_i
         return NULL;
     }
     return &g_cont_batch_handles[handle_id - 1];
+}
+
+static VspecPyNativeDecodeLoopHandle* vspec_py_get_native_loop_handle(int handle_id) {
+    if (handle_id <= 0 || handle_id > VSPEC_PY_MAX_NATIVE_LOOP_HANDLES) {
+        return NULL;
+    }
+    if (!g_native_loop_handles[handle_id - 1].active) {
+        return NULL;
+    }
+    return &g_native_loop_handles[handle_id - 1];
+}
+
+static VspecPyNativeForwardHandle* vspec_py_get_native_forward_handle(int handle_id) {
+    if (handle_id <= 0 || handle_id > VSPEC_PY_MAX_NATIVE_FORWARD_HANDLES) {
+        return NULL;
+    }
+    if (!g_native_forward_handles[handle_id - 1].active) {
+        return NULL;
+    }
+    return &g_native_forward_handles[handle_id - 1];
+}
+
+typedef struct VspecPyOutputGuardState {
+    int initialized;
+    float strictness;
+    uint64_t observed_fragments;
+} VspecPyOutputGuardState;
+
+static VspecPyOutputGuardState g_py_output_guard = {0, 0.72f, 0U};
+
+static size_t vspec_py_text_len(const char* s) {
+    return s ? strlen(s) : 0U;
+}
+
+static int vspec_py_contains_bad_seq(const char* s) {
+    if (!s || !s[0]) {
+        return 0;
+    }
+    if (strstr(s, "http") || strstr(s, "www") || strstr(s, "__") || strstr(s, "==") || strstr(s, "@@")) {
+        return 1;
+    }
+    return 0;
+}
+
+static float vspec_py_punct_ratio(const char* s) {
+    if (!s || !s[0]) {
+        return 0.0f;
+    }
+    size_t punct = 0U;
+    size_t total = 0U;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        const unsigned char ch = *p;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            continue;
+        }
+        total += 1U;
+        if (!isalnum(ch)) {
+            punct += 1U;
+        }
+    }
+    if (total == 0U) {
+        return 0.0f;
+    }
+    return (float)punct / (float)total;
+}
+
+static int vspec_py_long_alpha_blob(const char* s) {
+    if (!s || !s[0]) {
+        return 0;
+    }
+    const size_t n = strlen(s);
+    if (n < 24U) {
+        return 0;
+    }
+    size_t alpha = 0U;
+    size_t spaces = 0U;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        if (isalpha(*p)) {
+            alpha += 1U;
+        }
+        if (*p == ' ') {
+            spaces += 1U;
+        }
+    }
+    return (spaces == 0U && alpha >= (n * 9U) / 10U) ? 1 : 0;
 }
 
 const char* vspec_py_version(void) {
@@ -176,6 +293,158 @@ int vspec_py_sample_candidate(
     int* out_token_id
 ) {
     return vspec_sampling_select_candidate(token_ids, scores, count, greedy, random_bits, out_token_id);
+}
+
+int vspec_py_runtime_output_guard_init(float strictness) {
+    if (strictness < 0.0f) {
+        strictness = 0.0f;
+    }
+    if (strictness > 1.0f) {
+        strictness = 1.0f;
+    }
+    g_py_output_guard.strictness = strictness;
+    g_py_output_guard.observed_fragments = 0U;
+    g_py_output_guard.initialized = 1;
+    return 1;
+}
+
+int vspec_py_runtime_output_guard_allow(const char* text_fragment) {
+    if (!g_py_output_guard.initialized) {
+        return 1;
+    }
+    if (!text_fragment || !text_fragment[0]) {
+        return 1;
+    }
+    if (vspec_py_contains_bad_seq(text_fragment)) {
+        return 0;
+    }
+    if (vspec_py_long_alpha_blob(text_fragment)) {
+        return 0;
+    }
+    const size_t n = vspec_py_text_len(text_fragment);
+    const float punct_ratio = vspec_py_punct_ratio(text_fragment);
+    const float ratio_cap = 0.35f - (0.15f * g_py_output_guard.strictness);
+    if (n >= 12U && punct_ratio > ratio_cap) {
+        return 0;
+    }
+    return 1;
+}
+
+float vspec_py_runtime_output_guard_score_adjustment(const char* text_fragment) {
+    if (!g_py_output_guard.initialized || !text_fragment || !text_fragment[0]) {
+        return 0.0f;
+    }
+    float score = 0.0f;
+    if (vspec_py_contains_bad_seq(text_fragment)) {
+        score -= 1.25f;
+    }
+    if (vspec_py_long_alpha_blob(text_fragment)) {
+        score -= 1.10f;
+    }
+    const float punct_ratio = vspec_py_punct_ratio(text_fragment);
+    if (punct_ratio > 0.22f) {
+        score -= (0.6f + punct_ratio);
+    }
+    return score;
+}
+
+int vspec_py_runtime_output_guard_observe(const char* text_fragment) {
+    if (!g_py_output_guard.initialized) {
+        return 1;
+    }
+    if (text_fragment && text_fragment[0]) {
+        g_py_output_guard.observed_fragments += 1U;
+    }
+    return 1;
+}
+
+int vspec_py_native_forward_create(const char* model_path, uint64_t seed) {
+    if (!model_path || !model_path[0]) {
+        return 0;
+    }
+
+    for (int i = 0; i < VSPEC_PY_MAX_NATIVE_FORWARD_HANDLES; ++i) {
+        VspecPyNativeForwardHandle* handle = &g_native_forward_handles[i];
+        if (handle->active) {
+            continue;
+        }
+
+        (void)memset(handle, 0, sizeof(*handle));
+        if (!vspec_safetensors_parse_header_file(model_path, &handle->model)) {
+            (void)memset(handle, 0, sizeof(*handle));
+            return 0;
+        }
+
+        if (!vspec_native_forward_init(&handle->ctx, &handle->model, model_path, seed)) {
+            (void)memset(handle, 0, sizeof(*handle));
+            return 0;
+        }
+
+        (void)snprintf(handle->model_path, sizeof(handle->model_path), "%s", model_path);
+        handle->active = 1;
+        return i + 1;
+    }
+    return 0;
+}
+
+void vspec_py_native_forward_destroy(int handle_id) {
+    VspecPyNativeForwardHandle* handle = vspec_py_get_native_forward_handle(handle_id);
+    if (!handle) {
+        return;
+    }
+    (void)memset(handle, 0, sizeof(*handle));
+}
+
+int vspec_py_native_forward_step(
+    int handle_id,
+    const char* prompt,
+    size_t produced_tokens,
+    const int* candidate_ids,
+    const float* base_scores,
+    size_t candidate_count,
+    float blend,
+    float* out_scores
+) {
+    VspecPyNativeForwardHandle* handle = vspec_py_get_native_forward_handle(handle_id);
+    if (!handle || !prompt || !out_scores || !candidate_ids || candidate_count == 0U) {
+        return 0;
+    }
+
+    if (blend < 0.0f) {
+        blend = 0.0f;
+    }
+    if (blend > 1.0f) {
+        blend = 1.0f;
+    }
+
+    float native_scores[VSPEC_NATIVE_TOKEN_COUNT];
+    int native_ids[VSPEC_NATIVE_TOKEN_COUNT];
+    for (size_t i = 0U; i < VSPEC_NATIVE_TOKEN_COUNT; ++i) {
+        native_ids[i] = (int)i;
+        native_scores[i] = 0.0f;
+    }
+
+    if (!vspec_native_forward_step(
+            &handle->ctx,
+            prompt,
+            produced_tokens,
+            native_ids,
+            VSPEC_NATIVE_TOKEN_COUNT,
+            native_scores)) {
+        return 0;
+    }
+
+    for (size_t i = 0U; i < candidate_count; ++i) {
+        float base = base_scores ? base_scores[i] : 0.0f;
+        const int cid = candidate_ids[i];
+        float bonus = 0.0f;
+        if (cid >= 0 && (size_t)cid < VSPEC_NATIVE_TOKEN_COUNT) {
+            bonus = native_scores[(size_t)cid];
+        }
+        out_scores[i] = base + (blend * bonus);
+    }
+
+    return 1;
 }
 
 int vspec_py_kv_cache_create(size_t page_tokens, size_t max_pages, size_t num_heads, size_t head_dim) {
@@ -379,6 +648,181 @@ size_t vspec_py_decode_session_remaining_tokens(int handle_id) {
         return 0U;
     }
     return vspec_decode_session_remaining_tokens(&handle->session);
+}
+
+int vspec_py_native_decode_loop_create(
+    size_t total_vram_bytes,
+    size_t max_active,
+    size_t max_batch_tokens,
+    size_t token_quantum
+) {
+    for (int i = 0; i < VSPEC_PY_MAX_NATIVE_LOOP_HANDLES; ++i) {
+        VspecPyNativeDecodeLoopHandle* handle = &g_native_loop_handles[i];
+        if (handle->active) {
+            continue;
+        }
+        (void)memset(handle, 0, sizeof(*handle));
+        vspec_decode_session_init(
+            &handle->session,
+            total_vram_bytes,
+            max_active,
+            max_batch_tokens,
+            token_quantum
+        );
+        {
+            const char* enabled = getenv("VSPEC_CUDA_GRAPH_CAPTURE");
+            handle->graph_capture_enabled = 1;
+            if (enabled && enabled[0] != '\0') {
+                if (strcmp(enabled, "0") == 0 || strcmp(enabled, "false") == 0 || strcmp(enabled, "False") == 0 || strcmp(enabled, "no") == 0 || strcmp(enabled, "off") == 0) {
+                    handle->graph_capture_enabled = 0;
+                }
+            }
+        }
+        handle->active = 1;
+        return i + 1;
+    }
+    return 0;
+}
+
+void vspec_py_native_decode_loop_destroy(int handle_id) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return;
+    }
+    if (vspec_decode_session_is_active(&handle->session)) {
+        (void)vspec_decode_session_cancel(&handle->session);
+    }
+    (void)memset(handle, 0, sizeof(*handle));
+}
+
+int vspec_py_native_decode_loop_begin(
+    int handle_id,
+    size_t reserve_bytes,
+    size_t prompt_tokens,
+    size_t max_new_tokens,
+    uint16_t priority,
+    uint64_t graph_signature
+) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0;
+    }
+
+    if (handle->graph_capture_enabled) {
+        int seen = 0;
+        for (size_t i = 0U; i < handle->graph_cache_count; ++i) {
+            if (handle->graph_cache_slots[i] == graph_signature) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            handle->graph_captures += 1U;
+            if (handle->graph_cache_count < 16U) {
+                handle->graph_cache_slots[handle->graph_cache_count++] = graph_signature;
+            } else {
+                handle->graph_cache_slots[handle->graph_cache_cursor] = graph_signature;
+                handle->graph_cache_cursor = (handle->graph_cache_cursor + 1U) % 16U;
+            }
+        }
+        handle->graph_replay_active = (graph_signature != 0U) ? 1 : 0;
+    } else {
+        handle->graph_replay_active = 0;
+    }
+
+    if (handle->started) {
+        if (handle->graph_signature == graph_signature) {
+            handle->graph_reuse_hits += 1U;
+        } else {
+            handle->graph_reuse_misses += 1U;
+        }
+    } else {
+        handle->graph_reuse_misses += 1U;
+    }
+    handle->graph_signature = graph_signature;
+    handle->started = 1;
+    return vspec_decode_session_begin(&handle->session, reserve_bytes, prompt_tokens, max_new_tokens, priority);
+}
+
+size_t vspec_py_native_decode_loop_next_quota(int handle_id) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0U;
+    }
+    return vspec_decode_session_next_quota(&handle->session);
+}
+
+int vspec_py_native_decode_loop_commit(int handle_id, size_t generated_tokens, int reached_eos) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0;
+    }
+    if (handle->graph_capture_enabled && handle->graph_replay_active) {
+        const uint64_t replay_steps = (generated_tokens > 0U) ? (uint64_t)generated_tokens : 1U;
+        handle->graph_replays += replay_steps;
+    }
+    handle->steps += 1U;
+    return vspec_decode_session_commit(&handle->session, generated_tokens, reached_eos);
+}
+
+int vspec_py_native_decode_loop_cancel(int handle_id) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0;
+    }
+    return vspec_decode_session_cancel(&handle->session);
+}
+
+int vspec_py_native_decode_loop_stats(
+    int handle_id,
+    uint64_t* out_graph_signature,
+    uint64_t* out_graph_reuse_hits,
+    uint64_t* out_graph_reuse_misses,
+    uint64_t* out_steps
+) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0;
+    }
+    if (out_graph_signature) {
+        *out_graph_signature = handle->graph_signature;
+    }
+    if (out_graph_reuse_hits) {
+        *out_graph_reuse_hits = handle->graph_reuse_hits;
+    }
+    if (out_graph_reuse_misses) {
+        *out_graph_reuse_misses = handle->graph_reuse_misses;
+    }
+    if (out_steps) {
+        *out_steps = handle->steps;
+    }
+    return 1;
+}
+
+int vspec_py_native_decode_loop_graph_cache_stats(
+    int handle_id,
+    uint64_t* out_graph_captures,
+    uint64_t* out_graph_replays,
+    uint64_t* out_cached_signatures,
+    int* out_graph_capture_enabled
+) {
+    VspecPyNativeDecodeLoopHandle* handle = vspec_py_get_native_loop_handle(handle_id);
+    if (!handle) {
+        return 0;
+    }
+    if (out_graph_captures) {
+        *out_graph_captures = handle->graph_captures;
+    }
+    if (out_graph_replays) {
+        *out_graph_replays = handle->graph_replays;
+    }
+    if (out_cached_signatures) {
+        *out_cached_signatures = (uint64_t)handle->graph_cache_count;
+    }
+    if (out_graph_capture_enabled) {
+        *out_graph_capture_enabled = handle->graph_capture_enabled;
+    }
+    return 1;
 }
 
 int vspec_py_continuous_batch_create(

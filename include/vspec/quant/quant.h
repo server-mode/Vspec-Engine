@@ -5,6 +5,10 @@
 
 #include "vspec/quant/formats/special_quant.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum VspecQuantType {
     VSPEC_QUANT_NONE = 0,
     VSPEC_QUANT_INT2 = 2,
@@ -22,5 +26,9 @@ typedef struct VspecQuantMeta {
 } VspecQuantMeta;
 
 void vspec_quant_meta_init(VspecQuantMeta* meta);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

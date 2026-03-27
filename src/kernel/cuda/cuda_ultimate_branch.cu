@@ -133,6 +133,9 @@ static int vspec_cuda_linear_tensorcore_tf32(
     const size_t bytes_a = m * k * sizeof(float);
     const size_t bytes_b = k * n * sizeof(float);
     const size_t bytes_c = m * n * sizeof(float);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t status;
 
     float* d_a = NULL;
     float* d_b = NULL;
@@ -145,10 +148,7 @@ static int vspec_cuda_linear_tensorcore_tf32(
     if (cudaMemcpy(d_a, a_row_major, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
     if (cudaMemcpy(d_b, b_row_major_kxn, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-
-    cublasStatus_t status = cublasGemmEx(
+    status = cublasGemmEx(
         handle,
         CUBLAS_OP_T,
         CUBLAS_OP_T,
@@ -188,7 +188,7 @@ fail:
 }
 #endif
 
-int vspec_cuda_ultimate_tensorcore_available(void) {
+extern "C" int vspec_cuda_ultimate_tensorcore_available(void) {
 #if defined(VSPEC_USE_CUBLAS) && VSPEC_USE_CUBLAS
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
@@ -200,7 +200,7 @@ int vspec_cuda_ultimate_tensorcore_available(void) {
 #endif
 }
 
-void vspec_cuda_launch_linear_ultimate(VspecKernelContext* ctx) {
+extern "C" void vspec_cuda_launch_linear_ultimate(VspecKernelContext* ctx) {
     if (!ctx || !ctx->input || !ctx->weight || !ctx->output || !ctx->qmeta.scales) {
         return;
     }

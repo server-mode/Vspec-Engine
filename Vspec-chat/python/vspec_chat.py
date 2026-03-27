@@ -32,7 +32,7 @@ from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projecti
 from runtime_threebit_module import ThreeBitRuntimeModule
 from decode_contract import sanitize_and_validate_logits
 from native_safe_decode import resolve_native_safe_max_layers
-from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, adaptive_step
+from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, CoreNativeDecodeLoop, adaptive_step
 from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
 
 
@@ -870,6 +870,19 @@ def main() -> None:
     if fused_bits_env not in {0, 3, 4}:
         fused_bits_env = 0
     os.environ["VSPEC_FUSED_BITS"] = str(fused_bits_env)
+    os.environ.setdefault("VSPEC_INT4_PRE_REGISTER", "1")
+    os.environ.setdefault("VSPEC_CUDA_GRAPH_CAPTURE", "1")
+    os.environ.setdefault("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only")
+    os.environ.setdefault("VSPEC_INT4_BLOCKWISE_ENABLE", "1")
+    os.environ.setdefault("VSPEC_INT4_BLOCK_SIZE", "32")
+    os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "16")
+    os.environ.setdefault("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
+    os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "0")
+    os.environ.setdefault("VSPEC_C_SAMPLER_REQUIRED", "1")
+    os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "0")
+    os.environ.setdefault("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0")
+    if os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16").strip() in {"0", "off", "OFF"}:
+        os.environ.setdefault("VSPEC_INT4_COMPUTE_MODE", "native")
     if (
         fused_bits_env == 4
         and str(args.device) in {"cuda", "cuda-native"}
@@ -1179,7 +1192,9 @@ def main() -> None:
             prefill_tokens_total = int(total_prefill)
             if hasattr(runtime, "prefill_tokens"):
                 run_prefill_direct = True
-                use_prefill_core_sched = os.getenv("VSPEC_PREFILL_CORE_SCHED", "0").strip().lower() not in {"0", "false", "no", "off"}
+                prefill_sched_requested = os.getenv("VSPEC_PREFILL_CORE_SCHED", "0").strip().lower() not in {"0", "false", "no", "off"}
+                prefill_sched_experimental = os.getenv("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0").strip().lower() in {"1", "true", "yes", "on"}
+                use_prefill_core_sched = bool(prefill_sched_requested and prefill_sched_experimental)
                 if use_prefill_core_sched and total_prefill > 0:
                     print("[vspec-chat] prefill_core_scheduler_experimental= on")
                     try:
@@ -1320,10 +1335,62 @@ def main() -> None:
     if decode_step_cap != int(max_steps):
         print(f"[vspec-chat] decode_step_cap= {decode_step_cap} (requested={int(max_steps)})")
     max_steps = decode_step_cap
-    core_decode = CoreDecodeSession.from_runtime(runtime, max_steps)
-    scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
+    native_cpp_loop = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _runtime_graph_signature(runtime_obj, prompt_tokens: int, decode_steps: int) -> int:
+        graph_mode = os.getenv("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only").strip().lower()
+        try:
+            prompt_bucket = max(1, int(os.getenv("VSPEC_GRAPH_SIG_PROMPT_BUCKET", "64") or "64"))
+        except Exception:
+            prompt_bucket = 64
+        try:
+            decode_bucket = max(1, int(os.getenv("VSPEC_GRAPH_SIG_DECODE_BUCKET", "16") or "16"))
+        except Exception:
+            decode_bucket = 16
+
+        if graph_mode == "strict":
+            p_sig = int(prompt_tokens)
+            d_sig = int(decode_steps)
+        elif graph_mode == "shape-only":
+            p_sig = 0
+            d_sig = 0
+        else:
+            p_sig = int(max(0, prompt_tokens) // prompt_bucket)
+            d_sig = int((max(1, decode_steps) + decode_bucket - 1) // decode_bucket)
+
+        if runtime_obj is None:
+            return int((p_sig * 1315423911 + d_sig * 2654435761) & 0xFFFFFFFFFFFFFFFF)
+        layer_count = len(getattr(runtime_obj, "layers", []) or [])
+        hidden = 0
+        try:
+            embed = getattr(runtime_obj, "embed", None)
+            if embed is not None:
+                hidden = int(embed.shape[1])
+        except Exception:
+            hidden = 0
+        num_heads = int(getattr(runtime_obj, "num_heads", 0) or 0)
+        num_kv_heads = int(getattr(runtime_obj, "num_kv_heads", 0) or 0)
+        fused_bits_sig = int(getattr(runtime_obj, "fused_bits", 0) or 0)
+        sig = 1469598103934665603
+        for part in (layer_count, hidden, num_heads, num_kv_heads, fused_bits_sig, p_sig, d_sig):
+            sig ^= int(part) & 0xFFFFFFFFFFFFFFFF
+            sig = (sig * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return int(sig)
+
+    if native_cpp_loop:
+        core_decode = CoreNativeDecodeLoop.from_runtime(runtime, max_steps)
+        graph_sig = _runtime_graph_signature(runtime, max(0, len(token_ids) - 1), max_steps)
+        scheduler_enabled = core_decode.begin(
+            prompt_tokens=max(0, len(token_ids) - 1),
+            max_new_tokens=max_steps,
+            graph_signature=graph_sig,
+        )
+    else:
+        core_decode = CoreDecodeSession.from_runtime(runtime, max_steps)
+        scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
     if scheduler_enabled:
-        print(f"[vspec-chat] core_scheduler= on reserve_bytes={core_decode.reserve_bytes}")
+        scheduler_mode = "native-cpp-loop" if native_cpp_loop else "decode-session"
+        print(f"[vspec-chat] core_scheduler= on reserve_bytes={core_decode.reserve_bytes} mode={scheduler_mode}")
     adaptive_entropy_prev = 0.0
     adaptive_latency_ms = 0.0
     adaptive_quality_drift = 0.0
@@ -1342,7 +1409,9 @@ def main() -> None:
         for _ in range(quota):
             token_t0 = time.perf_counter()
             if runtime is None:
-                logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
+                print("[vspec-chat] decode_contract_ok= False reason=runtime-unavailable logits_len=0 expected_vocab=", vocab_size)
+                decode_contract_failed = True
+                break
             else:
                 logits = decode_optimizer.fetch_logits(runtime, token_ids[-1], vocab_size)
                 logits, contract = sanitize_and_validate_logits(logits, vocab_size)
@@ -1353,7 +1422,9 @@ def main() -> None:
                 if step == 0 and contract.masked_tail > 0:
                     print(f"[vspec-chat] decode_contract_masked_tail= {contract.masked_tail}")
                 if decode_optimizer.logits_empty(logits):
-                    logits = [random.uniform(-1.0, 1.0) for _ in range(vocab_size)]
+                    print(f"[vspec-chat] decode_contract_ok= False reason=empty-logits logits_len=0 expected_vocab={vocab_size}")
+                    decode_contract_failed = True
+                    break
             if decode_contract_failed:
                 break
             logits = threebit_module.denoise_logits(logits, step)
@@ -1430,8 +1501,26 @@ def main() -> None:
             decode_pct = 82 + int(((step + 1) / max_steps) * 17)
             _progress(show_progress, min(99, decode_pct), "decode", f"{step + 1}/{max_steps} tokens")
 
-    if scheduler_enabled and core_decode.is_active():
-        core_decode.cancel()
+    if scheduler_enabled:
+        try:
+            core_decode.cancel()
+        except Exception:
+            pass
+
+    if native_cpp_loop:
+        try:
+            loop_stats = core_decode.stats()
+            if loop_stats:
+                print("[vspec-chat] graph_signature=", int(loop_stats.get("graph_signature", 0)))
+                print("[vspec-chat] graph_reuse_hits=", int(loop_stats.get("graph_reuse_hits", 0)))
+                print("[vspec-chat] graph_reuse_misses=", int(loop_stats.get("graph_reuse_misses", 0)))
+                print("[vspec-chat] graph_capture_enabled=", int(loop_stats.get("graph_capture_enabled", 0)))
+                print("[vspec-chat] graph_captures=", int(loop_stats.get("graph_captures", 0)))
+                print("[vspec-chat] graph_replays=", int(loop_stats.get("graph_replays", 0)))
+                print("[vspec-chat] graph_cached_signatures=", int(loop_stats.get("graph_cached_signatures", 0)))
+                print("[vspec-chat] native_loop_steps=", int(loop_stats.get("steps", 0)))
+        except Exception:
+            pass
     core_decode.close()
 
     fast_engine.end_stream()
@@ -1448,17 +1537,37 @@ def main() -> None:
         or _is_runtime_fallback_text(text, lang_mode)
         or _looks_gibberish_output(text)
     )
+
+    def _verifier_headroom_ok() -> bool:
+        if args.device not in {"cuda", "cuda-native", "torch-cuda"}:
+            return True
+        try:
+            min_free_gb = float(os.getenv("VSPEC_VERIFIER_MIN_FREE_GB", "2.0") or "2.0")
+        except Exception:
+            min_free_gb = 2.0
+        try:
+            mem = cuda_mem_info()
+            if not mem:
+                return True
+            free_bytes = int(mem[0])
+            return free_bytes >= int(max(0.5, min_free_gb) * (1024**3))
+        except Exception:
+            return True
+
     disable_native_safe_verify = os.getenv("VSPEC_DISABLE_NATIVE_SAFE_VERIFY", "0").strip().lower() in {"1", "true", "yes", "on"}
     if (not disable_native_safe_verify) and needs_verify and args.device in {"cuda", "cuda-native", "cpu"}:
-        native_safe_text = _run_native_safe_verifier(args, args.prompt, lang_mode)
-        assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=args.allow_semantic_rescue)
-        native_safe_text = assurance.repair(native_safe_text, args.prompt) if native_safe_text else ""
-        if native_safe_text and (not _is_runtime_fallback_text(native_safe_text, lang_mode)):
-            text = native_safe_text
-            needs_verify = False
-            print("[vspec-chat] native_safe_verify_used= True")
+        if not _verifier_headroom_ok():
+            print("[vspec-chat] native_safe_verify_skipped= low_vram_headroom")
         else:
-            print("[vspec-chat] native_safe_verify_used= False")
+            native_safe_text = _run_native_safe_verifier(args, args.prompt, lang_mode)
+            assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=args.allow_semantic_rescue)
+            native_safe_text = assurance.repair(native_safe_text, args.prompt) if native_safe_text else ""
+            if native_safe_text and (not _is_runtime_fallback_text(native_safe_text, lang_mode)):
+                text = native_safe_text
+                needs_verify = False
+                print("[vspec-chat] native_safe_verify_used= True")
+            else:
+                print("[vspec-chat] native_safe_verify_used= False")
 
     if (
         args.runtime_mix_mode == "hybrid-verify"
@@ -1481,6 +1590,11 @@ def main() -> None:
                     verifier_timeout_override = max(45.0, float(getattr(args, "hybrid_verifier_timeout_sec", 8.0) or 8.0))
                 else:
                     verifier_allowed = False
+
+        if verifier_allowed:
+            if not _verifier_headroom_ok():
+                print("[vspec-chat] torch_verifier_skipped= low_vram_headroom")
+                verifier_allowed = False
 
         if verifier_allowed:
             torch_text = _run_torch_verifier(
@@ -1581,10 +1695,20 @@ def main() -> None:
         print("[vspec-chat] vram_delta_bytes=", used_after - used_before)
 
     lowbit_stats = lowbit_projection_stats_snapshot()
+    print("[vspec-chat] int4_pre_registered=", int(getattr(runtime, "int4_pre_registered", 0) or 0) if runtime is not None else 0)
+    print("[vspec-chat] int4_pre_register_failures=", int(getattr(runtime, "int4_pre_register_failures", 0) or 0) if runtime is not None else 0)
     print("[vspec-chat] lowbit_exec_calls=", int(lowbit_stats.get("calls", 0)))
     print("[vspec-chat] lowbit_exec_lowbit_calls=", int(lowbit_stats.get("lowbit_calls", 0)))
+    print("[vspec-chat] lowbit_exec_int4_registered_calls=", int(lowbit_stats.get("int4_registered_calls", 0)))
+    print("[vspec-chat] lowbit_exec_int4_registered_many_calls=", int(lowbit_stats.get("int4_registered_many_calls", 0)))
+    print("[vspec-chat] lowbit_exec_int4_registered_registers=", int(lowbit_stats.get("int4_registered_registers", 0)))
+    print("[vspec-chat] lowbit_exec_int4_registered_failures=", int(lowbit_stats.get("int4_registered_failures", 0)))
     print("[vspec-chat] lowbit_exec_fallback_gemm_calls=", int(lowbit_stats.get("fallback_gemm_calls", 0)))
     print("[vspec-chat] lowbit_exec_fallback_matmul_calls=", int(lowbit_stats.get("fallback_matmul_calls", 0)))
+    print("[vspec-chat] kv_core_mirror_enabled=", bool(getattr(runtime, "kv_core_mirror_enabled", False)) if runtime is not None else False)
+    print("[vspec-chat] kv_python_shadow_disabled=", bool(getattr(runtime, "kv_python_shadow_disabled", False)) if runtime is not None else False)
+    print("[vspec-chat] cublas_cache_size_hint=", os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16"))
+    print("[vspec-chat] c_sampler_required=", os.getenv("VSPEC_C_SAMPLER_REQUIRED", "1"))
 
 
 if __name__ == "__main__":

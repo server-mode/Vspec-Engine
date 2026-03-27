@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 size_t vspec_int4_packed_bytes(size_t elements);
 void vspec_int4_pack(const int8_t* src, size_t elements, uint8_t* dst);
 int8_t vspec_int4_get(const uint8_t* packed, size_t index);
@@ -35,5 +39,9 @@ void vspec_int4_matmul_ref_f32_q4_with_zero_points(
     const float* zero_points,
     float* c
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

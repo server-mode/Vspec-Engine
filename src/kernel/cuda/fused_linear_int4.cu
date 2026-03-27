@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "vspec/kernel/cuda_fused.h"
 #include "vspec/quant/quant.h"
@@ -28,6 +29,207 @@ __device__ static int8_t decode_int3_at(const uint8_t* packed, size_t index) {
     }
     code &= 0x7U;
     return (code & 0x4U) ? (int8_t)(code - 8U) : (int8_t)code;
+}
+
+static uint64_t vspec_hash_sample_bytes(const void* ptr, size_t bytes, size_t sample_count) {
+    if (!ptr || bytes == 0U) {
+        return 0U;
+    }
+    const uint8_t* p = (const uint8_t*)ptr;
+    const size_t samples = (sample_count == 0U) ? 64U : sample_count;
+    const size_t step = (bytes / samples) + 1U;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0U; i < bytes; i += step) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)bytes;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+typedef struct VspecInt4WeightCacheEntry {
+    const uint8_t* host_w;
+    const float* host_s;
+    uint8_t* d_w;
+    float* d_s;
+    size_t bytes_w;
+    size_t bytes_s;
+    uint64_t fp_w;
+    uint64_t fp_s;
+    uint64_t last_used;
+} VspecInt4WeightCacheEntry;
+
+typedef struct VspecInt3WeightCacheEntry {
+    const uint8_t* host_w;
+    const float* host_s;
+    uint8_t* d_w;
+    float* d_s;
+    size_t bytes_w;
+    size_t bytes_s;
+    uint64_t fp_w;
+    uint64_t fp_s;
+    uint64_t last_used;
+} VspecInt3WeightCacheEntry;
+
+static VspecInt4WeightCacheEntry* vspec_int4_cache_acquire(
+    VspecInt4WeightCacheEntry* cache,
+    size_t* cache_count,
+    uint64_t* use_clock,
+    size_t cache_cap,
+    const uint8_t* host_w,
+    const float* host_s,
+    size_t bytes_w,
+    size_t bytes_s,
+    uint64_t fp_w,
+    uint64_t fp_s
+) {
+    VspecInt4WeightCacheEntry* entry = NULL;
+    VspecInt4WeightCacheEntry* stale = NULL;
+
+    for (size_t i = 0U; i < *cache_count; ++i) {
+        if (cache[i].host_w == host_w && cache[i].host_s == host_s &&
+            cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s &&
+            cache[i].fp_w == fp_w && cache[i].fp_s == fp_s) {
+            entry = &cache[i];
+            break;
+        }
+        if (cache[i].host_w == host_w && cache[i].host_s == host_s &&
+            cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s) {
+            stale = &cache[i];
+        }
+    }
+
+    if (!entry) {
+        if (stale) {
+            entry = stale;
+        } else if (*cache_count < cache_cap) {
+            entry = &cache[*cache_count];
+            *cache_count += 1U;
+        } else {
+            size_t lru_idx = 0U;
+            for (size_t i = 1U; i < cache_cap; ++i) {
+                if (cache[i].last_used < cache[lru_idx].last_used) {
+                    lru_idx = i;
+                }
+            }
+            entry = &cache[lru_idx];
+        }
+
+        if (entry->d_w) cudaFree(entry->d_w);
+        if (entry->d_s) cudaFree(entry->d_s);
+        memset(entry, 0, sizeof(*entry));
+        entry->host_w = host_w;
+        entry->host_s = host_s;
+        entry->bytes_w = bytes_w;
+        entry->bytes_s = bytes_s;
+        entry->fp_w = fp_w;
+        entry->fp_s = fp_s;
+        if (cudaMalloc((void**)&entry->d_w, bytes_w) != cudaSuccess) {
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMalloc((void**)&entry->d_s, bytes_s) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMemcpy(entry->d_w, host_w, bytes_w, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            cudaFree(entry->d_s);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMemcpy(entry->d_s, host_s, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            cudaFree(entry->d_s);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+    }
+
+    entry->last_used = ++(*use_clock);
+    return entry;
+}
+
+static VspecInt3WeightCacheEntry* vspec_int3_cache_acquire(
+    VspecInt3WeightCacheEntry* cache,
+    size_t* cache_count,
+    uint64_t* use_clock,
+    size_t cache_cap,
+    const uint8_t* host_w,
+    const float* host_s,
+    size_t bytes_w,
+    size_t bytes_s,
+    uint64_t fp_w,
+    uint64_t fp_s
+) {
+    VspecInt3WeightCacheEntry* entry = NULL;
+    VspecInt3WeightCacheEntry* stale = NULL;
+
+    for (size_t i = 0U; i < *cache_count; ++i) {
+        if (cache[i].host_w == host_w && cache[i].host_s == host_s &&
+            cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s &&
+            cache[i].fp_w == fp_w && cache[i].fp_s == fp_s) {
+            entry = &cache[i];
+            break;
+        }
+        if (cache[i].host_w == host_w && cache[i].host_s == host_s &&
+            cache[i].bytes_w == bytes_w && cache[i].bytes_s == bytes_s) {
+            stale = &cache[i];
+        }
+    }
+
+    if (!entry) {
+        if (stale) {
+            entry = stale;
+        } else if (*cache_count < cache_cap) {
+            entry = &cache[*cache_count];
+            *cache_count += 1U;
+        } else {
+            size_t lru_idx = 0U;
+            for (size_t i = 1U; i < cache_cap; ++i) {
+                if (cache[i].last_used < cache[lru_idx].last_used) {
+                    lru_idx = i;
+                }
+            }
+            entry = &cache[lru_idx];
+        }
+
+        if (entry->d_w) cudaFree(entry->d_w);
+        if (entry->d_s) cudaFree(entry->d_s);
+        memset(entry, 0, sizeof(*entry));
+        entry->host_w = host_w;
+        entry->host_s = host_s;
+        entry->bytes_w = bytes_w;
+        entry->bytes_s = bytes_s;
+        entry->fp_w = fp_w;
+        entry->fp_s = fp_s;
+        if (cudaMalloc((void**)&entry->d_w, bytes_w) != cudaSuccess) {
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMalloc((void**)&entry->d_s, bytes_s) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMemcpy(entry->d_w, host_w, bytes_w, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            cudaFree(entry->d_s);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        if (cudaMemcpy(entry->d_s, host_s, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(entry->d_w);
+            cudaFree(entry->d_s);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+    }
+
+    entry->last_used = ++(*use_clock);
+    return entry;
 }
 
 static size_t vspec_env_size_or_default(const char* name, size_t fallback) {
@@ -363,14 +565,21 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
 
     static thread_local float* d_a = NULL;
     static thread_local float* d_a_clamped = NULL;
-    static thread_local uint8_t* d_b = NULL;
-    static thread_local float* d_s = NULL;
+    static const size_t kCacheCapMax = 256U;
+    static thread_local VspecInt4WeightCacheEntry weight_cache[256];
+    static thread_local size_t weight_cache_count = 0U;
+    static thread_local uint64_t weight_use_clock = 0U;
     static thread_local float* d_c = NULL;
     static thread_local size_t cap_a = 0U;
     static thread_local size_t cap_a_clamped = 0U;
-    static thread_local size_t cap_b = 0U;
-    static thread_local size_t cap_s = 0U;
     static thread_local size_t cap_c = 0U;
+    size_t cache_cap = vspec_env_size_or_default("VSPEC_INT4_WEIGHT_CACHE_CAP", 256U);
+    if (cache_cap == 0U) {
+        cache_cap = 1U;
+    }
+    if (cache_cap > kCacheCapMax) {
+        cache_cap = kCacheCapMax;
+    }
 
     if (cap_a < bytes_a) {
         if (d_a) cudaFree(d_a);
@@ -390,18 +599,6 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
         d_a_clamped = NULL;
         cap_a_clamped = 0U;
     }
-    if (cap_b < bytes_b) {
-        if (d_b) cudaFree(d_b);
-        d_b = NULL;
-        if (cudaMalloc((void**)&d_b, bytes_b) != cudaSuccess) return;
-        cap_b = bytes_b;
-    }
-    if (cap_s < bytes_s) {
-        if (d_s) cudaFree(d_s);
-        d_s = NULL;
-        if (cudaMalloc((void**)&d_s, bytes_s) != cudaSuccess) return;
-        cap_s = bytes_s;
-    }
     if (cap_c < bytes_c) {
         if (d_c) cudaFree(d_c);
         d_c = NULL;
@@ -410,8 +607,21 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
     }
 
     if (cudaMemcpy(d_a, ctx->input, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) return;
-    if (cudaMemcpy(d_b, ctx->weight, bytes_b, cudaMemcpyHostToDevice) != cudaSuccess) return;
-    if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) return;
+    const uint64_t fp_w = vspec_hash_sample_bytes(ctx->weight, bytes_b, 128U);
+    const uint64_t fp_s = vspec_hash_sample_bytes(ctx->qmeta.scales, bytes_s, 64U);
+    VspecInt4WeightCacheEntry* cache_entry = vspec_int4_cache_acquire(
+        weight_cache,
+        &weight_cache_count,
+        &weight_use_clock,
+        cache_cap,
+        (const uint8_t*)ctx->weight,
+        ctx->qmeta.scales,
+        bytes_b,
+        bytes_s,
+        fp_w,
+        fp_s
+    );
+    if (!cache_entry || !cache_entry->d_w || !cache_entry->d_s) return;
 
     const float* d_input = d_a;
     if (clamp_enabled && clamp_alpha > 0.0f) {
@@ -421,7 +631,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int4(VspecKernelContext* ctx) {
         d_input = d_a_clamped;
     }
 
-    vspec_cuda_fused_linear_int4_device(d_input, d_b, d_s, NULL, d_c, m, n, k, 1U);
+    vspec_cuda_fused_linear_int4_device(d_input, cache_entry->d_w, cache_entry->d_s, NULL, d_c, m, n, k, 1U);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);
@@ -452,16 +662,23 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
 
     static thread_local float* d_a = NULL;
     static thread_local float* d_a_clamped = NULL;
-    static thread_local uint8_t* d_b3 = NULL;
+    static const size_t kCacheCapMax = 256U;
+    static thread_local VspecInt3WeightCacheEntry weight_cache[256];
+    static thread_local size_t weight_cache_count = 0U;
+    static thread_local uint64_t weight_use_clock = 0U;
     static thread_local uint8_t* d_b4 = NULL;
-    static thread_local float* d_s = NULL;
     static thread_local float* d_c = NULL;
     static thread_local size_t cap_a = 0U;
     static thread_local size_t cap_a_clamped = 0U;
-    static thread_local size_t cap_b3 = 0U;
     static thread_local size_t cap_b4 = 0U;
-    static thread_local size_t cap_s = 0U;
     static thread_local size_t cap_c = 0U;
+    size_t cache_cap = vspec_env_size_or_default("VSPEC_INT3_WEIGHT_CACHE_CAP", 256U);
+    if (cache_cap == 0U) {
+        cache_cap = 1U;
+    }
+    if (cache_cap > kCacheCapMax) {
+        cache_cap = kCacheCapMax;
+    }
 
     if (cap_a < bytes_a) {
         if (d_a) cudaFree(d_a);
@@ -481,23 +698,11 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
         d_a_clamped = NULL;
         cap_a_clamped = 0U;
     }
-    if (cap_b3 < bytes_b3) {
-        if (d_b3) cudaFree(d_b3);
-        d_b3 = NULL;
-        if (cudaMalloc((void**)&d_b3, bytes_b3) != cudaSuccess) return;
-        cap_b3 = bytes_b3;
-    }
     if (cap_b4 < bytes_b4) {
         if (d_b4) cudaFree(d_b4);
         d_b4 = NULL;
         if (cudaMalloc((void**)&d_b4, bytes_b4) != cudaSuccess) return;
         cap_b4 = bytes_b4;
-    }
-    if (cap_s < bytes_s) {
-        if (d_s) cudaFree(d_s);
-        d_s = NULL;
-        if (cudaMalloc((void**)&d_s, bytes_s) != cudaSuccess) return;
-        cap_s = bytes_s;
     }
     if (cap_c < bytes_c) {
         if (d_c) cudaFree(d_c);
@@ -507,10 +712,23 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
     }
 
     if (cudaMemcpy(d_a, ctx->input, bytes_a, cudaMemcpyHostToDevice) != cudaSuccess) return;
-    if (cudaMemcpy(d_b3, ctx->weight, bytes_b3, cudaMemcpyHostToDevice) != cudaSuccess) return;
-    if (cudaMemcpy(d_s, ctx->qmeta.scales, bytes_s, cudaMemcpyHostToDevice) != cudaSuccess) return;
+    const uint64_t fp_w = vspec_hash_sample_bytes(ctx->weight, bytes_b3, 128U);
+    const uint64_t fp_s = vspec_hash_sample_bytes(ctx->qmeta.scales, bytes_s, 64U);
+    VspecInt3WeightCacheEntry* cache_entry = vspec_int3_cache_acquire(
+        weight_cache,
+        &weight_cache_count,
+        &weight_use_clock,
+        cache_cap,
+        (const uint8_t*)ctx->weight,
+        ctx->qmeta.scales,
+        bytes_b3,
+        bytes_s,
+        fp_w,
+        fp_s
+    );
+    if (!cache_entry || !cache_entry->d_w || !cache_entry->d_s) return;
 
-    vspec_cuda_expand_int3_to_int4_device(d_b3, d_b4, n, k);
+    vspec_cuda_expand_int3_to_int4_device(cache_entry->d_w, d_b4, n, k);
 
     const float* d_input = d_a;
     if (clamp_enabled && clamp_alpha > 0.0f) {
@@ -520,7 +738,7 @@ extern "C" void vspec_cuda_launch_fused_linear_int3_storage(VspecKernelContext* 
         d_input = d_a_clamped;
     }
 
-    vspec_cuda_fused_linear_int4_device(d_input, d_b4, d_s, NULL, d_c, m, n, k, 1U);
+    vspec_cuda_fused_linear_int4_device(d_input, d_b4, cache_entry->d_s, NULL, d_c, m, n, k, 1U);
 
     if (cudaDeviceSynchronize() != cudaSuccess) return;
     (void)cudaMemcpy(ctx->output, d_c, bytes_c, cudaMemcpyDeviceToHost);

@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
+if(POLICY CMP0104)
+    cmake_policy(SET CMP0104 NEW)
+endif()
 project(vspec_engine C)
 
 set(CMAKE_C_STANDARD 11)
@@ -10,6 +13,9 @@ option(VSPEC_ENABLE_CUDA "Enable CUDA backend" ON)
 set(VSPEC_HAS_CUDA 0)
 if(VSPEC_ENABLE_CUDA)
     include(CheckLanguage)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY "Shared" CACHE STRING "CUDA runtime linkage" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES "75" CACHE STRING "CUDA architectures" FORCE)
+    set(CMAKE_CUDA_FLAGS "-D_WINDOWS -Xcompiler=\" /EHsc\" -Wno-deprecated-gpu-targets --diag_suppress=177 --diag_suppress=546" CACHE STRING "CUDA flags" FORCE)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
@@ -65,6 +71,8 @@ add_library(vspec_engine
     src/runtime/continuous_batch.c
     src/runtime/torch_compat_module.c
     src/runtime/three_bit_runtime_modules.c
+    src/runtime/native_model_registry.c
+    src/runtime/native_inference.c
     src/runtime/decode_session.c
     src/runtime/continuous_batch.c
     src/runtime/sampling_core.c
@@ -91,7 +99,7 @@ add_library(vspec_engine
 if(VSPEC_HAS_CUDA)
     find_package(CUDAToolkit)
 
-    target_sources(vspec_engine PRIVATE
+    set(VSPEC_ENGINE_CUDA_SOURCES
         src/kernel/cuda/cuda_linear_int4.cu
         src/kernel/cuda/fused_linear_int4.cu
         src/kernel/cuda/fused_linear_int3.cu
@@ -104,7 +112,24 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/cuda_attention_f32.cu
         src/kernel/cuda/cuda_elemwise_f32.cu
     )
-    set_target_properties(vspec_engine PROPERTIES CUDA_STANDARD 14)
+
+    foreach(_cu_file IN LISTS VSPEC_ENGINE_CUDA_SOURCES)
+        set_source_files_properties(${_cu_file} PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-gpu-targets")
+    endforeach()
+
+    target_sources(vspec_engine PRIVATE
+        ${VSPEC_ENGINE_CUDA_SOURCES}
+    )
+    set_target_properties(vspec_engine PROPERTIES
+        CUDA_STANDARD 14
+        CUDA_RUNTIME_LIBRARY Shared
+        CUDA_ARCHITECTURES "75"
+    )
+    target_compile_options(vspec_engine PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
+        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=177>
+        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=546>
+    )
 
     if (CUDAToolkit_FOUND)
         target_link_libraries(vspec_engine PRIVATE CUDA::cublas)
@@ -133,6 +158,7 @@ add_library(vspec_engine_capi SHARED
     src/scheduler/request_scheduler.c
     src/runtime/continuous_batch.c
     src/runtime/decode_session.c
+    src/runtime/native_inference.c
     src/runtime/sampling_core.c
     src/runtime/plugin/plugin_api.c
     src/graph/ir.c
@@ -150,9 +176,7 @@ set_target_properties(vspec_engine_capi PROPERTIES
 )
 
 if(VSPEC_HAS_CUDA)
-    add_library(vspec_cuda_bridge SHARED
-        src/python/cuda_bridge.c
-        src/attention/flash_block.c
+    set(VSPEC_BRIDGE_CUDA_SOURCES
         src/kernel/cuda/cuda_rmsnorm_f32.cu
         src/kernel/cuda/cuda_linear_f32.cu
         src/kernel/cuda/cuda_gemm_f32.cu
@@ -163,12 +187,28 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/fused_linear_int3.cu
     )
 
+    foreach(_cu_file IN LISTS VSPEC_BRIDGE_CUDA_SOURCES)
+        set_source_files_properties(${_cu_file} PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-gpu-targets")
+    endforeach()
+
+    add_library(vspec_cuda_bridge SHARED
+        src/python/cuda_bridge.c
+        ${VSPEC_BRIDGE_CUDA_SOURCES}
+    )
+
     if (CUDAToolkit_FOUND)
-        target_link_libraries(vspec_cuda_bridge PRIVATE CUDA::cublas)
+        target_link_libraries(vspec_cuda_bridge PRIVATE vspec_engine CUDA::cublas)
         target_compile_definitions(vspec_cuda_bridge PRIVATE VSPEC_USE_CUBLAS=1)
     else()
+        target_link_libraries(vspec_cuda_bridge PRIVATE vspec_engine)
         target_compile_definitions(vspec_cuda_bridge PRIVATE VSPEC_USE_CUBLAS=0)
     endif()
+
+    target_compile_options(vspec_cuda_bridge PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
+        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=177>
+        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=546>
+    )
 
     target_include_directories(vspec_cuda_bridge
         PUBLIC
@@ -176,8 +216,14 @@ if(VSPEC_HAS_CUDA)
     )
 
     set_target_properties(vspec_cuda_bridge PROPERTIES
+        CUDA_RUNTIME_LIBRARY Shared
+        CUDA_ARCHITECTURES "75"
         OUTPUT_NAME "vspec_cuda_bridge"
     )
+
+    if(MSVC)
+        set_target_properties(vspec_cuda_bridge PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
+    endif()
 endif()
 
 add_executable(vspec_int4_demo
@@ -245,6 +291,42 @@ add_executable(vspec_week25_scheduler_stress
 )
 
 target_link_libraries(vspec_week25_scheduler_stress PRIVATE vspec_engine)
+
+add_executable(vspec_native_model_probe
+    tools/native/native_model_probe.c
+)
+
+target_link_libraries(vspec_native_model_probe PRIVATE vspec_engine)
+
+add_executable(vspec_native_internal_loop_chat
+    tools/native/native_internal_loop_chat.c
+)
+
+target_link_libraries(vspec_native_internal_loop_chat PRIVATE vspec_engine)
+
+add_executable(vspec_native_session_chat
+    tools/native/native_session_chat.c
+)
+
+target_link_libraries(vspec_native_session_chat PRIVATE vspec_engine)
+
+add_executable(vspec_native_startup_chat
+    tools/native/native_startup_chat.c
+)
+
+target_link_libraries(vspec_native_startup_chat PRIVATE vspec_engine)
+
+add_executable(vspec_native_real_logits
+    tools/native/native_real_logits.c
+)
+
+target_link_libraries(vspec_native_real_logits PRIVATE vspec_engine)
+
+add_executable(vspec_native_real_decode
+    tools/native/native_real_decode.c
+)
+
+target_link_libraries(vspec_native_real_decode PRIVATE vspec_engine)
 
 if(VSPEC_HAS_CUDA)
     add_executable(vspec_job3_storage_compute_benchmark

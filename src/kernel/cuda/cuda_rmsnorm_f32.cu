@@ -46,6 +46,8 @@ extern "C" void vspec_cuda_rmsnorm_f32(const float* input, const float* weight, 
     float* d_in = NULL;
     float* d_w = NULL;
     float* d_out = NULL;
+    dim3 grid((unsigned)rows);
+    dim3 block(VSPEC_CUDA_BLOCK_RMS);
 
     if (cudaMalloc((void**)&d_in, bytes) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_w, weight_bytes) != cudaSuccess) goto cleanup;
@@ -54,8 +56,6 @@ extern "C" void vspec_cuda_rmsnorm_f32(const float* input, const float* weight, 
     if (cudaMemcpy(d_in, input, bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
     if (cudaMemcpy(d_w, weight, weight_bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
 
-    dim3 grid((unsigned)rows);
-    dim3 block(VSPEC_CUDA_BLOCK_RMS);
     rmsnorm_kernel<<<grid, block>>>(d_in, d_w, eps, dim, d_out);
 
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;

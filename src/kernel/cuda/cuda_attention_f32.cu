@@ -3,84 +3,6 @@
 
 #include "vspec/kernel/cuda_ops.h"
 
-__device__ static float clampf_device(float x, float lo, float hi) {
-    if (x < lo) {
-        return lo;
-    }
-    if (x > hi) {
-        return hi;
-    }
-    return x;
-}
-
-__global__ static void clamp_vector_std_kernel(
-    const float* input,
-    float* output,
-    size_t n,
-    float alpha
-) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    if (!input || !output || n == 0U) {
-        return;
-    }
-
-    float mean = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        mean += input[i];
-    }
-    mean /= (float)n;
-
-    float var = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        float d = input[i] - mean;
-        var += d * d;
-    }
-    var /= (float)n;
-    const float std = sqrtf(fmaxf(var, 0.0f));
-    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
-
-    for (size_t i = 0; i < n; ++i) {
-        output[i] = clampf_device(input[i], -th, th);
-    }
-}
-
-__global__ static void clamp_rows_std_kernel(
-    const float* input,
-    float* output,
-    size_t rows,
-    size_t cols,
-    float alpha
-) {
-    const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const float* in_row = input + row * cols;
-    float* out_row = output + row * cols;
-
-    float mean = 0.0f;
-    for (size_t i = 0; i < cols; ++i) {
-        mean += in_row[i];
-    }
-    mean /= (float)cols;
-
-    float var = 0.0f;
-    for (size_t i = 0; i < cols; ++i) {
-        float d = in_row[i] - mean;
-        var += d * d;
-    }
-    var /= (float)cols;
-    const float std = sqrtf(fmaxf(var, 0.0f));
-    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
-
-    for (size_t i = 0; i < cols; ++i) {
-        out_row[i] = clampf_device(in_row[i], -th, th);
-    }
-}
-
 __global__ static void attention_scores_kernel(
     const float* query,
     const float* keys,
@@ -171,6 +93,11 @@ extern "C" void vspec_cuda_attention_single_f32(
     float* d_v = NULL;
     float* d_scores = NULL;
     float* d_out = NULL;
+    const float inv_sqrt_dim = 1.0f / sqrtf((float)head_dim);
+    dim3 block(256);
+    dim3 grid_scores((unsigned)((seq_len + block.x - 1U) / block.x));
+    dim3 grid_softmax(1);
+    dim3 grid_out((unsigned)((head_dim + block.x - 1U) / block.x));
 
     if (cudaMalloc((void**)&d_q, bytes_q) != cudaSuccess) goto cleanup;
     if (cudaMalloc((void**)&d_k, bytes_k) != cudaSuccess) goto cleanup;
@@ -182,15 +109,10 @@ extern "C" void vspec_cuda_attention_single_f32(
     if (cudaMemcpy(d_k, keys, bytes_k, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
     if (cudaMemcpy(d_v, values, bytes_k, cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
 
-    const float inv_sqrt_dim = 1.0f / sqrtf((float)head_dim);
-    dim3 block(256);
-    dim3 grid_scores((unsigned)((seq_len + block.x - 1U) / block.x));
     attention_scores_kernel<<<grid_scores, block>>>(d_q, d_k, d_scores, seq_len, head_dim, inv_sqrt_dim);
 
-    dim3 grid_softmax(1);
     attention_softmax_kernel<<<grid_softmax, block>>>(d_scores, seq_len, softmax_denom_floor);
 
-    dim3 grid_out((unsigned)((head_dim + block.x - 1U) / block.x));
     attention_output_kernel<<<grid_out, block>>>(d_scores, d_v, d_out, seq_len, head_dim);
 
     if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;

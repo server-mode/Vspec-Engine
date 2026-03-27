@@ -7,16 +7,6 @@
 #include "vspec/attention/kv_cache.h"
 #include "vspec/kernel/cuda_fused.h"
 
-__device__ static float clampf_device(float x, float lo, float hi) {
-    if (x < lo) {
-        return lo;
-    }
-    if (x > hi) {
-        return hi;
-    }
-    return x;
-}
-
 __device__ static int8_t decode_int3_at_device(const uint8_t* packed, size_t index) {
     const size_t bit_pos = index * 3U;
     const size_t byte_idx = bit_pos >> 3U;
@@ -54,73 +44,6 @@ __global__ static void dequant_int3_kv_rows_kernel(
     out[row * head_dim + col] = (float)q * s;
 }
 
-__global__ static void clamp_vector_std_kernel(
-    const float* input,
-    float* output,
-    size_t n,
-    float alpha
-) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    if (!input || !output || n == 0U) {
-        return;
-    }
-
-    float mean = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        mean += input[i];
-    }
-    mean /= (float)n;
-
-    float var = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        float d = input[i] - mean;
-        var += d * d;
-    }
-    var /= (float)n;
-    const float std = sqrtf(fmaxf(var, 0.0f));
-    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
-
-    for (size_t i = 0; i < n; ++i) {
-        output[i] = clampf_device(input[i], -th, th);
-    }
-}
-
-__global__ static void clamp_rows_std_kernel(
-    const float* input,
-    float* output,
-    size_t rows,
-    size_t cols,
-    float alpha
-) {
-    const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const float* in_row = input + row * cols;
-    float* out_row = output + row * cols;
-
-    float mean = 0.0f;
-    for (size_t i = 0; i < cols; ++i) {
-        mean += in_row[i];
-    }
-    mean /= (float)cols;
-
-    float var = 0.0f;
-    for (size_t i = 0; i < cols; ++i) {
-        float d = in_row[i] - mean;
-        var += d * d;
-    }
-    var /= (float)cols;
-    const float std = sqrtf(fmaxf(var, 0.0f));
-    const float th = fmaxf(1e-6f, fabsf(alpha) * std);
-
-    for (size_t i = 0; i < cols; ++i) {
-        out_row[i] = clampf_device(in_row[i], -th, th);
-    }
-}
 
 __global__ static void fused_attention_scores_kernel(
     const float* query,
@@ -337,7 +260,6 @@ static void vspec_cuda_attention_fused_single_int3kv_f32(
     static float* d_ks = NULL;
     static float* d_vs = NULL;
     static float* d_k = NULL;
-    static float* d_k_clamped = NULL;
     static float* d_v = NULL;
     static float* d_scores = NULL;
     static float* d_out = NULL;

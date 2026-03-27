@@ -74,6 +74,39 @@ VSPEC_PY_API int vspec_py_decode_session_commit(int handle_id, size_t generated_
 VSPEC_PY_API int vspec_py_decode_session_cancel(int handle_id);
 VSPEC_PY_API int vspec_py_decode_session_is_active(int handle_id);
 VSPEC_PY_API size_t vspec_py_decode_session_remaining_tokens(int handle_id);
+
+VSPEC_PY_API int vspec_py_native_decode_loop_create(
+  size_t total_vram_bytes,
+  size_t max_active,
+  size_t max_batch_tokens,
+  size_t token_quantum
+);
+VSPEC_PY_API void vspec_py_native_decode_loop_destroy(int handle_id);
+VSPEC_PY_API int vspec_py_native_decode_loop_begin(
+  int handle_id,
+  size_t reserve_bytes,
+  size_t prompt_tokens,
+  size_t max_new_tokens,
+  uint16_t priority,
+  uint64_t graph_signature
+);
+VSPEC_PY_API size_t vspec_py_native_decode_loop_next_quota(int handle_id);
+VSPEC_PY_API int vspec_py_native_decode_loop_commit(int handle_id, size_t generated_tokens, int reached_eos);
+VSPEC_PY_API int vspec_py_native_decode_loop_cancel(int handle_id);
+VSPEC_PY_API int vspec_py_native_decode_loop_stats(
+  int handle_id,
+  uint64_t* out_graph_signature,
+  uint64_t* out_graph_reuse_hits,
+  uint64_t* out_graph_reuse_misses,
+  uint64_t* out_steps
+);
+VSPEC_PY_API int vspec_py_native_decode_loop_graph_cache_stats(
+  int handle_id,
+  uint64_t* out_graph_captures,
+  uint64_t* out_graph_replays,
+  uint64_t* out_cached_signatures,
+  int* out_graph_capture_enabled
+);
 VSPEC_PY_API int vspec_py_continuous_batch_create(
   size_t total_vram_bytes,
   size_t max_active,
@@ -130,6 +163,24 @@ VSPEC_PY_API int vspec_py_runtime_adaptive_step(
   uint32_t* out_token_tier,
   float* out_token_importance,
   uint32_t* out_kv_action
+);
+
+VSPEC_PY_API int vspec_py_runtime_output_guard_init(float strictness);
+VSPEC_PY_API int vspec_py_runtime_output_guard_allow(const char* text_fragment);
+VSPEC_PY_API float vspec_py_runtime_output_guard_score_adjustment(const char* text_fragment);
+VSPEC_PY_API int vspec_py_runtime_output_guard_observe(const char* text_fragment);
+
+VSPEC_PY_API int vspec_py_native_forward_create(const char* model_path, uint64_t seed);
+VSPEC_PY_API void vspec_py_native_forward_destroy(int handle_id);
+VSPEC_PY_API int vspec_py_native_forward_step(
+  int handle_id,
+  const char* prompt,
+  size_t produced_tokens,
+  const int* candidate_ids,
+  const float* base_scores,
+  size_t candidate_count,
+  float blend,
+  float* out_scores
 );
 
 VSPEC_PY_API int vspec_py_plugin_load_dynamic(const char* path, const char* symbol_name, char* out_msg, size_t out_msg_size);

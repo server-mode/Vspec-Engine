@@ -34,6 +34,9 @@ try:
         fused_linear_int3_available,
         fused_linear_int4,
         fused_linear_int4_available,
+        get_lowbit_bridge_cache_caps,
+        fused_linear_int4_register_weight,
+        fused_linear_int4_registered_available,
         gemm_f32,
         gemm_f32_available,
         linear_f32,
@@ -60,6 +63,9 @@ except Exception:  # pragma: no cover - optional dependency
     fused_linear_int3_available = lambda: False
     fused_linear_int4 = None
     fused_linear_int4_available = lambda: False
+    get_lowbit_bridge_cache_caps = lambda: (256, 256)
+    fused_linear_int4_register_weight = lambda *args, **kwargs: 0
+    fused_linear_int4_registered_available = lambda: False
     gemm_f32 = None
     gemm_f32_available = lambda: False
     silu_f32 = None
@@ -72,7 +78,7 @@ from model_loader import WeightInfo, get_torch_state_dict
 from gguf_support import get_gguf_archive
 from runtime_core_bridge import CorePagedKVCache
 from runtime_baseline_manager import resolve_runtime_baseline_plan
-from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project
+from runtime_lowbit_module import LowbitModulePlan, build_lowbit_module_plan, lowbit_linear_project, lowbit_linear_project_many
 from runtime_compat import (
     QuantizationSourcePolicy,
     resolve_model_stability_profile,
@@ -112,6 +118,44 @@ def _softmax(x: "np.ndarray") -> "np.ndarray":
     x = x - np.max(x, axis=-1, keepdims=True)
     exp_x = np.exp(x)
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+
+def _attention_cpu_batched(
+    q: "np.ndarray",
+    keys: "np.ndarray",
+    values: "np.ndarray",
+    num_heads: int,
+    num_kv_heads: int,
+    kv_heads_equal: bool,
+    kv_group_size: int,
+    inv_sqrt_head_dim: float,
+    attention_logit_clip: float,
+) -> "np.ndarray":
+    # Vectorized CPU attention fallback for equal-head layouts; grouped-KV keeps stable loop path.
+    if num_heads <= 0:
+        return np.empty((0, 0), dtype=np.float32)
+    if kv_heads_equal:
+        keys_h = np.transpose(keys, (1, 0, 2))
+        values_h = np.transpose(values, (1, 0, 2))
+        scores = np.einsum("hd,htd->ht", q.astype(np.float32, copy=False), keys_h.astype(np.float32, copy=False))
+        scores = scores * float(inv_sqrt_head_dim)
+        if attention_logit_clip > 0:
+            np.clip(scores, -attention_logit_clip, attention_logit_clip, out=scores)
+        probs = _softmax(scores)
+        out = np.einsum("ht,htd->hd", probs.astype(np.float32, copy=False), values_h.astype(np.float32, copy=False))
+        return out.astype(np.float32, copy=False)
+
+    out = np.empty((num_heads, int(q.shape[-1])), dtype=np.float32)
+    for h in range(num_heads):
+        kv_h = min(num_kv_heads - 1, h // max(1, kv_group_size))
+        kh = keys[:, kv_h, :]
+        vh = values[:, kv_h, :]
+        scores = (kh @ q[h]) * float(inv_sqrt_head_dim)
+        if attention_logit_clip > 0:
+            np.clip(scores, -attention_logit_clip, attention_logit_clip, out=scores)
+        probs = _softmax(scores.reshape(1, -1))[0]
+        out[h] = probs @ vh
+    return out.astype(np.float32, copy=False)
 
 
 def _dynamic_clamp_std_vec(x: "np.ndarray", alpha: float) -> "np.ndarray":
@@ -415,6 +459,8 @@ def _quantize_weight_rowwise(weight: "np.ndarray", bits: int) -> tuple["np.ndarr
             block_size = max(8, int(block_size_raw))
         except Exception:
             block_size = 32
+        # Keep Q4_K-like granularity by normalizing to 32-multiple blocks.
+        block_size = max(32, ((int(block_size) + 31) // 32) * 32)
         n, k = w.shape
         n_blocks = (k + block_size - 1) // block_size
         scales_2d = np.empty((n, n_blocks), dtype=np.float32)
@@ -636,6 +682,7 @@ def _packed_cache_key(prefix: str, key: str, bits: int, w: "np.ndarray") -> str:
             block_size = max(8, int(block_size_raw))
         except Exception:
             block_size = 32
+        block_size = max(32, ((int(block_size) + 31) // 32) * 32)
         mode = f"blk{block_size}"
     return f"{prefix}{key}.b{bits}.{mode}.{w.shape[0]}x{w.shape[1]}.{digest}"
 
@@ -854,6 +901,10 @@ class GenericTransformerRuntime:
     logit_entropy_target: float
     logit_margin_floor: float
     logit_margin_gain: float
+    phase3_flash_attn_calls: int
+    phase3_fused_attn_calls: int
+    phase3_scalar_attn_calls: int
+    phase3_cpu_attn_calls: int
 
     def _get_rotary_cos_sin(self, position: int) -> tuple["np.ndarray", "np.ndarray"]:
         while len(self.rope_cos_cache) <= position:
@@ -893,6 +944,17 @@ class GenericTransformerRuntime:
                 )
 
             def _linear_multi(vec: "np.ndarray", specs: list[tuple[str, "np.ndarray"]], combo_key: str) -> list["np.ndarray"]:
+                many = lowbit_linear_project_many(
+                    vec=vec,
+                    specs=specs,
+                    layer_idx=idx,
+                    packed=layer.packed,
+                    use_native_cuda_norm=self.use_native_cuda_norm,
+                    lowbit_plan=self.lowbit_plan,
+                )
+                if many is not None and len(many) == len(specs):
+                    return many
+
                 use_combo = (
                     self.use_native_cuda_norm
                     and self.lowbit_plan.enabled
@@ -940,75 +1002,130 @@ class GenericTransformerRuntime:
             else:
                 q, k = _apply_rotary(q, k, self.position, self.rope_theta)
 
-            if len(self.cache_k) <= idx:
-                init_cap = 16
-                k_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
-                v_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
-                k_buf[0] = k
-                v_buf[0] = v
-                self.cache_k.append(k_buf)
-                self.cache_v.append(v_buf)
-                if len(self.cache_len) <= idx:
-                    self.cache_len.append(1)
-                else:
-                    self.cache_len[idx] = 1
-            else:
-                used = self.cache_len[idx]
-                cap = self.cache_k[idx].shape[0]
-                if used >= cap:
-                    new_cap = cap * 2
-                    k_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
-                    v_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
-                    k_new[:used] = self.cache_k[idx][:used]
-                    v_new[:used] = self.cache_v[idx][:used]
-                    self.cache_k[idx] = k_new
-                    self.cache_v[idx] = v_new
-                self.cache_k[idx][used] = k
-                self.cache_v[idx][used] = v
-                self.cache_len[idx] = used + 1
-
             mirrors = getattr(self, "kv_core_mirrors", None)
+            mirror_layer = None
             if mirrors is not None and idx < len(mirrors):
-                try:
-                    mirrors[idx].append(k, v)
-                except Exception:
-                    pass
+                mirror_layer = mirrors[idx]
 
-            used_len = self.cache_len[idx]
-            keys = self.cache_k[idx][:used_len]
-            values = self.cache_v[idx][:used_len]
-            if mirrors is not None and idx < len(mirrors):
+            mirror_only = bool(getattr(self, "kv_python_shadow_disabled", False) and (mirror_layer is not None))
+            keys = None
+            values = None
+            used_len = 0
+
+            if mirror_only:
+                mirror_ok = False
                 try:
-                    mirror_tokens = int(mirrors[idx].session_tokens())
-                    if mirror_tokens == used_len:
-                        mirror_keys, mirror_values = mirrors[idx].read_tokens(used_len)
-                        if mirror_keys is not None and mirror_values is not None:
+                    mirror_ok = bool(mirror_layer.append(k, v))
+                except Exception:
+                    mirror_ok = False
+                if mirror_ok:
+                    try:
+                        used_len = int(mirror_layer.session_tokens())
+                        mirror_keys, mirror_values = mirror_layer.read_tokens(used_len)
+                        if mirror_keys is not None and mirror_values is not None and int(mirror_keys.shape[0]) == used_len:
                             keys = mirror_keys
                             values = mirror_values
-                except Exception:
-                    pass
+                        else:
+                            mirror_only = False
+                    except Exception:
+                        mirror_only = False
+                else:
+                    mirror_only = False
+
+            if not mirror_only:
+                if len(self.cache_k) <= idx:
+                    init_cap = 16
+                    k_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                    v_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                    k_buf[0] = k
+                    v_buf[0] = v
+                    self.cache_k.append(k_buf)
+                    self.cache_v.append(v_buf)
+                    if len(self.cache_len) <= idx:
+                        self.cache_len.append(1)
+                    else:
+                        self.cache_len[idx] = 1
+                else:
+                    used = self.cache_len[idx]
+                    cap = self.cache_k[idx].shape[0]
+                    if used >= cap:
+                        new_cap = cap * 2
+                        k_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                        v_new = np.empty((new_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
+                        k_new[:used] = self.cache_k[idx][:used]
+                        v_new[:used] = self.cache_v[idx][:used]
+                        self.cache_k[idx] = k_new
+                        self.cache_v[idx] = v_new
+                    self.cache_k[idx][used] = k
+                    self.cache_v[idx][used] = v
+                    self.cache_len[idx] = used + 1
+
+                if mirror_layer is not None:
+                    try:
+                        mirror_layer.append(k, v)
+                    except Exception:
+                        pass
+
+                used_len = self.cache_len[idx]
+                keys = self.cache_k[idx][:used_len]
+                values = self.cache_v[idx][:used_len]
+                if mirror_layer is not None:
+                    try:
+                        mirror_tokens = int(mirror_layer.session_tokens())
+                        if mirror_tokens == used_len:
+                            mirror_keys, mirror_values = mirror_layer.read_tokens(used_len)
+                            if mirror_keys is not None and mirror_values is not None:
+                                keys = mirror_keys
+                                values = mirror_values
+                    except Exception:
+                        pass
+
+            if keys is None or values is None or used_len <= 0:
+                keys = np.ascontiguousarray(k[None, :, :], dtype=np.float32)
+                values = np.ascontiguousarray(v[None, :, :], dtype=np.float32)
+                used_len = int(keys.shape[0])
 
             if len(self.attn_tmp_buffers) <= idx:
                 self.attn_tmp_buffers.append(np.empty((self.num_heads, self.head_dim), dtype=np.float32))
             attn = self.attn_tmp_buffers[idx]
-            for h in range(self.num_heads):
-                qh = q[h]
-                kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
-                kh = keys[:, kv_h, :]
-                vh = values[:, kv_h, :]
-                if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_flash_single_f32_available() and used_len >= self.flash_attention_min_tokens:
-                    attn[h] = attention_flash_single_f32(qh, kh, vh, self.flash_attention_block_tokens)
-                elif self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
-                    attn[h] = attention_fused_single_f32(qh, kh, vh)
-                elif self.use_native_cuda_norm and attention_single_f32_available():
-                    attn[h] = attention_single_f32(qh, kh, vh)
-                else:
-                    scores = (kh @ qh) * self.inv_sqrt_head_dim
-                    if self.attention_logit_clip > 0:
-                        np.clip(scores, -self.attention_logit_clip, self.attention_logit_clip, out=scores)
-                    scores = scores.reshape(1, -1)
-                    probs = _softmax(scores)[0]
-                    attn[h] = probs @ vh
+            early_flash_turn1 = os.getenv("VSPEC_FLASH_ATTN_TURN1_FORCE", "1").strip().lower() in {"1", "true", "yes", "on"}
+            flash_min_tokens = int(self.flash_attention_min_tokens)
+            if early_flash_turn1 and int(self.position) <= 1:
+                flash_min_tokens = 1
+
+            use_native_attn = self.use_native_cuda_norm and (
+                ((not self.disable_fused_attention) and attention_fused_single_f32_available())
+                or attention_single_f32_available()
+                or (((not self.disable_fused_attention) and attention_flash_single_f32_available() and used_len >= flash_min_tokens))
+            )
+            if use_native_attn:
+                for h in range(self.num_heads):
+                    qh = q[h]
+                    kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
+                    kh = keys[:, kv_h, :]
+                    vh = values[:, kv_h, :]
+                    if self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_flash_single_f32_available() and used_len >= flash_min_tokens:
+                        attn[h] = attention_flash_single_f32(qh, kh, vh, self.flash_attention_block_tokens)
+                        self.phase3_flash_attn_calls += 1
+                    elif self.use_native_cuda_norm and (not self.disable_fused_attention) and attention_fused_single_f32_available():
+                        attn[h] = attention_fused_single_f32(qh, kh, vh)
+                        self.phase3_fused_attn_calls += 1
+                    else:
+                        attn[h] = attention_single_f32(qh, kh, vh)
+                        self.phase3_scalar_attn_calls += 1
+            else:
+                attn[:, :] = _attention_cpu_batched(
+                    q=q,
+                    keys=keys,
+                    values=values,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    kv_heads_equal=kv_heads_equal,
+                    kv_group_size=kv_group_size,
+                    inv_sqrt_head_dim=self.inv_sqrt_head_dim,
+                    attention_logit_clip=self.attention_logit_clip,
+                )
+                self.phase3_cpu_attn_calls += int(self.num_heads)
 
             attn = attn.reshape(-1)
             attn = _linear_native(attn, layer.wo, "wo")
@@ -1202,11 +1319,24 @@ class GPT2Runtime:
             keys = self.cache_k[idx][:used_len]
             values = self.cache_v[idx][:used_len]
             attn_out = np.empty((self.num_heads, self.head_dim), dtype=np.float32)
-            scale = 1.0 / np.sqrt(float(self.head_dim))
-            for h in range(self.num_heads):
-                scores = (keys[:, h, :] @ q[h]) * scale
-                probs = _softmax(scores.reshape(1, -1))[0]
-                attn_out[h] = probs @ values[:, h, :]
+            if self.use_native_cuda_norm and attention_fused_single_f32_available():
+                for h in range(self.num_heads):
+                    attn_out[h] = attention_fused_single_f32(q[h], keys[:, h, :], values[:, h, :])
+            elif self.use_native_cuda_norm and attention_single_f32_available():
+                for h in range(self.num_heads):
+                    attn_out[h] = attention_single_f32(q[h], keys[:, h, :], values[:, h, :])
+            else:
+                attn_out[:, :] = _attention_cpu_batched(
+                    q=q,
+                    keys=keys,
+                    values=values,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_heads,
+                    kv_heads_equal=True,
+                    kv_group_size=1,
+                    inv_sqrt_head_dim=(1.0 / np.sqrt(float(max(1, self.head_dim)))),
+                    attention_logit_clip=0.0,
+                )
 
             attn_flat = attn_out.reshape(-1)
             attn_proj = _linear(attn_flat, layer.c_proj, "c_proj")
@@ -1356,6 +1486,17 @@ class Qwen35Runtime:
                 )
 
             def _linear_multi(vec: "np.ndarray", specs: list[tuple[str, "np.ndarray"]], combo_key: str) -> list["np.ndarray"]:
+                many = lowbit_linear_project_many(
+                    vec=vec,
+                    specs=specs,
+                    layer_idx=idx,
+                    packed=layer.packed,
+                    use_native_cuda_norm=self.use_native_cuda_norm,
+                    lowbit_plan=self.lowbit_plan,
+                )
+                if many is not None and len(many) == len(specs):
+                    return many
+
                 use_combo = (
                     self.use_native_cuda_norm
                     and self.lowbit_plan.enabled
@@ -1419,21 +1560,29 @@ class Qwen35Runtime:
                 keys = self.cache_k[idx][:used_len]
                 values = self.cache_v[idx][:used_len]
                 attn = np.empty((self.num_heads, self.head_dim), dtype=np.float32)
-                for h in range(self.num_heads):
-                    qh = q[h]
-                    kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
-                    kh = keys[:, kv_h, :]
-                    vh = values[:, kv_h, :]
-                    if self.use_native_cuda_norm and attention_fused_single_f32_available():
-                        attn[h] = attention_fused_single_f32(qh, kh, vh)
-                    elif self.use_native_cuda_norm and attention_single_f32_available():
-                        attn[h] = attention_single_f32(qh, kh, vh)
-                    else:
-                        scores = (kh @ qh) / np.sqrt(float(max(1, self.head_dim)))
-                        if self.attention_logit_clip > 0.0:
-                            scores = np.clip(scores, -self.attention_logit_clip, self.attention_logit_clip)
-                        probs = _softmax(scores.reshape(1, -1))[0]
-                        attn[h] = probs @ vh
+                use_native_attn = self.use_native_cuda_norm and (attention_fused_single_f32_available() or attention_single_f32_available())
+                if use_native_attn:
+                    for h in range(self.num_heads):
+                        qh = q[h]
+                        kv_h = h if kv_heads_equal else min(self.num_kv_heads - 1, h // kv_group_size)
+                        kh = keys[:, kv_h, :]
+                        vh = values[:, kv_h, :]
+                        if self.use_native_cuda_norm and attention_fused_single_f32_available():
+                            attn[h] = attention_fused_single_f32(qh, kh, vh)
+                        else:
+                            attn[h] = attention_single_f32(qh, kh, vh)
+                else:
+                    attn[:, :] = _attention_cpu_batched(
+                        q=q,
+                        keys=keys,
+                        values=values,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        kv_heads_equal=kv_heads_equal,
+                        kv_group_size=kv_group_size,
+                        inv_sqrt_head_dim=(1.0 / np.sqrt(float(max(1, self.head_dim)))),
+                        attention_logit_clip=self.attention_logit_clip,
+                    )
 
                 attn = attn * (1.0 / (1.0 + np.exp(-gate.astype(np.float32, copy=False))))
                 attn_out = _linear(attn.reshape(-1), layer.wo, "wo")
@@ -2412,7 +2561,7 @@ def _load_qwen35_runtime(
         if quant_policy.disable_runtime_quantization:
             q_residual_clamp_alpha = 0.0
 
-        return Qwen35Runtime(
+        runtime = Qwen35Runtime(
             embed=embed.embed.astype(np.float32, copy=False),
             lm_head=lm_head.astype(np.float32, copy=False),
             lm_head_native=np.ascontiguousarray(lm_head.T, dtype=np.float32) if use_native_cuda_norm else None,
@@ -2449,6 +2598,10 @@ def _load_qwen35_runtime(
             logit_margin_gain=stability.logit_margin_gain,
             ssm_warmup_tokens=stability.ssm_warmup_tokens,
         )
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        runtime.int4_pre_registered = int(reg_ok)
+        runtime.int4_pre_register_failures = int(reg_fail)
+        return runtime
     finally:
         _clear_safe_open_caches()
 
@@ -2605,7 +2758,7 @@ def _load_gpt2_runtime(
         elif lm_head.shape[0] != hidden:
             return None
 
-        return GPT2Runtime(
+        runtime = GPT2Runtime(
             embed=embed.astype(np.float32, copy=False),
             pos_embed=pos_embed.astype(np.float32, copy=False),
             lm_head=lm_head.astype(np.float32, copy=False),
@@ -2624,6 +2777,10 @@ def _load_gpt2_runtime(
             fused_bits=fused_bits,
             lowbit_plan=lowbit_plan,
         )
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        runtime.int4_pre_registered = int(reg_ok)
+        runtime.int4_pre_register_failures = int(reg_fail)
+        return runtime
     finally:
         _clear_safe_open_caches()
 
@@ -2764,10 +2921,10 @@ def _load_generic_transformer(
         g_residual_clamp_alpha = stability.residual_clamp_alpha
         if quant_policy.disable_runtime_quantization:
             g_residual_clamp_alpha = 0.0
-        flash_attention_min_tokens = int(os.getenv("VSPEC_FLASH_ATTN_MIN_TOKENS", "256") or "256")
+        flash_attention_min_tokens = int(os.getenv("VSPEC_FLASH_ATTN_MIN_TOKENS", "1") or "1")
         flash_attention_block_tokens = int(os.getenv("VSPEC_FLASH_ATTN_BLOCK_TOKENS", "128") or "128")
 
-        return GenericTransformerRuntime(
+        runtime = GenericTransformerRuntime(
             embed=embed_weight,
             lm_head=lm_head,
             lm_head_native=np.ascontiguousarray(lm_head.T, dtype=np.float32) if use_native_cuda_norm else None,
@@ -2802,7 +2959,15 @@ def _load_generic_transformer(
             logit_entropy_target=stability.logit_entropy_target,
             logit_margin_floor=stability.logit_margin_floor,
             logit_margin_gain=stability.logit_margin_gain,
+            phase3_flash_attn_calls=0,
+            phase3_fused_attn_calls=0,
+            phase3_scalar_attn_calls=0,
+            phase3_cpu_attn_calls=0,
         )
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        runtime.int4_pre_registered = int(reg_ok)
+        runtime.int4_pre_register_failures = int(reg_fail)
+        return runtime
     finally:
         _clear_safe_open_caches()
 
@@ -2978,6 +3143,80 @@ def runtime_matrix_bits_summary(layers: list[LayerWeights]) -> tuple[str, float,
     return summary, eff, has_lowbit, coverage
 
 
+def _warm_register_runtime_int4_handles(runtime_obj) -> tuple[int, int]:
+    if np is None or runtime_obj is None:
+        return 0, 0
+    enabled = os.getenv("VSPEC_INT4_PRE_REGISTER", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled or not fused_linear_int4_registered_available():
+        return 0, 0
+
+    layers = list(getattr(runtime_obj, "layers", []) or [])
+    if not layers:
+        return 0, 0
+
+    required_handles = 0
+    for layer in layers:
+        packed_map = getattr(layer, "packed", None)
+        if not isinstance(packed_map, dict) or not packed_map:
+            continue
+        for entry in packed_map.values():
+            if entry is None or len(entry) < 5:
+                continue
+            try:
+                if int(entry[2]) == 4:
+                    required_handles += 1
+            except Exception:
+                continue
+
+    try:
+        bridge_cap, _ = get_lowbit_bridge_cache_caps()
+    except Exception:
+        bridge_cap = 256
+    if int(bridge_cap) < int(max(64, required_handles)):
+        return 0, int(required_handles)
+
+    registered = 0
+    failures = 0
+    for layer in layers:
+        packed_map = getattr(layer, "packed", None)
+        if not isinstance(packed_map, dict) or not packed_map:
+            continue
+        for key, entry in list(packed_map.items()):
+            if entry is None or len(entry) < 5:
+                continue
+            if not hasattr(layer, key):
+                continue
+            packed_w, scales, bits, out_n, zero_points = entry[:5]
+            if int(bits) != 4:
+                continue
+            handle = 0
+            if len(entry) >= 6:
+                try:
+                    handle = int(entry[5] or 0)
+                except Exception:
+                    handle = 0
+            if handle > 0:
+                continue
+
+            try:
+                k_in = int(getattr(layer, key).shape[-1])
+            except Exception:
+                failures += 1
+                continue
+
+            try:
+                handle = int(fused_linear_int4_register_weight(packed_w, scales, int(out_n), k_in, zero_points=zero_points) or 0)
+            except Exception:
+                handle = 0
+            if handle > 0:
+                packed_map[key] = (packed_w, scales, bits, out_n, zero_points, handle)
+                registered += 1
+            else:
+                failures += 1
+
+    return registered, failures
+
+
 def build_generic_runtime(
     config: dict,
     weight_index: dict[str, WeightInfo],
@@ -3059,14 +3298,29 @@ def build_generic_runtime(
         runtime.quant_source_quantized = bool(quant_policy.source_quantized)
         runtime.quant_runtime_disabled = bool(quant_policy.disable_runtime_quantization)
         runtime.quant_policy_reason = quant_policy.reason
+        runtime.kv_core_mirror_enabled = False
+        runtime.kv_core_mirror_count = 0
+        runtime.kv_python_shadow_disabled = False
         try:
-            page_tokens = max(16, int(os.getenv("VSPEC_CORE_KV_PAGE_TOKENS", "64") or "64"))
-            max_tokens = max(128, int(os.getenv("VSPEC_CORE_KV_MAX_TOKENS", "4096") or "4096"))
-            max_pages = max(4, (max_tokens + page_tokens - 1) // page_tokens)
-            runtime.kv_core_mirrors = [
-                CorePagedKVCache(page_tokens, max_pages, runtime.num_kv_heads, runtime.head_dim, session_id=idx + 1)
-                for idx in range(len(getattr(runtime, "layers", []) or []))
-            ]
+            mirror_disabled = os.getenv("VSPEC_DISABLE_CORE_KV_MIRROR", "0").strip().lower() in {"1", "true", "yes", "on"}
+            shadow_disabled = os.getenv("VSPEC_DISABLE_PY_KV_SHADOW", "0").strip().lower() in {"1", "true", "yes", "on"}
+            mirror_only_experimental = os.getenv("VSPEC_EXPERIMENTAL_MIRROR_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+            if mirror_disabled:
+                runtime.kv_core_mirrors = []
+            else:
+                page_tokens = max(16, int(os.getenv("VSPEC_CORE_KV_PAGE_TOKENS", "64") or "64"))
+                max_tokens = max(128, int(os.getenv("VSPEC_CORE_KV_MAX_TOKENS", "4096") or "4096"))
+                max_pages = max(4, (max_tokens + page_tokens - 1) // page_tokens)
+                runtime.kv_core_mirrors = [
+                    CorePagedKVCache(page_tokens, max_pages, runtime.num_kv_heads, runtime.head_dim, session_id=idx + 1)
+                    for idx in range(len(getattr(runtime, "layers", []) or []))
+                ]
+                runtime.kv_core_mirror_count = len(runtime.kv_core_mirrors)
+                runtime.kv_core_mirror_enabled = runtime.kv_core_mirror_count > 0
+                runtime.kv_python_shadow_disabled = bool(runtime.kv_core_mirror_enabled and shadow_disabled and mirror_only_experimental)
         except Exception:
             runtime.kv_core_mirrors = []
+            runtime.kv_core_mirror_enabled = False
+            runtime.kv_core_mirror_count = 0
+            runtime.kv_python_shadow_disabled = False
     return runtime
