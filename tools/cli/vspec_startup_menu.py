@@ -525,6 +525,14 @@ def _run_benchmark() -> int:
 
 
 def _run_chat(selected_model: ModelCandidate) -> int:
+    # Job61 rollback: keep chat on proven Python pipeline by default.
+    os.environ["VSPEC_CHAT_MODE"] = "python"
+    os.environ["VSPEC_NATIVE_BACKEND"] = "python"
+    os.environ["VSPEC_FORCE_NATIVE_REAL"] = "0"
+    os.environ["VSPEC_REQUIRE_NATIVE_REAL"] = "0"
+    os.environ["VSPEC_FULL_NATIVE_C"] = "0"
+    os.environ["VSPEC_FULL_NATIVE_BYPASS_RUNTIME"] = "0"
+    os.environ["VSPEC_NATIVE_CHAT_REPL"] = "0"
     os.environ["VSPEC_TARGET_BITS"] = "3"
     os.environ["VSPEC_FUSED_BITS"] = "4"
     os.environ["VSPEC_3BIT_RUNTIME_MODULE"] = "1"
@@ -535,6 +543,9 @@ def _run_chat(selected_model: ModelCandidate) -> int:
     os.environ["VSPEC_PRECISION_DOWNGRADE_TRIGGER"] = "0.70"
     os.environ["VSPEC_CACHE_COMPRESSION_TRIGGER"] = "0.78"
     os.environ["VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP"] = "3"
+    os.environ["VSPEC_INT4_PRE_REGISTER"] = "0"
+    os.environ["VSPEC_DISABLE_PY_KV_SHADOW"] = "1"
+    os.environ.setdefault("VSPEC_LAYER_LOAD_WORKERS", "1")
 
     print("\n[startup] Chat runtime defaults:")
     print("  - Runtime compute: INT4 (fused-bits=4)")
@@ -548,41 +559,21 @@ def _run_chat(selected_model: ModelCandidate) -> int:
     print("  - VSPEC_PRECISION_DOWNGRADE_TRIGGER=0.70")
     print("  - VSPEC_CACHE_COMPRESSION_TRIGGER=0.78")
     print("  - VSPEC_PER_MODEL_ADAPTIVE_BIT_CAP=3")
-    print("\n[startup] launching interactive chat...\n")
+    print("  - VSPEC_INT4_PRE_REGISTER=0 (faster/stable startup)")
+    print("  - VSPEC_DISABLE_PY_KV_SHADOW=1")
+    print("  - VSPEC_LAYER_LOAD_WORKERS=1")
+    print("  - Chat pipeline: Python (job61 rollback)")
+    print("\n[startup] launching interactive chat...")
+    print("[startup] note: first load may take a while; runtime progress will be shown below.\n")
+    if os.getenv("VSPEC_NATIVE_CHAT_REPL", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print("[startup] note: VSPEC_NATIVE_CHAT_REPL is deprecated in startup menu and ignored.")
+        print("[startup] using Python interactive runner (job61 rollback).")
 
-    native_repl_enabled = os.getenv("VSPEC_NATIVE_CHAT_REPL", "1").strip().lower() in {"1", "true", "yes", "on"}
-    if native_repl_enabled:
-        root = Path(__file__).resolve().parents[2]
-        native_exe_candidates = [
-            root / "build" / "Release" / "vspec_native_session_chat.exe",
-            root / "build" / "Debug" / "vspec_native_session_chat.exe",
-            root / "build" / "vspec_native_session_chat",
-        ]
-        native_exe = next((p for p in native_exe_candidates if p.exists()), None)
-
-        resolved_model = selected_model.path
-        if selected_model.kind == "vspec":
-            try:
-                resolved_model = Path(resolve_model_for_runtime(str(selected_model.path)))
-            except Exception:
-                resolved_model = selected_model.path
-
-        native_model = None
-        if resolved_model.exists() and resolved_model.is_dir():
-            shards = sorted(resolved_model.glob("model-*.safetensors"))
-            if shards:
-                native_model = shards[0]
-            else:
-                safes = sorted(resolved_model.glob("*.safetensors"))
-                if safes:
-                    native_model = safes[0]
-
-        if native_exe is not None and native_model is not None:
-            print(f"[startup] native chat repl enabled: {native_exe.name}")
-            proc = subprocess.run([str(native_exe), str(native_model), "256"])
-            return int(proc.returncode)
-
-        print("[startup] native chat repl requested but unavailable, fallback to python session.")
+    chat_max_tokens_raw = os.getenv("VSPEC_CHAT_MAX_TOKENS", "256").strip()
+    try:
+        chat_max_tokens = max(1, int(chat_max_tokens_raw))
+    except Exception:
+        chat_max_tokens = 256
 
     run_args = VspecRunArgs(
         model=str(selected_model.path),
@@ -591,7 +582,7 @@ def _run_chat(selected_model: ModelCandidate) -> int:
         fused_bits=4,
         target_bits=3,
         max_layers=0,
-        max_tokens=256,
+        max_tokens=chat_max_tokens,
         temperature=0.8,
         top_k=40,
         repetition_penalty=1.15,

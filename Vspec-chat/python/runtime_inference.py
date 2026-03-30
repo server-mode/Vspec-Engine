@@ -2598,7 +2598,7 @@ def _load_qwen35_runtime(
             logit_margin_gain=stability.logit_margin_gain,
             ssm_warmup_tokens=stability.ssm_warmup_tokens,
         )
-        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime, progress_cb=progress_cb)
         runtime.int4_pre_registered = int(reg_ok)
         runtime.int4_pre_register_failures = int(reg_fail)
         return runtime
@@ -2777,7 +2777,7 @@ def _load_gpt2_runtime(
             fused_bits=fused_bits,
             lowbit_plan=lowbit_plan,
         )
-        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime, progress_cb=progress_cb)
         runtime.int4_pre_registered = int(reg_ok)
         runtime.int4_pre_register_failures = int(reg_fail)
         return runtime
@@ -2964,7 +2964,7 @@ def _load_generic_transformer(
             phase3_scalar_attn_calls=0,
             phase3_cpu_attn_calls=0,
         )
-        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime)
+        reg_ok, reg_fail = _warm_register_runtime_int4_handles(runtime, progress_cb=progress_cb)
         runtime.int4_pre_registered = int(reg_ok)
         runtime.int4_pre_register_failures = int(reg_fail)
         return runtime
@@ -3143,7 +3143,10 @@ def runtime_matrix_bits_summary(layers: list[LayerWeights]) -> tuple[str, float,
     return summary, eff, has_lowbit, coverage
 
 
-def _warm_register_runtime_int4_handles(runtime_obj) -> tuple[int, int]:
+def _warm_register_runtime_int4_handles(
+    runtime_obj,
+    progress_cb: Optional[Callable[[str, int, int], None]] = None,
+) -> tuple[int, int]:
     if np is None or runtime_obj is None:
         return 0, 0
     enabled = os.getenv("VSPEC_INT4_PRE_REGISTER", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -3172,12 +3175,27 @@ def _warm_register_runtime_int4_handles(runtime_obj) -> tuple[int, int]:
         bridge_cap, _ = get_lowbit_bridge_cache_caps()
     except Exception:
         bridge_cap = 256
+
+    if progress_cb is not None and required_handles > 0:
+        progress_cb("int4_pre_register", 0, required_handles)
+
     if int(bridge_cap) < int(max(64, required_handles)):
+        if required_handles > 0:
+            print(
+                f"[runtime] int4 pre-register skipped: bridge_cache_cap={int(bridge_cap)} required={int(required_handles)}",
+                flush=True,
+            )
         return 0, int(required_handles)
+
+    try:
+        log_limit = max(0, int(os.getenv("VSPEC_INT4_PRE_REGISTER_LOG_LIMIT", "5") or "5"))
+    except Exception:
+        log_limit = 5
 
     registered = 0
     failures = 0
-    for layer in layers:
+    attempted = 0
+    for layer_idx, layer in enumerate(layers):
         packed_map = getattr(layer, "packed", None)
         if not isinstance(packed_map, dict) or not packed_map:
             continue
@@ -3200,19 +3218,48 @@ def _warm_register_runtime_int4_handles(runtime_obj) -> tuple[int, int]:
 
             try:
                 k_in = int(getattr(layer, key).shape[-1])
-            except Exception:
+            except Exception as exc:
                 failures += 1
+                attempted += 1
+                if progress_cb is not None and required_handles > 0:
+                    progress_cb("int4_pre_register", min(attempted, required_handles), required_handles)
+                if failures <= log_limit:
+                    print(
+                        f"[runtime] warning: int4 pre-register failed layer={layer_idx} key={key}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 continue
 
+            err_reason: str | None = None
             try:
                 handle = int(fused_linear_int4_register_weight(packed_w, scales, int(out_n), k_in, zero_points=zero_points) or 0)
-            except Exception:
+                if handle <= 0:
+                    err_reason = "bridge returned handle=0"
+            except Exception as exc:
+                err_reason = f"{type(exc).__name__}: {exc}"
                 handle = 0
+
+            attempted += 1
+            if progress_cb is not None and required_handles > 0:
+                progress_cb("int4_pre_register", min(attempted, required_handles), required_handles)
+
             if handle > 0:
                 packed_map[key] = (packed_w, scales, bits, out_n, zero_points, handle)
                 registered += 1
             else:
                 failures += 1
+                if failures <= log_limit:
+                    detail = err_reason or "unknown"
+                    print(
+                        f"[runtime] warning: int4 pre-register failed layer={layer_idx} key={key}: {detail}",
+                        flush=True,
+                    )
+
+    if failures > log_limit:
+        print(
+            f"[runtime] int4 pre-register failures suppressed={int(failures - log_limit)} total_failures={int(failures)}",
+            flush=True,
+        )
 
     return registered, failures
 

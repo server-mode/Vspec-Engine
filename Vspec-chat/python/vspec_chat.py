@@ -30,9 +30,20 @@ from decode_optimization_module import DecodeOptimizationModule
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projection_stats_snapshot
 from runtime_threebit_module import ThreeBitRuntimeModule
-from decode_contract import sanitize_and_validate_logits
+from decode_phase1_contract import DecodeState, PythonDecodeOrchestrator
+from decode_phase2_prefill import run_prefill_with_core_scheduler
+from decode_phase3_step_dispatch import Phase3StepDispatcher
 from native_safe_decode import resolve_native_safe_max_layers
-from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, CoreNativeDecodeLoop, adaptive_step
+from runtime_core_bridge import (
+    CoreDecodeSession,
+    CoreNativeForwardContext,
+    CoreNativeDecodeLoop,
+    adaptive_step,
+    native_anf_observe_activations,
+    native_anf_observe_quality,
+    native_anf_prototype_enabled,
+    native_anf_report,
+)
 from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
 
 
@@ -76,7 +87,7 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     msg = f"[progress] {pct:>3}% | {stage}"
     if detail:
         msg += f" | {detail}"
-    print(msg)
+    print(msg, flush=True)
 
 
 def _entropy_from_logits(logits_obj) -> float:
@@ -91,6 +102,23 @@ def _entropy_from_logits(logits_obj) -> float:
         return float(-sum(p * math.log(max(1e-12, p)) for p in probs))
     except Exception:
         return 0.0
+
+
+def _anf_quality_proxies(logits_obj, entropy_now: float) -> tuple[float, float, float]:
+    try:
+        vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+        if not vals:
+            return 0.0, 0.0, 0.0
+        n = float(len(vals))
+        mean = sum(float(v) for v in vals) / n
+        var = sum((float(v) - mean) * (float(v) - mean) for v in vals) / n
+        std = math.sqrt(max(0.0, var))
+        residual_rms = min(2.0, max(0.0, std / 4.0))
+        entropy_collapse = min(1.0, max(0.0, entropy_now / max(1.0, math.log(max(2.0, n)))))
+        activation_norm_drift = min(1.0, max(0.0, abs(mean) / 8.0 + std / 16.0))
+        return residual_rms, entropy_collapse, activation_norm_drift
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 
 def _resolve_budget_step_cap(
@@ -875,12 +903,20 @@ def main() -> None:
     os.environ.setdefault("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only")
     os.environ.setdefault("VSPEC_INT4_BLOCKWISE_ENABLE", "1")
     os.environ.setdefault("VSPEC_INT4_BLOCK_SIZE", "32")
-    os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "16")
+    prototype_anf_mode = (
+        os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "0" if prototype_anf_mode else "16")
     os.environ.setdefault("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
-    os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "0")
+    os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "1" if prototype_anf_mode else "0")
+    if prototype_anf_mode:
+        os.environ.setdefault("VSPEC_ANF_TCC_ENABLE", "1")
+        os.environ.setdefault("VSPEC_ANF_MAX_HOT_RATIO", "0.10")
+        os.environ.setdefault("VSPEC_ANF_ACTIVATION_THRESHOLD", "1.10")
     os.environ.setdefault("VSPEC_C_SAMPLER_REQUIRED", "1")
-    os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "0")
-    os.environ.setdefault("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0")
+    os.environ.setdefault("VSPEC_USE_C_SAMPLER", "1")
+    os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "1")
     if os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16").strip() in {"0", "off", "OFF"}:
         os.environ.setdefault("VSPEC_INT4_COMPUTE_MODE", "native")
     if (
@@ -899,6 +935,17 @@ def main() -> None:
     model_dir = Path(args.model_dir)
     _progress(show_progress, 5, "snapshot", "finding latest HF snapshot")
     snapshot_dir = find_snapshot_dir(model_dir)
+
+    def _resolve_native_model_file(snapshot_dir: Path) -> str | None:
+        preferred = sorted(snapshot_dir.glob("model-*.safetensors"))
+        if preferred:
+            return str(preferred[0])
+        any_safe = sorted(snapshot_dir.glob("*.safetensors"))
+        if any_safe:
+            return str(any_safe[0])
+        return None
+
+    native_model_file = _resolve_native_model_file(snapshot_dir)
     _progress(show_progress, 15, "config", "loading model and tokenizer config")
     config = read_config(snapshot_dir)
     requested_layers = int(args.max_layers)
@@ -1069,10 +1116,15 @@ def main() -> None:
     def _runtime_progress(stage: str, current: int, total: int) -> None:
         if not show_progress:
             return
-        if stage != "layer_load" or total <= 0:
+        if total <= 0:
             return
-        pct = 36 + int((current / total) * 22)
-        _progress(show_progress, min(58, pct), "runtime-load", f"layer {current}/{total}")
+        if stage == "layer_load":
+            pct = 36 + int((current / total) * 22)
+            _progress(show_progress, min(58, pct), "runtime-load", f"layer {current}/{total}")
+            return
+        if stage == "int4_pre_register":
+            pct = 58 + int((current / total) * 6)
+            _progress(show_progress, min(64, pct), "runtime-int4", f"pre-register {current}/{total}")
 
     runtime_load_t0 = time.perf_counter()
     runtime = build_generic_runtime(
@@ -1193,53 +1245,26 @@ def main() -> None:
             if hasattr(runtime, "prefill_tokens"):
                 run_prefill_direct = True
                 prefill_sched_requested = os.getenv("VSPEC_PREFILL_CORE_SCHED", "0").strip().lower() not in {"0", "false", "no", "off"}
-                prefill_sched_experimental = os.getenv("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0").strip().lower() in {"1", "true", "yes", "on"}
-                use_prefill_core_sched = bool(prefill_sched_requested and prefill_sched_experimental)
+                use_prefill_core_sched = bool(prefill_sched_requested)
                 if use_prefill_core_sched and total_prefill > 0:
-                    print("[vspec-chat] prefill_core_scheduler_experimental= on")
-                    try:
-                        core_prefill = CoreContinuousBatcher.from_runtime(runtime, max_batch_items=1, max_batch_tokens=max(64, total_prefill))
-                        if core_prefill.available:
-                            reserve_prefill = CoreDecodeSession.estimate_reserve_bytes(runtime, 1)
-                            req_id = core_prefill.submit(
-                                reserve_bytes=reserve_prefill,
-                                prompt_tokens=total_prefill,
-                                max_new_tokens=1,
-                                priority=0,
-                            )
-                            if req_id > 0:
-                                consumed_total = 0
-                                while consumed_total < total_prefill:
-                                    items = core_prefill.next_batch(1)
-                                    if not items:
-                                        break
-                                    item = items[0]
-                                    phase = int(item.get("phase", 0))
-                                    if phase == 1:
-                                        cursor = max(0, int(item.get("prompt_cursor", consumed_total)))
-                                        quota = max(1, int(item.get("token_quota", 1)))
-                                        chunk = prefill_ids[cursor : min(total_prefill, cursor + quota)]
-                                        if chunk:
-                                            runtime.prefill_tokens(chunk)
-                                        consumed = len(chunk)
-                                        core_prefill.commit_prefill(req_id, consumed)
-                                        consumed_total = max(consumed_total, cursor + consumed)
-                                        prefill_core_steps += 1
-                                        if total_prefill > 0 and (consumed_total == total_prefill or consumed_total % max(1, total_prefill // 4) == 0):
-                                            pct = 60 + int((consumed_total / total_prefill) * 20)
-                                            _progress(show_progress, min(80, pct), "prefill-core", f"{consumed_total}/{total_prefill} tokens")
-                                        continue
-                                    core_prefill.cancel(req_id)
-                                    break
-                                if consumed_total >= total_prefill:
-                                    prefill_core_scheduler_used = True
-                                    run_prefill_direct = False
-                                    stats = core_prefill.stats()
-                                    if stats:
-                                        print("[vspec-chat] prefill_core_reserved_vram=", int(stats.get("reserved_vram", 0)))
-                            core_prefill.close()
-                    except Exception:
-                        run_prefill_direct = True
+                    print("[vspec-chat] prefill_core_scheduler= on")
+                    result = run_prefill_with_core_scheduler(
+                        runtime,
+                        prefill_ids,
+                        progress_cb=lambda cur, tot: _progress(
+                            show_progress,
+                            min(80, 60 + int((cur / max(1, tot)) * 20)),
+                            "prefill-core",
+                            f"{cur}/{tot} tokens",
+                        ),
+                    )
+                    if result.used_core_scheduler:
+                        run_prefill_direct = False
+                        prefill_core_scheduler_used = True
+                        prefill_core_steps = int(result.core_steps)
+                        print("[vspec-chat] prefill_core_reserved_vram=", int(result.reserved_vram))
+                    else:
+                        print("[vspec-chat] prefill_core_fallback=", str(result.reason or "unknown"))
 
                 if run_prefill_direct:
                     runtime.prefill_tokens(prefill_ids)
@@ -1335,6 +1360,22 @@ def main() -> None:
     if decode_step_cap != int(max_steps):
         print(f"[vspec-chat] decode_step_cap= {decode_step_cap} (requested={int(max_steps)})")
     max_steps = decode_step_cap
+    decode_state = DecodeState(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=int(max_steps))
+    phase3_dispatcher = Phase3StepDispatcher(
+        runtime=runtime,
+        decode_optimizer=decode_optimizer,
+        expected_vocab_size=vocab_size,
+    )
+    phase1_orchestrator = PythonDecodeOrchestrator(
+        state=decode_state,
+        runtime=runtime,
+        decode_optimizer=decode_optimizer,
+        expected_vocab_size=vocab_size,
+        scheduler_enabled=scheduler_enabled,
+        core_decode=core_decode,
+        step_dispatcher=phase3_dispatcher,
+    )
+    phase1_orchestrator.prefill(token_ids)
     native_cpp_loop = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     def _runtime_graph_signature(runtime_obj, prompt_tokens: int, decode_steps: int) -> int:
@@ -1394,6 +1435,24 @@ def main() -> None:
     adaptive_entropy_prev = 0.0
     adaptive_latency_ms = 0.0
     adaptive_quality_drift = 0.0
+    native_blend_calls = 0
+    native_blend_failures = 0
+    native_forward_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
+    native_forward_ctx = None
+    if native_forward_enabled and native_model_file:
+        try:
+            seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
+            seed_val = int(seed_raw)
+        except Exception:
+            seed_val = int(args.seed)
+        try:
+            native_forward_ctx = CoreNativeForwardContext(native_model_file, seed=seed_val)
+            if not native_forward_ctx.available:
+                native_forward_ctx = None
+        except Exception:
+            native_forward_ctx = None
+
+    anf_enabled = native_anf_prototype_enabled()
     for step in range(max_steps):
         if scheduler_enabled:
             quota = core_decode.next_quota()
@@ -1404,27 +1463,21 @@ def main() -> None:
         decode_elapsed = time.perf_counter() - decode_start_ts
         if decode_budget_seconds > 0.0 and decode_elapsed >= decode_budget_seconds:
             print(f"[vspec-chat] decode_timeout= True (budget={decode_budget_seconds:.1f}s)")
+            decode_state.mark_timeout()
             break
         reached_eos = False
         for _ in range(quota):
             token_t0 = time.perf_counter()
-            if runtime is None:
-                print("[vspec-chat] decode_contract_ok= False reason=runtime-unavailable logits_len=0 expected_vocab=", vocab_size)
+            step_result = phase1_orchestrator.step(token_ids[-1])
+            if not step_result.ok:
+                print(
+                    f"[vspec-chat] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={vocab_size}"
+                )
                 decode_contract_failed = True
                 break
-            else:
-                logits = decode_optimizer.fetch_logits(runtime, token_ids[-1], vocab_size)
-                logits, contract = sanitize_and_validate_logits(logits, vocab_size)
-                if not contract.ok:
-                    print(f"[vspec-chat] decode_contract_ok= False reason={contract.reason} logits_len={contract.logits_len} expected_vocab={contract.expected_vocab_size}")
-                    decode_contract_failed = True
-                    break
-                if step == 0 and contract.masked_tail > 0:
-                    print(f"[vspec-chat] decode_contract_masked_tail= {contract.masked_tail}")
-                if decode_optimizer.logits_empty(logits):
-                    print(f"[vspec-chat] decode_contract_ok= False reason=empty-logits logits_len=0 expected_vocab={vocab_size}")
-                    decode_contract_failed = True
-                    break
+            logits = step_result.logits
+            if step == 0 and int(step_result.masked_tail or 0) > 0:
+                print(f"[vspec-chat] decode_contract_masked_tail= {int(step_result.masked_tail)}")
             if decode_contract_failed:
                 break
             logits = threebit_module.denoise_logits(logits, step)
@@ -1434,6 +1487,13 @@ def main() -> None:
             entropy_now = _entropy_from_logits(logits)
             entropy_collapse = max(0.0, adaptive_entropy_prev - entropy_now)
             adaptive_entropy_prev = entropy_now
+            if anf_enabled:
+                try:
+                    native_anf_observe_activations(logits)
+                    rrms, ecollapse, norm_drift = _anf_quality_proxies(logits, entropy_now)
+                    native_anf_observe_quality(rrms, ecollapse, norm_drift)
+                except Exception:
+                    pass
             token_text = ""
             try:
                 token_text = tokenizer.decode([int(token_ids[-1])])
@@ -1474,8 +1534,52 @@ def main() -> None:
                 if bit_hint > 0:
                     temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
                     sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
-            next_id = fast_engine.sample(
+
+            if native_forward_ctx is not None and native_forward_ctx.available:
+                try:
+                    blend_alpha = float(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_ALPHA", "0.18") or "0.18")
+                except Exception:
+                    blend_alpha = 0.18
+                blend_alpha = max(0.0, min(1.0, blend_alpha))
+                if blend_alpha > 0.0:
+                    try:
+                        blend_topk = int(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_TOPK", "24") or "24")
+                    except Exception:
+                        blend_topk = 24
+                    blend_topk = max(4, min(128, blend_topk))
+
+                    try:
+                        vocab_vals = logits.tolist() if hasattr(logits, "tolist") else list(logits)
+                    except Exception:
+                        vocab_vals = []
+
+                    if vocab_vals:
+                        import heapq
+
+                        cand_k = min(len(vocab_vals), max(blend_topk, sample_top_k))
+                        cand_ids = heapq.nlargest(cand_k, range(len(vocab_vals)), key=vocab_vals.__getitem__)
+                        base_scores = [float(vocab_vals[i]) for i in cand_ids]
+                        blended = native_forward_ctx.blend_candidates(
+                            prompt=str(args.prompt or ""),
+                            produced_tokens=len(generated),
+                            candidate_ids=[int(i) for i in cand_ids],
+                            base_scores=base_scores,
+                            blend=blend_alpha,
+                        )
+                        if blended is not None and len(blended) == len(cand_ids):
+                            for idx, score in zip(cand_ids, blended):
+                                logits[idx] = float(score)
+                            native_blend_calls += 1
+                        else:
+                            native_blend_failures += 1
+                    else:
+                        native_blend_failures += 1
+                else:
+                    native_blend_failures += 1
+
+            next_id = phase1_orchestrator.sample(
                 logits,
+                fast_engine.sample,
                 sample_temperature,
                 sample_top_k,
                 sample_greedy,
@@ -1489,8 +1593,7 @@ def main() -> None:
             adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
             adaptive_quality_drift = min(1.0, 0.6 * adaptive_quality_drift + 0.4 * entropy_collapse)
             reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
-            if scheduler_enabled:
-                core_decode.commit(1, reached_eos)
+            phase1_orchestrator.commit(next_id, reached_eos)
             if reached_eos:
                 break
 
@@ -1519,6 +1622,46 @@ def main() -> None:
                 print("[vspec-chat] graph_replays=", int(loop_stats.get("graph_replays", 0)))
                 print("[vspec-chat] graph_cached_signatures=", int(loop_stats.get("graph_cached_signatures", 0)))
                 print("[vspec-chat] native_loop_steps=", int(loop_stats.get("steps", 0)))
+        except Exception:
+            pass
+
+    if native_forward_ctx is not None:
+        try:
+            native_forward_ctx.close()
+        except Exception:
+            pass
+    print("[vspec-chat] native_forward_blend_calls=", int(native_blend_calls))
+    print("[vspec-chat] native_forward_blend_failures=", int(native_blend_failures))
+    phase4_sampler_stats = fast_engine.phase4_sampler_report() if fast_engine is not None else {}
+    print("[vspec-chat] phase4_sampler_calls=", int(phase4_sampler_stats.get("calls", 0)))
+    print("[vspec-chat] phase4_c_sampler_calls=", int(phase4_sampler_stats.get("c_sampler_calls", 0)))
+    print("[vspec-chat] phase4_python_sampler_calls=", int(phase4_sampler_stats.get("python_sampler_calls", 0)))
+    print("[vspec-chat] phase4_sampler_parity_checks=", int(phase4_sampler_stats.get("parity_checks", 0)))
+    print("[vspec-chat] phase4_sampler_parity_mismatch=", int(phase4_sampler_stats.get("parity_mismatch", 0)))
+    print("[vspec-chat] phase4_sampler_parity_fallbacks=", int(phase4_sampler_stats.get("parity_fallbacks", 0)))
+    print("[vspec-chat] phase3_step_calls=", int(phase3_dispatcher.stats.get("calls", 0)))
+    print("[vspec-chat] phase3_c_step_calls=", int(phase3_dispatcher.stats.get("c_step_calls", 0)))
+    print("[vspec-chat] phase3_python_step_calls=", int(phase3_dispatcher.stats.get("python_step_calls", 0)))
+    print("[vspec-chat] phase3_parity_checks=", int(phase3_dispatcher.stats.get("parity_checks", 0)))
+    print("[vspec-chat] phase3_parity_failures=", int(phase3_dispatcher.stats.get("parity_failures", 0)))
+    print("[vspec-chat] phase3_parity_fallbacks=", int(phase3_dispatcher.stats.get("parity_fallbacks", 0)))
+    print(
+        "[vspec-chat] phase1_decode_state=",
+        f"prefill_done:{int(decode_state.prefill_done)} generated:{int(decode_state.generated_tokens)} finished:{int(decode_state.finished)} reason:{decode_state.finish_reason or 'none'}",
+    )
+
+    if anf_enabled:
+        try:
+            anf_report = native_anf_report() or {}
+            if anf_report:
+                print("[vspec-chat] anf_available=", int(anf_report.get("anf_available", 0)))
+                print("[vspec-chat] anf_mode=", int(anf_report.get("anf_mode", 0)))
+                print("[vspec-chat] anf_hot_ratio_avg=", float(anf_report.get("hot_ratio_avg", 0.0)))
+                print("[vspec-chat] anf_tokens_observed=", int(anf_report.get("tokens_observed", 0)))
+                print("[vspec-chat] anf_skip_ratio_avg=", float(anf_report.get("skip_ratio_avg", 0.0)))
+                print("[vspec-chat] anf_cascade_depth_max=", int(anf_report.get("cascade_depth_max", 0)))
+                print("[vspec-chat] anf_forced_fallback_count=", int(anf_report.get("forced_fallback_count", 0)))
+                print("[vspec-chat] anf_silent_stop_count=", int(anf_report.get("silent_stop_count", 0)))
         except Exception:
             pass
     core_decode.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from vspec_runner import VspecRunArgs, run_interactive, run_once
 
@@ -32,8 +33,14 @@ def main() -> None:
     parser.add_argument("--unsafe-low-layers", action="store_true", help="Allow very low max-layers even if response quality may collapse")
     parser.add_argument("--stream", action="store_true", help="Stream tokens for single prompt mode")
     parser.add_argument("--json", action="store_true", help="Emit JSON output for automation")
+    parser.add_argument("--strict-native", action="store_true", help="Require native-real backend only (no Python compute fallback)")
 
     args = parser.parse_args()
+
+    if args.strict_native:
+        os.environ["VSPEC_FORCE_NATIVE_REAL"] = "1"
+        os.environ["VSPEC_REQUIRE_NATIVE_REAL"] = "1"
+        os.environ.setdefault("VSPEC_NATIVE_BACKEND", "native-real")
 
     model = (args.model_opt or args.model or "").strip()
     if not model:

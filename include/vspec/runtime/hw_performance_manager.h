@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "vspec/kernel/backend.h"
+#include "vspec/runtime/neuron_router.h"
 
 typedef enum VspecHwTuningMode {
     VSPEC_HW_TUNING_PERFORMENT = 0,
@@ -41,6 +42,12 @@ typedef struct VspecRuntimeHwConfig {
     float precision_downgrade_trigger;
     float cache_compression_trigger;
     uint8_t per_model_adaptive_bit_cap;
+
+    VspecAnfMode anf_mode;
+    float anf_max_hot_ratio;
+    uint32_t anf_min_hot_neurons;
+    uint32_t anf_max_hot_neurons;
+    float anf_activation_threshold;
 } VspecRuntimeHwConfig;
 
 typedef struct VspecRuntimeHwState {

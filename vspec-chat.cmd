@@ -1,7 +1,17 @@
 @echo off
 set SCRIPT_DIR=%~dp0
 set VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe
+set PY_CMD=python
+if not defined VSPEC_USE_VENV_PYTHON set VSPEC_USE_VENV_PYTHON=0
+if /I "%VSPEC_USE_VENV_PYTHON%"=="1" if exist "%VENV_PY%" set PY_CMD=%VENV_PY%
+if defined VSPEC_PYTHON set PY_CMD=%VSPEC_PYTHON%
+echo [vspec-chat] python=%PY_CMD%
+if not defined VSPEC_CHAT_PROTOTYPE set VSPEC_CHAT_PROTOTYPE=0
+if not defined VSPEC_ENABLE_ANF set VSPEC_ENABLE_ANF=0
 if not defined VSPEC_CHAT_MODE set VSPEC_CHAT_MODE=python
+if /I "%VSPEC_CHAT_MODE%"=="native" (
+	if not defined VSPEC_NATIVE_BACKEND set VSPEC_NATIVE_BACKEND=native-real
+)
 if not defined VSPEC_NATIVE_CPP_LOOP set VSPEC_NATIVE_CPP_LOOP=1
 if /I "%VSPEC_CHAT_MODE%"=="native" (
 	if not defined VSPEC_FULL_NATIVE_C set VSPEC_FULL_NATIVE_C=1
@@ -14,7 +24,7 @@ if /I "%VSPEC_CHAT_MODE%"=="native" (
 )
 if not defined VSPEC_CHAT_HARD_NATIVE set VSPEC_CHAT_HARD_NATIVE=1
 if "%~1"=="" (
-	if /I "%VSPEC_CHAT_MODE%"=="native" (
+	if /I "%VSPEC_CHAT_MODE%"=="native" if /I not "%VSPEC_NATIVE_BACKEND%"=="native-real" (
 		if exist "%SCRIPT_DIR%build\Release\vspec_native_startup_chat.exe" (
 			"%SCRIPT_DIR%build\Release\vspec_native_startup_chat.exe"
 			exit /b %ERRORLEVEL%
@@ -31,12 +41,12 @@ if "%~1"=="" (
 		)
 	)
 	if exist "%VENV_PY%" (
-		"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
+		"%PY_CMD%" "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
 	) else (
-		python "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
+		"%PY_CMD%" "%SCRIPT_DIR%tools\cli\vspec_startup_menu.py"
 	)
 ) else (
-	if /I "%VSPEC_CHAT_MODE%"=="native" (
+	if /I "%VSPEC_CHAT_MODE%"=="native" if /I not "%VSPEC_NATIVE_BACKEND%"=="native-real" (
 		if exist "%SCRIPT_DIR%build\Release\vspec_native_startup_chat.exe" (
 			"%SCRIPT_DIR%build\Release\vspec_native_startup_chat.exe" "%~1"
 			exit /b %ERRORLEVEL%
@@ -52,9 +62,9 @@ if "%~1"=="" (
 		)
 	)
 	if exist "%VENV_PY%" (
-		"%VENV_PY%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+		"%PY_CMD%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
 	) else (
-		python "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
+		"%PY_CMD%" "%SCRIPT_DIR%tools\cli\vspec_run.py" --chat %*
 	)
 )
 exit /b %ERRORLEVEL%

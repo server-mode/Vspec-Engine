@@ -9,13 +9,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 option(VSPEC_ENABLE_CUDA "Enable CUDA backend" ON)
+option(VSPEC_ENABLE_ANF "Enable ANF runtime path" OFF)
 
 set(VSPEC_HAS_CUDA 0)
 if(VSPEC_ENABLE_CUDA)
     include(CheckLanguage)
     set(CMAKE_CUDA_RUNTIME_LIBRARY "Shared" CACHE STRING "CUDA runtime linkage" FORCE)
     set(CMAKE_CUDA_ARCHITECTURES "75" CACHE STRING "CUDA architectures" FORCE)
-    set(CMAKE_CUDA_FLAGS "-D_WINDOWS -Xcompiler=\" /EHsc\" -Wno-deprecated-gpu-targets --diag_suppress=177 --diag_suppress=546" CACHE STRING "CUDA flags" FORCE)
+    set(CMAKE_CUDA_FLAGS "-D_WINDOWS -Xcompiler=\" /EHsc\" -Wno-deprecated-gpu-targets" CACHE STRING "CUDA flags" FORCE)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
@@ -85,6 +86,10 @@ add_library(vspec_engine
     src/runtime/mixed_bit.c
     src/runtime/mixed_bit_runtime.c
     src/runtime/mixed_bit_policy.c
+    src/runtime/neuron_router.c
+    src/runtime/pattern_cache.c
+    src/runtime/error_estimator.c
+    src/runtime/precision_wave.c
     src/runtime/adaptive_precision_engine.c
     src/runtime/adaptive/runtime_controller.c
     src/runtime/adaptive/token_scheduler.c
@@ -103,6 +108,8 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/cuda_linear_int4.cu
         src/kernel/cuda/fused_linear_int4.cu
         src/kernel/cuda/fused_linear_int3.cu
+        src/kernel/cuda/fused_linear_int2.cu
+        src/kernel/cuda/fused_linear_hybrid.cu
         src/kernel/cuda/cuda_ultimate_branch.cu
         src/kernel/cuda/attention_fused.cu
         src/kernel/cuda/autotune.cu
@@ -127,8 +134,6 @@ if(VSPEC_HAS_CUDA)
     )
     target_compile_options(vspec_engine PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
-        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=177>
-        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=546>
     )
 
     if (CUDAToolkit_FOUND)
@@ -139,7 +144,7 @@ if(VSPEC_HAS_CUDA)
     endif()
 endif()
 
-target_compile_definitions(vspec_engine PUBLIC VSPEC_HAS_CUDA=${VSPEC_HAS_CUDA})
+target_compile_definitions(vspec_engine PUBLIC VSPEC_HAS_CUDA=${VSPEC_HAS_CUDA} VSPEC_ENABLE_ANF=$<BOOL:${VSPEC_ENABLE_ANF}>)
 
 target_include_directories(vspec_engine
     PUBLIC
@@ -171,6 +176,8 @@ target_include_directories(vspec_engine_capi
 
 target_compile_definitions(vspec_engine_capi PRIVATE VSPEC_PYTHON_CAPI_BUILD)
 
+target_link_libraries(vspec_engine_capi PRIVATE vspec_engine)
+
 set_target_properties(vspec_engine_capi PROPERTIES
     OUTPUT_NAME "vspec_engine_capi"
 )
@@ -185,6 +192,8 @@ if(VSPEC_HAS_CUDA)
         src/kernel/cuda/cuda_elemwise_f32.cu
         src/kernel/cuda/fused_linear_int4.cu
         src/kernel/cuda/fused_linear_int3.cu
+        src/kernel/cuda/fused_linear_int2.cu
+        src/kernel/cuda/fused_linear_hybrid.cu
     )
 
     foreach(_cu_file IN LISTS VSPEC_BRIDGE_CUDA_SOURCES)
@@ -204,10 +213,13 @@ if(VSPEC_HAS_CUDA)
         target_compile_definitions(vspec_cuda_bridge PRIVATE VSPEC_USE_CUBLAS=0)
     endif()
 
+    target_compile_definitions(vspec_cuda_bridge PRIVATE
+        VSPEC_HAS_CUDA=1
+        VSPEC_ENABLE_ANF=$<BOOL:${VSPEC_ENABLE_ANF}>
+    )
+
     target_compile_options(vspec_cuda_bridge PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
-        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=177>
-        $<$<COMPILE_LANGUAGE:CUDA>:--diag_suppress=546>
     )
 
     target_include_directories(vspec_cuda_bridge
@@ -224,6 +236,21 @@ if(VSPEC_HAS_CUDA)
     if(MSVC)
         set_target_properties(vspec_cuda_bridge PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
     endif()
+
+    add_executable(vspec_anf_phase_a_laneA
+        tools/benchmark/anf_phase_a_laneA.c
+    )
+    target_link_libraries(vspec_anf_phase_a_laneA PRIVATE vspec_cuda_bridge)
+
+    add_executable(vspec_anf_phase_a_laneA_split_timing
+        tools/benchmark/anf_phase_a_laneA_split_timing.c
+    )
+    target_link_libraries(vspec_anf_phase_a_laneA_split_timing PRIVATE vspec_cuda_bridge)
+
+    add_executable(vspec_anf_phase_b_cuda_laneB
+        tools/benchmark/anf_phase_b_cuda_laneB.c
+    )
+    target_link_libraries(vspec_anf_phase_b_cuda_laneB PRIVATE vspec_cuda_bridge)
 endif()
 
 add_executable(vspec_int4_demo
@@ -291,6 +318,54 @@ add_executable(vspec_week25_scheduler_stress
 )
 
 target_link_libraries(vspec_week25_scheduler_stress PRIVATE vspec_engine)
+
+add_executable(vspec_anf_router_smoke
+    tools/benchmark/anf_router_smoke.c
+)
+
+target_link_libraries(vspec_anf_router_smoke PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_a_off_shadow
+    tools/benchmark/anf_phase_a_off_shadow.c
+)
+
+target_link_libraries(vspec_anf_phase_a_off_shadow PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_b_tcc_smoke
+    tools/benchmark/anf_phase_b_tcc_smoke.c
+)
+
+target_link_libraries(vspec_anf_phase_b_tcc_smoke PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_b_laneB
+    tools/benchmark/anf_phase_b_laneB.c
+)
+
+target_link_libraries(vspec_anf_phase_b_laneB PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_c_cascade_smoke
+    tools/benchmark/anf_phase_c_cascade_smoke.c
+)
+
+target_link_libraries(vspec_anf_phase_c_cascade_smoke PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_c_laneC
+    tools/benchmark/anf_phase_c_laneC.c
+)
+
+target_link_libraries(vspec_anf_phase_c_laneC PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_d_soak_1000
+    tools/benchmark/anf_phase_d_soak_1000.c
+)
+
+target_link_libraries(vspec_anf_phase_d_soak_1000 PRIVATE vspec_engine)
+
+add_executable(vspec_anf_phase_d_rollback_smoke
+    tools/benchmark/anf_phase_d_rollback_smoke.c
+)
+
+target_link_libraries(vspec_anf_phase_d_rollback_smoke PRIVATE vspec_engine)
 
 add_executable(vspec_native_model_probe
     tools/native/native_model_probe.c

@@ -1,6 +1,6 @@
 import ctypes
 import os
-from ctypes import c_float, c_int, c_size_t, c_uint64, POINTER
+from ctypes import c_float, c_int, c_size_t, c_uint32, c_uint64, POINTER
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +38,7 @@ _INT4_BRIDGE_ABI = "unknown"
 _INT4_BRIDGE_SIGNATURE = "unknown"
 _HAS_INT4_REGISTERED = False
 _HAS_INT4_REGISTERED_MANY = False
+_HAS_FUSED_HYBRID = False
 
 
 def _ensure_c_array(arr: np.ndarray, dtype) -> np.ndarray:
@@ -250,6 +251,25 @@ if _lib is not None:
         ]
         _lib.vspec_cuda_fused_linear_int3_bridge.restype = c_int
         _HAS_FUSED_INT3 = True
+
+    _HAS_FUSED_HYBRID = hasattr(_lib, "vspec_cuda_fused_linear_hybrid_bridge")
+    if _HAS_FUSED_HYBRID:
+        _lib.vspec_cuda_fused_linear_hybrid_bridge.argtypes = [
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            POINTER(c_uint32),
+            c_size_t,
+            c_size_t,
+            POINTER(c_float),
+        ]
+        _lib.vspec_cuda_fused_linear_hybrid_bridge.restype = c_int
 else:
     _HAS_FUSED_ATTN = False
     _HAS_FLASH_ATTN = False
@@ -257,6 +277,7 @@ else:
     _HAS_INT4_TENSORCORE = False
     _HAS_INT4_CACHED_STATS = False
     _HAS_INT4_REGISTERED_MANY = False
+    _HAS_FUSED_HYBRID = False
 
 
 def rmsnorm_f32_available() -> bool:
@@ -527,6 +548,10 @@ def fused_linear_int3_available() -> bool:
     return _lib is not None and _HAS_FUSED_INT3
 
 
+def fused_linear_hybrid_available() -> bool:
+    return _lib is not None and _HAS_FUSED_HYBRID
+
+
 def fused_linear_int4_registered_available() -> bool:
     return _lib is not None and _HAS_FUSED_INT4 and _HAS_INT4_REGISTERED
 
@@ -785,4 +810,59 @@ def fused_linear_int3(input_array: np.ndarray, packed_weight: np.ndarray, scales
     )
     if ok != 1:
         raise RuntimeError("vspec_cuda_fused_linear_int3_bridge failed")
+    return output
+
+
+def fused_linear_hybrid(
+    input_array: np.ndarray,
+    packed_weight_int2: np.ndarray,
+    scales_int2: np.ndarray,
+    n: int,
+    hot_indices: np.ndarray | None = None,
+    packed_weight_int4: np.ndarray | None = None,
+    scales_int4: np.ndarray | None = None,
+    zero_points_int4: np.ndarray | None = None,
+    n_blocks_int4: int = 1,
+) -> np.ndarray:
+    if _lib is None or not _HAS_FUSED_HYBRID:
+        raise RuntimeError("vspec_cuda_fused_linear_hybrid_bridge unavailable")
+
+    if input_array.ndim == 1:
+        input_array = input_array[None, :]
+
+    input_array = _ensure_c_array(input_array, np.float32)
+    packed_weight_int2 = _ensure_c_array(packed_weight_int2, np.uint8)
+    scales_int2 = _ensure_c_array(scales_int2, np.float32)
+    hot_arr = _ensure_c_array(hot_indices, np.uint32) if hot_indices is not None else None
+    packed_weight_int4_arr = _ensure_c_array(packed_weight_int4, np.uint8) if packed_weight_int4 is not None else None
+    scales_int4_arr = _ensure_c_array(scales_int4, np.float32) if scales_int4 is not None else None
+    zero_points_int4_arr = _ensure_c_array(zero_points_int4, np.float32) if zero_points_int4 is not None else None
+
+    m, k = input_array.shape
+    output = np.empty((m, int(n)), dtype=np.float32)
+
+    hot_ptr = hot_arr.ctypes.data_as(POINTER(c_uint32)) if hot_arr is not None and hot_arr.size > 0 else None
+    hot_count = int(hot_arr.size) if hot_arr is not None else 0
+
+    int4_w_ptr = packed_weight_int4_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)) if packed_weight_int4_arr is not None else None
+    int4_s_ptr = scales_int4_arr.ctypes.data_as(POINTER(c_float)) if scales_int4_arr is not None else None
+    int4_zp_ptr = zero_points_int4_arr.ctypes.data_as(POINTER(c_float)) if zero_points_int4_arr is not None else None
+
+    ok = _lib.vspec_cuda_fused_linear_hybrid_bridge(
+        input_array.ctypes.data_as(POINTER(c_float)),
+        packed_weight_int2.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+        scales_int2.ctypes.data_as(POINTER(c_float)),
+        int4_w_ptr,
+        int4_s_ptr,
+        int4_zp_ptr,
+        c_size_t(int(m)),
+        c_size_t(int(k)),
+        c_size_t(int(n)),
+        hot_ptr,
+        c_size_t(hot_count),
+        c_size_t(max(1, int(n_blocks_int4))),
+        output.ctypes.data_as(POINTER(c_float)),
+    )
+    if ok != 1:
+        raise RuntimeError("vspec_cuda_fused_linear_hybrid_bridge failed")
     return output

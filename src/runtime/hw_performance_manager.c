@@ -96,6 +96,16 @@ static void vspec_parse_backend_preference(const char* value, VspecRuntimeHwConf
     }
 }
 
+static void vspec_parse_anf_mode(const char* value, VspecRuntimeHwConfig* config) {
+    if (vspec_equals_ignore_case(value, "off")) {
+        config->anf_mode = VSPEC_ANF_MODE_OFF;
+    } else if (vspec_equals_ignore_case(value, "shadow")) {
+        config->anf_mode = VSPEC_ANF_MODE_SHADOW;
+    } else if (vspec_equals_ignore_case(value, "active")) {
+        config->anf_mode = VSPEC_ANF_MODE_ACTIVE;
+    }
+}
+
 void vspec_runtime_hw_config_default(VspecRuntimeHwConfig* config) {
     if (!config) {
         return;
@@ -120,6 +130,12 @@ void vspec_runtime_hw_config_default(VspecRuntimeHwConfig* config) {
     config->precision_downgrade_trigger = 0.88f;
     config->cache_compression_trigger = 0.90f;
     config->per_model_adaptive_bit_cap = 4U;
+
+    config->anf_mode = VSPEC_ANF_MODE_OFF;
+    config->anf_max_hot_ratio = 0.15f;
+    config->anf_min_hot_neurons = 16U;
+    config->anf_max_hot_neurons = 1024U;
+    config->anf_activation_threshold = 0.80f;
 }
 
 int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* out_config) {
@@ -205,6 +221,16 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
             out_config->cache_compression_trigger = vspec_clamp_float((float)atof(value), 0.50f, 1.00f);
         } else if (vspec_equals_ignore_case(key, "per_model_adaptive_bit_cap")) {
             out_config->per_model_adaptive_bit_cap = vspec_clamp_u8((uint8_t)strtoul(value, NULL, 10), 3U, 4U);
+        } else if (vspec_equals_ignore_case(key, "anf_mode")) {
+            vspec_parse_anf_mode(value, out_config);
+        } else if (vspec_equals_ignore_case(key, "anf_max_hot_ratio")) {
+            out_config->anf_max_hot_ratio = vspec_clamp_float((float)atof(value), 0.01f, 0.50f);
+        } else if (vspec_equals_ignore_case(key, "anf_min_hot_neurons")) {
+            out_config->anf_min_hot_neurons = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 0U, 65536U);
+        } else if (vspec_equals_ignore_case(key, "anf_max_hot_neurons")) {
+            out_config->anf_max_hot_neurons = vspec_clamp_u32((uint32_t)strtoul(value, NULL, 10), 1U, 65536U);
+        } else if (vspec_equals_ignore_case(key, "anf_activation_threshold")) {
+            out_config->anf_activation_threshold = vspec_clamp_float((float)atof(value), 0.0f, 8.0f);
         }
     }
 
@@ -229,6 +255,10 @@ int vspec_runtime_hw_config_load_file(const char* path, VspecRuntimeHwConfig* ou
         if (out_config->qlora_rank < 8U) {
             out_config->qlora_rank = 8U;
         }
+    }
+
+    if (out_config->anf_min_hot_neurons > out_config->anf_max_hot_neurons) {
+        out_config->anf_min_hot_neurons = out_config->anf_max_hot_neurons;
     }
 
     return 1;

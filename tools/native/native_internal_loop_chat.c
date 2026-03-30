@@ -9,6 +9,7 @@
 #include "vspec/runtime/native_inference.h"
 #include "vspec/runtime/native_model_registry.h"
 #include "vspec/runtime/output_guard.h"
+#include "vspec/runtime/runtime.h"
 
 static void append_token(char* out, size_t cap, const char* token, int with_space) {
     if (!out || cap == 0U || !token) {
@@ -42,6 +43,8 @@ int main(int argc, char** argv) {
     const char* model_file = argv[1];
     const char* prompt = argv[2];
     const size_t max_steps = (argc >= 4) ? (size_t)strtoul(argv[3], NULL, 10) : 16U;
+
+    vspec_runtime_init_default();
 
     VspecCompatModel model;
     if (!vspec_safetensors_parse_header_file(model_file, &model)) {

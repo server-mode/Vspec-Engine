@@ -1,21 +1,19 @@
 import heapq
 import math
 import os
-import random
 import re
 from dataclasses import dataclass
 
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
 from meaningful_output_guard import MeaningfulOutputGuard
+from decode_phase4_sampler import Phase4SamplingCore
 from runtime_core_bridge import (
     native_output_guard_allow,
     native_output_guard_available,
     native_output_guard_init,
     native_output_guard_observe,
     native_output_guard_score_adjustment,
-    sample_candidate,
-    sample_candidate_available,
 )
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 
@@ -63,6 +61,7 @@ class FastOutputEngine:
         self._emitted_parts: list[str] = []
         self.simple_sampling = os.getenv("VSPEC_SAMPLING_SIMPLE", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.c_sampler_required = os.getenv("VSPEC_C_SAMPLER_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.phase4_sampler = Phase4SamplingCore()
         self.native_output_guard_enabled = os.getenv("VSPEC_NATIVE_OUTPUT_GUARD", "1").strip().lower() in {"1", "true", "yes", "on"}
         if self.native_output_guard_enabled and native_output_guard_available():
             strictness_raw = os.getenv("VSPEC_NATIVE_OUTPUT_GUARD_STRICTNESS", "0.72")
@@ -240,39 +239,16 @@ class FastOutputEngine:
             return int(candidate_ids[0])
         if greedy:
             return scored[0][0]
-
-        if sample_candidate_available():
-            sampled = sample_candidate(
-                token_ids=[tid for tid, _ in scored],
-                scores=[score for _, score in scored],
-                greedy=False,
-                random_bits=random.getrandbits(63),
-            )
-            if sampled is not None:
-                return int(sampled)
-
-        if self.c_sampler_required:
-            return int(scored[0][0])
-
-        max_logit = scored[0][1]
-        if not math.isfinite(float(max_logit)):
-            return scored[0][0]
-        exp_vals = [math.exp(v - max_logit) for _, v in scored]
-        total = sum(exp_vals)
-        if (not math.isfinite(float(total))) or total <= 0:
-            return scored[0][0]
-        r = random.random()
-        acc = 0.0
-        for i, (_, v) in enumerate(scored):
-            acc += exp_vals[i] / total
-            if r <= acc:
-                return scored[i][0]
-        return scored[-1][0]
+        decision = self.phase4_sampler.choose(scored=scored, greedy=False, c_sampler_required=self.c_sampler_required)
+        return int(decision.token_id)
 
     def structure_report(self) -> dict | None:
         if self.structure_guard is None:
             return None
         return self.structure_guard.report()
+
+    def phase4_sampler_report(self) -> dict:
+        return dict(self.phase4_sampler.stats)
 
 
 def _topn_indices(values: list[float], n: int) -> list[int]:

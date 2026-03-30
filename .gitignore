@@ -22,3 +22,6 @@ research/
 **/__pycache__/
 *.py[cod]
 tmp/
+prototype/
+build_vs2022/
+build_vs2022_anf/

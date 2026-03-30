@@ -54,6 +54,10 @@ typedef struct VspecNativeForwardContext {
     unsigned char fingerprint[64];
     size_t fingerprint_len;
     uint64_t state;
+    int anf_tcc_ready;
+    size_t anf_prev_hot_count;
+    uint32_t anf_prev_hot_indices[VSPEC_NATIVE_TOKEN_COUNT];
+    float anf_prev_scores[VSPEC_NATIVE_TOKEN_COUNT];
 } VspecNativeForwardContext;
 
 int vspec_native_forward_init(

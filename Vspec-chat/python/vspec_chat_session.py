@@ -16,9 +16,21 @@ from language_structure_guard import LanguageStructureIntegrityManager
 from runtime_meaningful_response import RuntimeMeaningfulResponseAssurance
 from runtime_lowbit_module import lowbit_projection_stats_reset, lowbit_projection_stats_snapshot
 from runtime_threebit_module import ThreeBitRuntimeModule
-from decode_contract import sanitize_and_validate_logits
+from decode_phase1_contract import DecodeState, PythonDecodeOrchestrator
+from decode_phase2_prefill import run_prefill_with_core_scheduler
+from decode_phase3_step_dispatch import Phase3StepDispatcher
+from decode_phase5_daemon import Phase5TurnReport, SessionCoreDaemonSupervisor
 from native_safe_decode import build_native_safe_runtime
-from runtime_core_bridge import CoreContinuousBatcher, CoreDecodeSession, CoreNativeDecodeLoop, CoreNativeForwardContext, adaptive_step
+from runtime_core_bridge import (
+    CoreDecodeSession,
+    CoreNativeDecodeLoop,
+    CoreNativeForwardContext,
+    adaptive_step,
+    native_anf_observe_activations,
+    native_anf_observe_quality,
+    native_anf_prototype_enabled,
+    native_anf_report,
+)
 from model_adapters import select_adapter
 from model_loader import (
     build_weight_index,
@@ -29,7 +41,6 @@ from model_loader import (
     read_tokenizer_config,
 )
 from runtime_inference import build_generic_runtime, runtime_matrix_bits_summary
-from vspec_chat import _detect_lang, _is_runtime_fallback_text, _looks_gibberish_output
 from vspec_cuda_bridge import cuda_device_capability, cuda_mem_info, int4_compute_mode, int4_tensorcore_available
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
 
@@ -66,7 +77,106 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     msg = f"[session] {pct:>3}% | {stage}"
     if detail:
         msg += f" | {detail}"
-    print(msg)
+    print(msg, flush=True)
+
+
+def _detect_lang(prompt: str) -> str:
+    lower = prompt.lower()
+    vi_chars = "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ"
+    if any(ch in lower for ch in vi_chars):
+        return "vi"
+    if any("\u4e00" <= ch <= "\u9fff" for ch in prompt):
+        return "auto"
+    return "en"
+
+
+def _is_runtime_fallback_text(text: str, lang_mode: str) -> bool:
+    out = (text or "").strip().lower()
+    if not out:
+        return True
+    if out.startswith("[vspec-decode-error]"):
+        return True
+    if "i could not confidently decode a clean response" in out:
+        return True
+    if lang_mode == "vi" and "mình chưa giải mã được câu trả lời đủ sạch" in out:
+        return True
+    return False
+
+
+def _looks_gibberish_output(text: str) -> bool:
+    out = (text or "").strip()
+    if not out:
+        return True
+    if len(out) >= 32 and out.count("\n") <= 1:
+        quote_ratio = (out.count("\"") + out.count("'")) / max(1, len(out))
+        comma_ratio = out.count(",") / max(1, len(out))
+        if quote_ratio > 0.08 or comma_ratio > 0.10:
+            return True
+    letters = sum(1 for ch in out if ch.isalpha())
+    if len(out) >= 40 and (letters / max(1, len(out))) < 0.45:
+        return True
+    punct = sum(1 for ch in out if (not ch.isalnum()) and (not ch.isspace()))
+    if len(out) >= 40 and (punct / max(1, len(out))) > 0.22:
+        return True
+    words = re.findall(r"[A-Za-z]{2,}", out)
+    if len(words) >= 16:
+        normalized = [w.lower() for w in words]
+        unique_ratio = len(set(normalized)) / max(1, len(normalized))
+        if unique_ratio < 0.45:
+            return True
+        short_words = [w for w in normalized if len(w) <= 5]
+        if short_words:
+            counts = {}
+            for w in short_words:
+                counts[w] = counts.get(w, 0) + 1
+            top_freq = max(counts.values()) if counts else 0
+            if top_freq / max(1, len(short_words)) > 0.22:
+                return True
+    if len(words) == 1 and len(words[0]) >= 20:
+        return True
+    if 1 <= len(words) <= 3 and max(len(w) for w in words) >= 14:
+        return True
+    single_letter_words = re.findall(r"\b[A-Za-z]\b", out)
+    total_word_like = len(words) + len(single_letter_words)
+    if len(out) >= 80 and total_word_like >= 16:
+        single_ratio = len(single_letter_words) / max(1, total_word_like)
+        punct = sum(1 for ch in out if (not ch.isalnum()) and (not ch.isspace()))
+        punct_ratio = punct / max(1, len(out))
+        if single_ratio > 0.22 and punct_ratio > 0.08:
+            return True
+    if len(out) >= 24 and (" " not in out) and out.isalpha():
+        return True
+    if len(words) >= 6:
+        avg_len = sum(len(w) for w in words) / max(1, len(words))
+        if avg_len > 10.0:
+            return True
+        common_words = {
+            "the", "and", "for", "you", "your", "with", "that", "this", "what", "when", "where", "which",
+            "hello", "know", "about", "vietnam", "yes", "can", "help", "please", "thanks", "is", "are", "to",
+            "in", "on", "it", "of", "a", "an", "do", "does", "how", "why", "i", "me", "my"
+        }
+        normalized = [w.lower() for w in words]
+        known_ratio = sum(1 for w in normalized if w in common_words) / len(normalized)
+        if len(words) >= 10 and known_ratio < 0.08:
+            return True
+    return False
+
+
+def _anf_quality_proxies(logits_obj, entropy_now: float) -> tuple[float, float, float]:
+    try:
+        vals = logits_obj.tolist() if hasattr(logits_obj, "tolist") else list(logits_obj)
+        if not vals:
+            return 0.0, 0.0, 0.0
+        n = float(len(vals))
+        mean = sum(float(v) for v in vals) / n
+        var = sum((float(v) - mean) * (float(v) - mean) for v in vals) / n
+        std = math.sqrt(max(0.0, var))
+        residual_rms = min(2.0, max(0.0, std / 4.0))
+        entropy_collapse = min(1.0, max(0.0, entropy_now / max(1.0, math.log(max(2.0, n)))))
+        activation_norm_drift = min(1.0, max(0.0, abs(mean) / 8.0 + std / 16.0))
+        return residual_rms, entropy_collapse, activation_norm_drift
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 
 def _fallback_cuda_capability() -> Optional[tuple[int, int, int]]:
@@ -138,6 +248,7 @@ def _generate(
     native_loop_handle: Optional[CoreNativeDecodeLoop],
     native_forward_ctx: Optional[CoreNativeForwardContext],
     native_model_file: Optional[str],
+    phase5_observer: Optional[Callable[[Phase5TurnReport], None]],
 ) -> str:
     lowbit_projection_stats_reset()
 
@@ -463,72 +574,25 @@ def _generate(
         if hasattr(runtime_obj, "prefill_tokens"):
             run_prefill_direct = True
             prefill_sched_requested = os.getenv("VSPEC_PREFILL_CORE_SCHED", "0").strip().lower() not in {"0", "false", "no", "off"}
-            prefill_sched_experimental = os.getenv("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0").strip().lower() in {"1", "true", "yes", "on"}
-            use_prefill_core_sched = bool(prefill_sched_requested and prefill_sched_experimental)
+            use_prefill_core_sched = bool(prefill_sched_requested)
             if use_prefill_core_sched and total_prefill > 0:
                 print("[session] prefill_core_scheduler= on")
-                try:
-                    core_prefill = CoreContinuousBatcher.from_runtime(
-                        runtime_obj,
-                        max_batch_items=1,
-                        max_batch_tokens=max(64, total_prefill),
-                    )
-                    if core_prefill.available:
-                        reserve_prefill = CoreDecodeSession.estimate_reserve_bytes(runtime_obj, 1)
-                        req_id = core_prefill.submit(
-                            reserve_bytes=reserve_prefill,
-                            prompt_tokens=total_prefill,
-                            max_new_tokens=1,
-                            priority=0,
-                        )
-                        if req_id > 0:
-                            consumed_total = 0
-                            stalled_rounds = 0
-                            while consumed_total < total_prefill:
-                                items = core_prefill.next_batch(1)
-                                if not items:
-                                    stalled_rounds += 1
-                                    if stalled_rounds >= 3:
-                                        break
-                                    break
-                                item = items[0]
-                                phase = int(item.get("phase", 0))
-                                if phase == 1:
-                                    cursor = max(0, int(item.get("prompt_cursor", consumed_total)))
-                                    quota = max(1, int(item.get("token_quota", 1)))
-                                    chunk = prefill[cursor : min(total_prefill, cursor + quota)]
-                                    if chunk:
-                                        runtime_obj.prefill_tokens(chunk)
-                                    consumed = len(chunk)
-                                    if consumed <= 0:
-                                        stalled_rounds += 1
-                                        if stalled_rounds >= 3:
-                                            core_prefill.cancel(req_id)
-                                            break
-                                        continue
-                                    stalled_rounds = 0
-                                    core_prefill.commit_prefill(req_id, consumed)
-                                    consumed_total = max(consumed_total, cursor + consumed)
-                                    if total_prefill > 0 and (
-                                        consumed_total == total_prefill
-                                        or consumed_total % max(1, total_prefill // 4) == 0
-                                    ):
-                                        pct = 10 + int((consumed_total / total_prefill) * 35)
-                                        _progress(show_progress, min(45, pct), "prefill-core", f"{consumed_total}/{total_prefill}")
-                                    continue
-                                core_prefill.cancel(req_id)
-                                break
-                            if consumed_total >= total_prefill:
-                                run_prefill_direct = False
-                                stats = core_prefill.stats()
-                                if stats:
-                                    print(f"[session] prefill_core_steps= {int(stats.get('prefill_steps', 0))}")
-                                    print(f"[session] prefill_core_reserved_vram= {int(stats.get('reserved_vram', 0))}")
-                    core_prefill.close()
-                except Exception:
-                    run_prefill_direct = True
-            elif total_prefill > 0:
-                print("[session] prefill_core_scheduler= off (stable)")
+                result = run_prefill_with_core_scheduler(
+                    runtime_obj,
+                    prefill,
+                    progress_cb=lambda cur, tot: _progress(
+                        show_progress,
+                        min(45, 10 + int((cur / max(1, tot)) * 35)),
+                        "prefill-core",
+                        f"{cur}/{tot}",
+                    ),
+                )
+                if result.used_core_scheduler:
+                    run_prefill_direct = False
+                    print(f"[session] prefill_core_steps= {int(result.core_steps)}")
+                    print(f"[session] prefill_core_reserved_vram= {int(result.reserved_vram)}")
+                else:
+                    print(f"[session] prefill_core_fallback= {str(result.reason or 'unknown')}")
 
             if run_prefill_direct:
                 runtime_obj.prefill_tokens(prefill)
@@ -656,6 +720,10 @@ def _generate(
         cpu_calls_before = int(getattr(runtime_obj, "phase3_cpu_attn_calls", 0) or 0)
 
         total_steps = max(1, int(max_steps))
+        decode_state = DecodeState(
+            prompt_tokens=max(0, len(local_tokens) - 1),
+            max_new_tokens=int(total_steps),
+        )
         native_cpp_loop = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
 
         def _runtime_graph_signature(runtime_ref, prompt_tokens: int, decode_steps: int) -> int:
@@ -714,9 +782,24 @@ def _generate(
         else:
             core_decode = CoreDecodeSession.from_runtime(runtime_obj, total_steps)
             scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(local_tokens) - 1), max_new_tokens=total_steps)
+        phase1_orchestrator = PythonDecodeOrchestrator(
+            state=decode_state,
+            runtime=runtime_obj,
+            decode_optimizer=decode_optimizer,
+            expected_vocab_size=tokenizer.get_vocab_size(),
+            scheduler_enabled=scheduler_enabled,
+            core_decode=core_decode,
+            step_dispatcher=Phase3StepDispatcher(
+                runtime=runtime_obj,
+                decode_optimizer=decode_optimizer,
+                expected_vocab_size=tokenizer.get_vocab_size(),
+            ),
+        )
+        phase1_orchestrator.prefill(local_tokens)
         adaptive_entropy_prev = 0.0
         adaptive_latency_ms = 0.0
         adaptive_quality_drift = 0.0
+        anf_enabled = native_anf_prototype_enabled()
 
         try:
             for step in range(total_steps):
@@ -730,31 +813,24 @@ def _generate(
                 elapsed = time.perf_counter() - start
                 if decode_budget_seconds > 0.0 and elapsed >= decode_budget_seconds:
                     timed_out = True
+                    decode_state.mark_timeout()
                     break
 
                 reached_eos = False
                 for _ in range(quota):
                     token_t0 = time.perf_counter()
-                    logits = decode_optimizer.fetch_logits(runtime_obj, local_tokens[-1], tokenizer.get_vocab_size())
-                    logits, contract = sanitize_and_validate_logits(logits, tokenizer.get_vocab_size())
-                    if not contract.ok:
+                    step_result = phase1_orchestrator.step(local_tokens[-1])
+                    if not step_result.ok:
                         print(
-                            f"[session] decode_contract_ok= False reason={contract.reason} logits_len={contract.logits_len} expected_vocab={contract.expected_vocab_size}"
+                            f"[session] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={tokenizer.get_vocab_size()}"
                         )
                         contract_failed = True
                         break
-                    if step == 0 and contract.masked_tail > 0:
-                        print(f"[session] decode_contract_masked_tail= {contract.masked_tail}")
+                    logits = step_result.logits
+                    if step == 0 and int(step_result.masked_tail or 0) > 0:
+                        print(f"[session] decode_contract_masked_tail= {int(step_result.masked_tail)}")
                     if step == 0:
                         _logits_health(logits, step)
-                    if decode_optimizer.logits_empty(logits):
-                        if debug_logits:
-                            print(f"[session][logits] step={step} empty_after_fetch=True")
-                        print(
-                            f"[session] decode_contract_ok= False reason=empty-logits logits_len=0 expected_vocab={tokenizer.get_vocab_size()}"
-                        )
-                        contract_failed = True
-                        break
 
                     logits = threebit_module.denoise_logits(logits, step)
                     logits = decode_optimizer.apply_generation_controls(logits, local_tokens)
@@ -770,6 +846,13 @@ def _generate(
                     entropy_now = _entropy_from_logits(logits)
                     entropy_collapse = max(0.0, adaptive_entropy_prev - entropy_now)
                     adaptive_entropy_prev = entropy_now
+                    if anf_enabled:
+                        try:
+                            native_anf_observe_activations(logits)
+                            rrms, ecollapse, norm_drift = _anf_quality_proxies(logits, entropy_now)
+                            native_anf_observe_quality(rrms, ecollapse, norm_drift)
+                        except Exception:
+                            pass
                     token_text = ""
                     try:
                         token_text = tokenizer.decode([int(local_tokens[-1])])
@@ -846,7 +929,14 @@ def _generate(
                         else:
                             native_blend_failures += 1
 
-                    next_id = engine.sample(logits, sample_temperature, sample_top_k, sample_greedy, local_lang_top_n)
+                    next_id = phase1_orchestrator.sample(
+                        logits,
+                        engine.sample,
+                        sample_temperature,
+                        sample_top_k,
+                        sample_greedy,
+                        local_lang_top_n,
+                    )
                     generated.append(next_id)
                     local_tokens.append(next_id)
                     engine.stream_token(next_id)
@@ -854,8 +944,7 @@ def _generate(
                     adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
                     adaptive_quality_drift = min(1.0, 0.6 * adaptive_quality_drift + 0.4 * entropy_collapse)
                     reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
-                    if scheduler_enabled:
-                        core_decode.commit(1, reached_eos)
+                    phase1_orchestrator.commit(next_id, reached_eos)
                     if reached_eos:
                         break
 
@@ -884,6 +973,20 @@ def _generate(
                         print(f"[session] graph_cached_signatures= {int(loop_stats.get('graph_cached_signatures', 0))}")
                 except Exception:
                     pass
+            if anf_enabled:
+                try:
+                    anf_report = native_anf_report() or {}
+                    if anf_report:
+                        print(f"[session] anf_available= {int(anf_report.get('anf_available', 0))}")
+                        print(f"[session] anf_mode= {int(anf_report.get('anf_mode', 0))}")
+                        print(f"[session] anf_hot_ratio_avg= {float(anf_report.get('hot_ratio_avg', 0.0))}")
+                        print(f"[session] anf_tokens_observed= {int(anf_report.get('tokens_observed', 0))}")
+                        print(f"[session] anf_skip_ratio_avg= {float(anf_report.get('skip_ratio_avg', 0.0))}")
+                        print(f"[session] anf_cascade_depth_max= {int(anf_report.get('cascade_depth_max', 0))}")
+                        print(f"[session] anf_forced_fallback_count= {int(anf_report.get('forced_fallback_count', 0))}")
+                        print(f"[session] anf_silent_stop_count= {int(anf_report.get('silent_stop_count', 0))}")
+                except Exception:
+                    pass
             if native_cpp_loop:
                 if owns_native_loop:
                     core_decode.close()
@@ -895,6 +998,24 @@ def _generate(
         text = postprocess_output_text(text, prompt, lang_mode)
         tps = (len(generated) / elapsed) if elapsed > 0 else 0.0
         decode_report = engine.structure_report() or {}
+        decode_report["phase1_generated_tokens"] = int(decode_state.generated_tokens)
+        decode_report["phase1_finish_reason"] = str(decode_state.finish_reason or "")
+        decode_report["phase1_contract_failed"] = bool(decode_state.contract_failed)
+        phase4_stats = engine.phase4_sampler_report() if engine is not None else {}
+        decode_report["phase4_sampler_calls"] = int(phase4_stats.get("calls", 0) or 0)
+        decode_report["phase4_c_sampler_calls"] = int(phase4_stats.get("c_sampler_calls", 0) or 0)
+        decode_report["phase4_python_sampler_calls"] = int(phase4_stats.get("python_sampler_calls", 0) or 0)
+        decode_report["phase4_sampler_parity_checks"] = int(phase4_stats.get("parity_checks", 0) or 0)
+        decode_report["phase4_sampler_parity_mismatch"] = int(phase4_stats.get("parity_mismatch", 0) or 0)
+        decode_report["phase4_sampler_parity_fallbacks"] = int(phase4_stats.get("parity_fallbacks", 0) or 0)
+        phase3_stats = getattr(phase1_orchestrator, "step_dispatcher", None)
+        phase3_stats = getattr(phase3_stats, "stats", {}) if phase3_stats is not None else {}
+        decode_report["phase3_step_calls"] = int(phase3_stats.get("calls", 0) or 0)
+        decode_report["phase3_c_step_calls"] = int(phase3_stats.get("c_step_calls", 0) or 0)
+        decode_report["phase3_python_step_calls"] = int(phase3_stats.get("python_step_calls", 0) or 0)
+        decode_report["phase3_parity_checks"] = int(phase3_stats.get("parity_checks", 0) or 0)
+        decode_report["phase3_parity_failures"] = int(phase3_stats.get("parity_failures", 0) or 0)
+        decode_report["phase3_parity_fallbacks"] = int(phase3_stats.get("parity_fallbacks", 0) or 0)
         decode_report["native_forward_blend_calls"] = int(native_blend_calls)
         decode_report["native_forward_blend_failures"] = int(native_blend_failures)
         decode_report["flash_attn_calls"] = int((int(getattr(runtime_obj, "phase3_flash_attn_calls", 0) or 0) - flash_calls_before))
@@ -1273,6 +1394,18 @@ def _generate(
         print("[session] int4_cached_register_calls=", int(int4_cached_stats.get("register_calls", 0)))
         print("[session] int4_cached_register_reuse=", int(int4_cached_stats.get("register_reuse", 0)))
         print("[session] int4_cached_register_evictions=", int(int4_cached_stats.get("register_evictions", 0)))
+
+    if phase5_observer is not None:
+        try:
+            phase5_observer(
+                Phase5TurnReport(
+                    timed_out=bool(timed_out_first),
+                    contract_failed=bool(contract_failed_first),
+                    generated_tokens=int(gen_count),
+                )
+            )
+        except Exception:
+            pass
     return text
 
 
@@ -1339,12 +1472,21 @@ def main() -> None:
     os.environ.setdefault("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only")
     os.environ.setdefault("VSPEC_INT4_BLOCKWISE_ENABLE", "1")
     os.environ.setdefault("VSPEC_INT4_BLOCK_SIZE", "32")
-    os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "16")
+    prototype_anf_mode = (
+        os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "0" if prototype_anf_mode else "16")
     os.environ.setdefault("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
-    os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "0")
+    os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "1")
+    if prototype_anf_mode:
+        os.environ.setdefault("VSPEC_ANF_TCC_ENABLE", "1")
+        os.environ.setdefault("VSPEC_ANF_MAX_HOT_RATIO", "0.10")
+        os.environ.setdefault("VSPEC_ANF_ACTIVATION_THRESHOLD", "1.10")
     os.environ.setdefault("VSPEC_C_SAMPLER_REQUIRED", "1")
-    os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "0")
-    os.environ.setdefault("VSPEC_EXPERIMENTAL_PREFILL_CORE", "0")
+    os.environ.setdefault("VSPEC_USE_C_SAMPLER", "1")
+    os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "1")
+    os.environ.setdefault("VSPEC_ENABLE_PHASE5_DAEMON", "1")
     if os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16").strip() in {"0", "off", "OFF"}:
         os.environ.setdefault("VSPEC_INT4_COMPUTE_MODE", "native")
     if (
@@ -1495,10 +1637,15 @@ def main() -> None:
     def _runtime_progress(stage: str, current: int, total: int) -> None:
         if not show_progress:
             return
-        if stage != "layer_load" or total <= 0:
+        if total <= 0:
             return
-        pct = 61 + int((current / total) * 35)
-        _progress(show_progress, min(96, pct), "runtime-load", f"layer {current}/{total}")
+        if stage == "layer_load":
+            pct = 61 + int((current / total) * 31)
+            _progress(show_progress, min(92, pct), "runtime-load", f"layer {current}/{total}")
+            return
+        if stage == "int4_pre_register":
+            pct = 92 + int((current / total) * 4)
+            _progress(show_progress, min(96, pct), "runtime-int4", f"pre-register {current}/{total}")
 
     runtime = build_generic_runtime(
         config,
@@ -1633,35 +1780,25 @@ def main() -> None:
         torch_runtime_cache["value"] = fallback_runtime
         return fallback_runtime
 
-    native_cpp_loop_enabled = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
-    session_native_loop_handle: Optional[CoreNativeDecodeLoop] = None
-    native_forward_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
-    session_native_forward_ctx: Optional[CoreNativeForwardContext] = None
-    if native_cpp_loop_enabled:
-        try:
-            reserve = max(64, int(args.max_tokens) * 4)
-            session_native_loop_handle = CoreNativeDecodeLoop.from_runtime(runtime, reserve)
-            print(f"[session] native_cpp_loop_handle= shared reserve={reserve}")
-        except Exception:
-            session_native_loop_handle = None
-            print("[session] native_cpp_loop_handle= unavailable")
+    phase5_daemon = SessionCoreDaemonSupervisor(
+        runtime=runtime,
+        max_tokens=int(args.max_tokens),
+        native_model_file=native_model_file,
+        seed=int(args.seed),
+    )
+    phase5_daemon.start()
+    phase5_status = phase5_daemon.status()
+    print("[session] phase5_daemon_enabled=", int(bool(phase5_status.get("enabled", False))))
+    print("[session] phase5_daemon_loop_available=", int(bool(phase5_status.get("loop_available", False))))
+    print("[session] phase5_daemon_forward_ctx_available=", int(bool(phase5_status.get("forward_ctx_available", False))))
 
-    if native_forward_enabled and native_model_file:
-        try:
-            seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
-            seed_val = int(seed_raw)
-        except Exception:
-            seed_val = int(args.seed)
-        try:
-            session_native_forward_ctx = CoreNativeForwardContext(native_model_file, seed=seed_val)
-            if session_native_forward_ctx.available:
-                print("[session] native_forward_ctx= ready")
-            else:
-                session_native_forward_ctx = None
-                print("[session] native_forward_ctx= unavailable")
-        except Exception:
-            session_native_forward_ctx = None
-            print("[session] native_forward_ctx= unavailable")
+    def _observe_phase5_turn(turn_report: Phase5TurnReport) -> None:
+        phase5_daemon.observe_turn(turn_report)
+        st = phase5_daemon.status()
+        print("[session] phase5_turns_total=", int(st.get("turns_total", 0) or 0))
+        print("[session] phase5_turns_timeout=", int(st.get("turns_timeout", 0) or 0))
+        print("[session] phase5_turns_contract_failed=", int(st.get("turns_contract_failed", 0) or 0))
+        print("[session] phase5_daemon_restarts=", int(st.get("restarts", 0) or 0))
 
     try:
         while True:
@@ -1708,23 +1845,15 @@ def main() -> None:
                 max_retry_seconds=args.max_retry_seconds,
                 native_safe_fallback_builder=_native_safe_fallback_builder,
                 torch_timeout_fallback_builder=_torch_timeout_fallback_builder,
-                native_loop_handle=session_native_loop_handle,
-                native_forward_ctx=session_native_forward_ctx,
+                native_loop_handle=phase5_daemon.loop_handle,
+                native_forward_ctx=phase5_daemon.forward_ctx,
                 native_model_file=native_model_file,
+                phase5_observer=_observe_phase5_turn,
             )
             if args.no_stream:
                 print("assistant>", out)
     finally:
-        if session_native_loop_handle is not None:
-            try:
-                session_native_loop_handle.close()
-            except Exception:
-                pass
-        if session_native_forward_ctx is not None:
-            try:
-                session_native_forward_ctx.close()
-            except Exception:
-                pass
+        phase5_daemon.close()
 
 
 if __name__ == "__main__":

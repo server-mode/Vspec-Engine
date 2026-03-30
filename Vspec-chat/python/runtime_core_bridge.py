@@ -29,6 +29,7 @@ def _load_lib() -> ctypes.CDLL | None:
 
 _lib = _load_lib()
 _HAS_GRAPH_CACHE_STATS = False
+_HAS_ANF_BRIDGE = False
 
 if _lib is not None:
     _lib.vspec_py_weight_canonical_name.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
@@ -126,6 +127,31 @@ if _lib is not None:
     _lib.vspec_py_runtime_output_guard_score_adjustment.restype = c_float
     _lib.vspec_py_runtime_output_guard_observe.argtypes = [c_char_p]
     _lib.vspec_py_runtime_output_guard_observe.restype = c_int
+    _HAS_ANF_BRIDGE = hasattr(_lib, "vspec_py_runtime_anf_available")
+    if _HAS_ANF_BRIDGE:
+        _lib.vspec_py_runtime_anf_available.argtypes = []
+        _lib.vspec_py_runtime_anf_available.restype = c_int
+        _lib.vspec_py_runtime_anf_observe_activations.argtypes = [POINTER(c_float), c_size_t]
+        _lib.vspec_py_runtime_anf_observe_activations.restype = c_int
+        _lib.vspec_py_runtime_anf_observe_quality.argtypes = [c_float, c_float, c_float]
+        _lib.vspec_py_runtime_anf_observe_quality.restype = c_int
+        _lib.vspec_py_runtime_anf_report.argtypes = [
+            POINTER(c_int),
+            POINTER(c_int),
+            POINTER(c_float),
+            POINTER(c_uint32),
+            POINTER(c_uint32),
+            POINTER(c_float),
+            POINTER(c_float),
+            POINTER(c_uint32),
+            POINTER(c_float),
+            POINTER(c_float),
+            POINTER(c_uint32),
+            POINTER(c_uint32),
+            POINTER(c_uint32),
+            POINTER(c_uint32),
+        ]
+        _lib.vspec_py_runtime_anf_report.restype = c_int
     _lib.vspec_py_native_forward_create.argtypes = [c_char_p, c_uint64]
     _lib.vspec_py_native_forward_create.restype = c_int
     _lib.vspec_py_native_forward_destroy.argtypes = [c_int]
@@ -264,6 +290,99 @@ def native_output_guard_observe(text_fragment: str) -> bool:
     if _lib is None:
         return False
     return bool(_lib.vspec_py_runtime_output_guard_observe(str(text_fragment or "").encode("utf-8", errors="ignore")))
+
+
+def native_anf_available() -> bool:
+    if _lib is None or not _HAS_ANF_BRIDGE:
+        return False
+    return bool(_lib.vspec_py_runtime_anf_available())
+
+
+def native_anf_prototype_enabled() -> bool:
+    if os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    if os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    return native_anf_available()
+
+
+def native_anf_observe_activations(values) -> bool:
+    if _lib is None or not _HAS_ANF_BRIDGE or np is None:
+        return False
+    if isinstance(values, np.ndarray) and values.dtype == np.float32 and values.flags.c_contiguous:
+        arr = values.reshape(-1)
+    else:
+        arr = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return False
+    return bool(_lib.vspec_py_runtime_anf_observe_activations(arr.ctypes.data_as(POINTER(c_float)), c_size_t(int(arr.size))))
+
+
+def native_anf_observe_quality(residual_rms: float, attention_entropy_collapse: float, activation_norm_drift: float) -> bool:
+    if _lib is None or not _HAS_ANF_BRIDGE:
+        return False
+    return bool(
+        _lib.vspec_py_runtime_anf_observe_quality(
+            c_float(float(residual_rms)),
+            c_float(float(attention_entropy_collapse)),
+            c_float(float(activation_norm_drift)),
+        )
+    )
+
+
+def native_anf_report() -> dict[str, float | int] | None:
+    if _lib is None or not _HAS_ANF_BRIDGE:
+        return None
+    out_anf_available = c_int(0)
+    out_anf_mode = c_int(0)
+    out_hot_ratio = c_float(0.0)
+    out_hot_neurons = c_uint32(0)
+    out_tokens_observed = c_uint32(0)
+    out_hot_ratio_avg = c_float(0.0)
+    out_skip_ratio_avg = c_float(0.0)
+    out_cache_updates = c_uint32(0)
+    out_error_wave_avg = c_float(0.0)
+    out_contamination_avg = c_float(0.0)
+    out_cascade_depth = c_uint32(0)
+    out_cascade_depth_max = c_uint32(0)
+    out_forced_fallback_count = c_uint32(0)
+    out_silent_stop_count = c_uint32(0)
+
+    ok = _lib.vspec_py_runtime_anf_report(
+        ctypes.byref(out_anf_available),
+        ctypes.byref(out_anf_mode),
+        ctypes.byref(out_hot_ratio),
+        ctypes.byref(out_hot_neurons),
+        ctypes.byref(out_tokens_observed),
+        ctypes.byref(out_hot_ratio_avg),
+        ctypes.byref(out_skip_ratio_avg),
+        ctypes.byref(out_cache_updates),
+        ctypes.byref(out_error_wave_avg),
+        ctypes.byref(out_contamination_avg),
+        ctypes.byref(out_cascade_depth),
+        ctypes.byref(out_cascade_depth_max),
+        ctypes.byref(out_forced_fallback_count),
+        ctypes.byref(out_silent_stop_count),
+    )
+    if not ok:
+        return None
+
+    return {
+        "anf_available": int(out_anf_available.value),
+        "anf_mode": int(out_anf_mode.value),
+        "hot_ratio": float(out_hot_ratio.value),
+        "hot_neurons": int(out_hot_neurons.value),
+        "tokens_observed": int(out_tokens_observed.value),
+        "hot_ratio_avg": float(out_hot_ratio_avg.value),
+        "skip_ratio_avg": float(out_skip_ratio_avg.value),
+        "cache_updates": int(out_cache_updates.value),
+        "error_wave_avg": float(out_error_wave_avg.value),
+        "contamination_avg": float(out_contamination_avg.value),
+        "cascade_depth": int(out_cascade_depth.value),
+        "cascade_depth_max": int(out_cascade_depth_max.value),
+        "forced_fallback_count": int(out_forced_fallback_count.value),
+        "silent_stop_count": int(out_silent_stop_count.value),
+    }
 
 
 def sample_candidate(token_ids: list[int], scores: list[float], greedy: bool, random_bits: int) -> int | None:

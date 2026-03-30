@@ -5,8 +5,8 @@ import math
 import time
 from typing import Callable, Optional
 
-from decode_contract import sanitize_and_validate_logits
 from decode_optimization_module import DecodeOptimizationModule
+from decode_phase3_step_dispatch import Phase3StepDispatcher
 from fast_output import FastOutputEngine, postprocess_output_text
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
@@ -63,6 +63,7 @@ class ManagedGenerationRequest:
     state_snapshot: dict | None = None
     engine: FastOutputEngine | None = field(default=None, repr=False)
     decode_optimizer: DecodeOptimizationModule | None = field(default=None, repr=False)
+    step_dispatcher: Phase3StepDispatcher | None = field(default=None, repr=False)
     adaptive_entropy_prev: float = 0.0
     adaptive_latency_ms: float = 0.0
     adaptive_quality_drift: float = 0.0
@@ -226,6 +227,12 @@ class CoreBatchGenerationDriver:
                 mode=req.decode_opt_mode,
             )
             req.decode_optimizer.seed_history(req.history)
+        if req.step_dispatcher is None and req.decode_optimizer is not None:
+            req.step_dispatcher = Phase3StepDispatcher(
+                runtime=self.runtime,
+                decode_optimizer=req.decode_optimizer,
+                expected_vocab_size=self.vocab_size,
+            )
         if req.started_at <= 0.0:
             req.started_at = time.perf_counter()
 
@@ -257,12 +264,12 @@ class CoreBatchGenerationDriver:
                     req.finished = True
                     break
 
-                logits = req.decode_optimizer.fetch_logits(self.runtime, req.history[-1], self.vocab_size)
-                logits, contract = sanitize_and_validate_logits(logits, self.vocab_size)
-                if not contract.ok:
+                dispatch = req.step_dispatcher.step(req.history[-1]) if req.step_dispatcher is not None else None
+                if dispatch is None or not dispatch.ok:
                     req.contract_failed = True
                     req.finished = True
                     break
+                logits = dispatch.logits
                 if req.decode_optimizer.logits_empty(logits):
                     req.contract_failed = True
                     req.finished = True

@@ -170,6 +170,26 @@ VSPEC_PY_API int vspec_py_runtime_output_guard_allow(const char* text_fragment);
 VSPEC_PY_API float vspec_py_runtime_output_guard_score_adjustment(const char* text_fragment);
 VSPEC_PY_API int vspec_py_runtime_output_guard_observe(const char* text_fragment);
 
+VSPEC_PY_API int vspec_py_runtime_anf_available(void);
+VSPEC_PY_API int vspec_py_runtime_anf_observe_activations(const float* activations, size_t count);
+VSPEC_PY_API int vspec_py_runtime_anf_observe_quality(float residual_rms, float attention_entropy_collapse, float activation_norm_drift);
+VSPEC_PY_API int vspec_py_runtime_anf_report(
+  int* out_anf_available,
+  int* out_anf_mode,
+  float* out_hot_ratio,
+  uint32_t* out_hot_neurons,
+  uint32_t* out_tokens_observed,
+  float* out_hot_ratio_avg,
+  float* out_skip_ratio_avg,
+  uint32_t* out_cache_updates,
+  float* out_error_wave_avg,
+  float* out_contamination_avg,
+  uint32_t* out_cascade_depth,
+  uint32_t* out_cascade_depth_max,
+  uint32_t* out_forced_fallback_count,
+  uint32_t* out_silent_stop_count
+);
+
 VSPEC_PY_API int vspec_py_native_forward_create(const char* model_path, uint64_t seed);
 VSPEC_PY_API void vspec_py_native_forward_destroy(int handle_id);
 VSPEC_PY_API int vspec_py_native_forward_step(

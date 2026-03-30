@@ -1,6 +1,9 @@
 #ifndef VSPEC_RUNTIME_RUNTIME_H
 #define VSPEC_RUNTIME_RUNTIME_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "vspec/kernel/context.h"
 #include "vspec/runtime/hw_performance_manager.h"
 #include "vspec/runtime/language_structure_guard.h"
@@ -11,6 +14,10 @@
 #include "vspec/runtime/torch_compat_module.h"
 #include "vspec/runtime/ultimate_optimizer.h"
 #include "vspec/runtime/qlora_adapter.h"
+#include "vspec/runtime/neuron_router.h"
+#include "vspec/runtime/pattern_cache.h"
+#include "vspec/runtime/error_estimator.h"
+#include "vspec/runtime/precision_wave.h"
 #include "vspec/runtime/adaptive/runtime_controller.h"
 #include "vspec/runtime/adaptive/token_scheduler.h"
 #include "vspec/runtime/adaptive/precision_router.h"
@@ -72,5 +79,20 @@ VspecRuntimeAdaptiveDecision vspec_runtime_adaptive_decide(void);
 VspecTokenScheduleDecision vspec_runtime_schedule_token(const char* token_text, float entropy_hint);
 uint8_t vspec_runtime_route_precision(const VspecPrecisionRouteHint* hint);
 VspecKvPolicyAction vspec_runtime_memory_decide(const VspecMemoryPolicyInput* input);
+
+int vspec_runtime_anf_available(void);
+
+void vspec_runtime_anf_router_configure(const VspecNeuronRouterConfig* cfg);
+size_t vspec_runtime_anf_select_hot_neurons(
+	const float* activations,
+	size_t count,
+	uint32_t* out_indices,
+	size_t out_capacity
+);
+void vspec_runtime_anf_router_report(VspecNeuronRouterReport* report);
+void vspec_runtime_anf_observe_token_activations(const float* activations, size_t count);
+void vspec_runtime_anf_pattern_cache_report(VspecAnfPatternCacheReport* report);
+void vspec_runtime_anf_error_estimator_report(VspecErrorEstimatorReport* report);
+void vspec_runtime_anf_precision_wave_report(VspecPrecisionWaveReport* report);
 
 #endif

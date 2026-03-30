@@ -1,4 +1,5 @@
 #include "vspec/runtime/native_inference.h"
+#include "vspec/runtime/runtime.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -10,6 +11,25 @@
 #include "vspec/compat/weight_mapper.h"
 
 static float token_embedding(size_t token_id, size_t dim);
+
+static int vspec_env_true_local(const char* name) {
+    const char* v = getenv(name);
+    if (!v || v[0] == '\0') {
+        return 0;
+    }
+    return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static int vspec_anf_tcc_active_mode_local(void) {
+    const char* mode = getenv("VSPEC_ANF_MODE");
+    if (!vspec_env_true_local("VSPEC_ENABLE_ANF") || !vspec_env_true_local("VSPEC_ANF_TCC_ENABLE")) {
+        return 0;
+    }
+    if (!mode || mode[0] == '\0') {
+        return 0;
+    }
+    return (strcmp(mode, "active") == 0) ? 1 : 0;
+}
 
 static uint64_t read_u64_le_local(const unsigned char b[8]) {
     uint64_t v = 0U;
@@ -613,6 +633,12 @@ int vspec_native_forward_init(
     }
 
     ctx->initialized = (ctx->has_attn_q || ctx->canonical_layer_count > 0U || ctx->sampled_weight_bytes > 0U) ? 1 : 0;
+    ctx->anf_tcc_ready = 0;
+    ctx->anf_prev_hot_count = 0U;
+    for (size_t i = 0U; i < VSPEC_NATIVE_TOKEN_COUNT; ++i) {
+        ctx->anf_prev_hot_indices[i] = 0U;
+        ctx->anf_prev_scores[i] = 0.0f;
+    }
     init_latent(ctx, seed);
     return ctx->initialized;
 }
@@ -636,7 +662,8 @@ int vspec_native_forward_step(
     }
 
     {
-        const size_t prompt_len = strlen(prompt);
+        const int tcc_sparse_enabled =
+            vspec_anf_tcc_active_mode_local() && (candidate_count <= VSPEC_NATIVE_TOKEN_COUNT);
         size_t prompt_hash = 0U;
         for (const char* p = prompt; *p; ++p) {
             prompt_hash = (prompt_hash * 131U) + (size_t)(unsigned char)(*p);
@@ -655,14 +682,82 @@ int vspec_native_forward_step(
         const float weight_signal = 0.35f + weight_bias * 0.45f;
         const float score_boost = base_quality + weight_signal;
 
-        for (size_t t = 0U; t < candidate_count; ++t) {
-            out_scores[t] += 0.22f * dot_token_latent(t, ctx->latent);
-            out_scores[t] += ctx->token_proj[t];
-            out_scores[t] += tiny_lm_head_projection(ctx, t);
-            out_scores[t] += tiny_qo_projection(ctx, t);
-            out_scores[t] += 0.003f * (float)((prompt_hash ^ (t * 2654435761u)) & 0xFFu) / 255.0f;
-            out_scores[t] += 0.025f * score_boost;
+        if (tcc_sparse_enabled) {
+            float importance[VSPEC_NATIVE_TOKEN_COUNT] = {0.0f};
+            uint32_t hot_indices[VSPEC_NATIVE_TOKEN_COUNT] = {0U};
+            uint8_t hot_mask[VSPEC_NATIVE_TOKEN_COUNT] = {0U};
+            uint8_t prev_hot_mask[VSPEC_NATIVE_TOKEN_COUNT] = {0U};
+            size_t hot_count = 0U;
+
+            for (size_t t = 0U; t < candidate_count; ++t) {
+                importance[t] = fabsf((0.22f * dot_token_latent(t, ctx->latent)) + ctx->token_proj[t]);
+            }
+            hot_count = vspec_runtime_anf_select_hot_neurons(
+                importance,
+                candidate_count,
+                hot_indices,
+                candidate_count);
+            for (size_t i = 0U; i < hot_count; ++i) {
+                const size_t idx = (size_t)hot_indices[i];
+                if (idx < candidate_count) {
+                    hot_mask[idx] = 1U;
+                }
+            }
+            for (size_t i = 0U; i < ctx->anf_prev_hot_count; ++i) {
+                const size_t idx = (size_t)ctx->anf_prev_hot_indices[i];
+                if (idx < candidate_count) {
+                    prev_hot_mask[idx] = 1U;
+                }
+            }
+
+            if (ctx->anf_tcc_ready) {
+                for (size_t t = 0U; t < candidate_count; ++t) {
+                    out_scores[t] = ctx->anf_prev_scores[t];
+                }
+            }
+
+            for (size_t t = 0U; t < candidate_count; ++t) {
+                const int need_full = !ctx->anf_tcc_ready;
+                const int need_changed = (hot_mask[t] != prev_hot_mask[t]);
+                if (need_full || need_changed) {
+                    out_scores[t] = -8.0f;
+                    out_scores[t] += 0.22f * dot_token_latent(t, ctx->latent);
+                    out_scores[t] += ctx->token_proj[t];
+                    out_scores[t] += tiny_lm_head_projection(ctx, t);
+                    out_scores[t] += tiny_qo_projection(ctx, t);
+                    out_scores[t] += 0.003f * (float)((prompt_hash ^ (t * 2654435761u)) & 0xFFu) / 255.0f;
+                    out_scores[t] += 0.025f * score_boost;
+                }
+            }
+
+            for (size_t t = 0U; t < candidate_count; ++t) {
+                ctx->anf_prev_scores[t] = out_scores[t];
+            }
+            ctx->anf_prev_hot_count = hot_count;
+            for (size_t i = 0U; i < hot_count; ++i) {
+                ctx->anf_prev_hot_indices[i] = hot_indices[i];
+            }
+            ctx->anf_tcc_ready = 1;
+        } else {
+            for (size_t t = 0U; t < candidate_count; ++t) {
+                out_scores[t] += 0.22f * dot_token_latent(t, ctx->latent);
+                out_scores[t] += ctx->token_proj[t];
+                out_scores[t] += tiny_lm_head_projection(ctx, t);
+                out_scores[t] += tiny_qo_projection(ctx, t);
+                out_scores[t] += 0.003f * (float)((prompt_hash ^ (t * 2654435761u)) & 0xFFu) / 255.0f;
+                out_scores[t] += 0.025f * score_boost;
+            }
+            if (candidate_count <= VSPEC_NATIVE_TOKEN_COUNT) {
+                for (size_t t = 0U; t < candidate_count; ++t) {
+                    ctx->anf_prev_scores[t] = out_scores[t];
+                }
+            }
+            ctx->anf_prev_hot_count = 0U;
+            ctx->anf_tcc_ready = 0;
         }
+
+        // ANF telemetry is always observed; active+tcc path emits sparse-updated activations.
+        vspec_runtime_anf_observe_token_activations(out_scores, candidate_count);
     }
 
     return 1;

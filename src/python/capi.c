@@ -13,6 +13,7 @@
 #include "vspec/runtime/continuous_batch.h"
 #include "vspec/runtime/decode_session.h"
 #include "vspec/runtime/native_inference.h"
+#include "vspec/runtime/runtime.h"
 #include "vspec/runtime/sampling_core.h"
 #include "vspec/runtime/plugin/plugin_api.h"
 
@@ -134,6 +135,14 @@ typedef struct VspecPyOutputGuardState {
 } VspecPyOutputGuardState;
 
 static VspecPyOutputGuardState g_py_output_guard = {0, 0.72f, 0U};
+static int g_py_runtime_initialized = 0;
+
+static void vspec_py_runtime_ensure_init(void) {
+    if (!g_py_runtime_initialized) {
+        vspec_runtime_init_default();
+        g_py_runtime_initialized = 1;
+    }
+}
 
 static size_t vspec_py_text_len(const char* s) {
     return s ? strlen(s) : 0U;
@@ -355,6 +364,99 @@ int vspec_py_runtime_output_guard_observe(const char* text_fragment) {
     if (text_fragment && text_fragment[0]) {
         g_py_output_guard.observed_fragments += 1U;
     }
+    return 1;
+}
+
+int vspec_py_runtime_anf_available(void) {
+    vspec_py_runtime_ensure_init();
+    return vspec_runtime_anf_available();
+}
+
+int vspec_py_runtime_anf_observe_activations(const float* activations, size_t count) {
+    if (!activations || count == 0U) {
+        return 0;
+    }
+    vspec_py_runtime_ensure_init();
+    if (!vspec_runtime_anf_available()) {
+        return 0;
+    }
+    vspec_runtime_anf_observe_token_activations(activations, count);
+    return 1;
+}
+
+int vspec_py_runtime_anf_observe_quality(float residual_rms, float attention_entropy_collapse, float activation_norm_drift) {
+    vspec_py_runtime_ensure_init();
+    if (!vspec_runtime_anf_available()) {
+        return 0;
+    }
+    vspec_runtime_behavior_observe_quality(residual_rms, attention_entropy_collapse, activation_norm_drift);
+    return 1;
+}
+
+int vspec_py_runtime_anf_report(
+    int* out_anf_available,
+    int* out_anf_mode,
+    float* out_hot_ratio,
+    uint32_t* out_hot_neurons,
+    uint32_t* out_tokens_observed,
+    float* out_hot_ratio_avg,
+    float* out_skip_ratio_avg,
+    uint32_t* out_cache_updates,
+    float* out_error_wave_avg,
+    float* out_contamination_avg,
+    uint32_t* out_cascade_depth,
+    uint32_t* out_cascade_depth_max,
+    uint32_t* out_forced_fallback_count,
+    uint32_t* out_silent_stop_count
+) {
+    VspecRuntimeBehaviorReport report;
+
+    vspec_py_runtime_ensure_init();
+    vspec_runtime_behavior_report(&report);
+
+    if (out_anf_available) {
+        *out_anf_available = report.anf_available;
+    }
+    if (out_anf_mode) {
+        *out_anf_mode = report.anf_mode;
+    }
+    if (out_hot_ratio) {
+        *out_hot_ratio = report.anf_hot_ratio;
+    }
+    if (out_hot_neurons) {
+        *out_hot_neurons = report.anf_hot_neurons;
+    }
+    if (out_tokens_observed) {
+        *out_tokens_observed = report.anf_tokens_observed;
+    }
+    if (out_hot_ratio_avg) {
+        *out_hot_ratio_avg = report.anf_hot_ratio_avg;
+    }
+    if (out_skip_ratio_avg) {
+        *out_skip_ratio_avg = report.anf_skip_ratio_avg;
+    }
+    if (out_cache_updates) {
+        *out_cache_updates = report.anf_cache_updates;
+    }
+    if (out_error_wave_avg) {
+        *out_error_wave_avg = report.anf_error_wave_avg;
+    }
+    if (out_contamination_avg) {
+        *out_contamination_avg = report.anf_contamination_avg;
+    }
+    if (out_cascade_depth) {
+        *out_cascade_depth = report.anf_cascade_depth;
+    }
+    if (out_cascade_depth_max) {
+        *out_cascade_depth_max = report.anf_cascade_depth_max;
+    }
+    if (out_forced_fallback_count) {
+        *out_forced_fallback_count = report.anf_forced_fallback_count;
+    }
+    if (out_silent_stop_count) {
+        *out_silent_stop_count = report.anf_silent_stop_count;
+    }
+
     return 1;
 }
 
