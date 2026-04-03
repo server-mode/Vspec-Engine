@@ -19,10 +19,23 @@ from model_loader import (
     read_tokenizer_config,
     summarize_weight_dtypes,
 )
-from runtime_inference import build_generic_runtime, runtime_load_reason, runtime_matrix_bits_summary
+from runtime_inference import (
+    build_generic_runtime,
+    runtime_load_reason,
+    runtime_matrix_bits_summary,
+    runtime_timing_reset,
+    runtime_timing_snapshot,
+    torch_compile_system_status,
+)
 from chat_prompt import build_prompt
 from vspec_cuda_bridge import cuda_mem_info
-from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
+from fast_output import (
+    FastOutputEngine,
+    postprocess_output_text,
+    resolve_speed_preset,
+    sampling_timing_reset,
+    sampling_timing_snapshot,
+)
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
@@ -41,7 +54,7 @@ from runtime_core_bridge import (
     adaptive_step,
     native_anf_observe_activations,
     native_anf_observe_quality,
-    native_anf_prototype_enabled,
+    native_anf_enabled,
     native_anf_report,
 )
 from generation_batch_driver import CoreBatchGenerationDriver, ManagedGenerationRequest
@@ -88,6 +101,21 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     if detail:
         msg += f" | {detail}"
     print(msg, flush=True)
+
+
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _native_cpp_loop_enabled_effective() -> tuple[bool, bool, bool]:
+    requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
+    torch_forward = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
+    enabled = bool(requested and (not torch_forward or allow_with_torch))
+    return enabled, requested, torch_forward
 
 
 def _entropy_from_logits(logits_obj) -> float:
@@ -867,6 +895,14 @@ def main() -> None:
     parser.add_argument("--prototype-2bit", action="store_true", help="Enable non-invasive 2-bit prototype module")
     parser.add_argument("--prototype-2bit-mode", default="balanced", choices=["safe", "balanced", "aggressive"], help="2-bit prototype policy profile")
     parser.add_argument("--prototype-2bit-protect-last", type=int, default=2, help="Number of final layers kept at original precision")
+    parser.add_argument("--native-full-transformer", action="store_true", help="Enable full transformer native-forward scoring path in C")
+    parser.add_argument("--native-full-layer-limit", type=int, default=0, help="0=all detected native layers, >0 limits native full-forward layers")
+    parser.add_argument("--native-full-context-limit", type=int, default=0, help="0=full context, >0 limits context tokens used by native full-forward")
+    parser.add_argument("--native-c-logits-provider", action="store_true", help="Use C native top-k logits provider during decode (fallback to Python forward on failure)")
+    parser.add_argument("--native-c-logits-topk", type=int, default=64, help="Top-k candidate count requested from native C logits provider")
+    parser.add_argument("--native-c-strict", action="store_true", help="Require native C logits provider during decode; fail instead of falling back to Python forward")
+    parser.add_argument("--enable-anf", action="store_true", help="Enable ANF telemetry and routing")
+    parser.add_argument("--anf-mode", default="shadow", choices=["off", "shadow", "active"], help="ANF routing mode when enabled")
     parser.add_argument("--unsafe-low-layers", action="store_true", help="Allow very low max-layers even if quality may collapse")
     args = parser.parse_args()
 
@@ -907,6 +943,15 @@ def main() -> None:
         os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() in {"1", "true", "yes", "on"}
         and os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
     )
+    anf_enabled_env = os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if args.enable_anf:
+        os.environ["VSPEC_ENABLE_ANF"] = "1"
+        anf_enabled_env = True
+    if anf_enabled_env:
+        os.environ.setdefault("VSPEC_ANF_MODE", str(args.anf_mode))
+        os.environ.setdefault("VSPEC_ANF_TCC_ENABLE", "1")
+        os.environ.setdefault("VSPEC_ANF_MAX_HOT_RATIO", "0.12")
+        os.environ.setdefault("VSPEC_ANF_ACTIVATION_THRESHOLD", "1.05")
     os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "0" if prototype_anf_mode else "16")
     os.environ.setdefault("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
     os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "1" if prototype_anf_mode else "0")
@@ -917,6 +962,21 @@ def main() -> None:
     os.environ.setdefault("VSPEC_C_SAMPLER_REQUIRED", "1")
     os.environ.setdefault("VSPEC_USE_C_SAMPLER", "1")
     os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "1")
+    os.environ.setdefault("VSPEC_NATIVE_PREFILL_COMPUTE", "1")
+    os.environ.setdefault("VSPEC_NATIVE_PREFILL_COMPUTE_MODE", "mirror")
+    os.environ.setdefault("VSPEC_PREFILL_FULL_GRAPH", "1")
+    if args.native_full_transformer:
+        os.environ["VSPEC_NATIVE_FULL_TRANSFORMER"] = "1"
+    if int(args.native_full_layer_limit) > 0:
+        os.environ["VSPEC_NATIVE_FULL_LAYER_LIMIT"] = str(int(args.native_full_layer_limit))
+    if int(args.native_full_context_limit) > 0:
+        os.environ["VSPEC_NATIVE_FULL_CONTEXT_LIMIT"] = str(int(args.native_full_context_limit))
+    if args.native_c_logits_provider:
+        os.environ["VSPEC_NATIVE_LOGITS_PROVIDER"] = "1"
+    if int(args.native_c_logits_topk) > 0:
+        os.environ["VSPEC_NATIVE_LOGITS_PROVIDER_TOPK"] = str(int(args.native_c_logits_topk))
+    if args.native_c_strict:
+        os.environ["VSPEC_NATIVE_C_STRICT"] = "1"
     if os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16").strip() in {"0", "off", "OFF"}:
         os.environ.setdefault("VSPEC_INT4_COMPUTE_MODE", "native")
     if (
@@ -946,6 +1006,20 @@ def main() -> None:
         return None
 
     native_model_file = _resolve_native_model_file(snapshot_dir)
+    native_forward_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
+    native_forward_ctx = None
+    if native_forward_ctx is None and native_forward_enabled and native_model_file:
+        try:
+            seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
+            seed_val = int(seed_raw)
+        except Exception:
+            seed_val = int(args.seed)
+        try:
+            native_forward_ctx = CoreNativeForwardContext(native_model_file, seed=seed_val)
+            if not native_forward_ctx.available:
+                native_forward_ctx = None
+        except Exception:
+            native_forward_ctx = None
     _progress(show_progress, 15, "config", "loading model and tokenizer config")
     config = read_config(snapshot_dir)
     requested_layers = int(args.max_layers)
@@ -1257,12 +1331,16 @@ def main() -> None:
                             "prefill-core",
                             f"{cur}/{tot} tokens",
                         ),
+                        native_forward_ctx=native_forward_ctx,
                     )
                     if result.used_core_scheduler:
                         run_prefill_direct = False
                         prefill_core_scheduler_used = True
                         prefill_core_steps = int(result.core_steps)
                         print("[vspec-chat] prefill_core_reserved_vram=", int(result.reserved_vram))
+                        print("[vspec-chat] prefill_native_compute=", bool(result.native_prefill_used))
+                        print("[vspec-chat] prefill_native_calls=", int(result.native_prefill_calls))
+                        print("[vspec-chat] prefill_native_failures=", int(result.native_prefill_failures))
                     else:
                         print("[vspec-chat] prefill_core_fallback=", str(result.reason or "unknown"))
 
@@ -1326,6 +1404,8 @@ def main() -> None:
 
     _progress(show_progress, 82, "decode", f"max_steps={max_steps}")
     lowbit_projection_stats_reset()
+    sampling_timing_reset()
+    runtime_timing_reset(runtime)
     fast_engine.begin_stream()
     stream_buffer = []
     decode_contract_failed = False
@@ -1361,22 +1441,9 @@ def main() -> None:
         print(f"[vspec-chat] decode_step_cap= {decode_step_cap} (requested={int(max_steps)})")
     max_steps = decode_step_cap
     decode_state = DecodeState(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=int(max_steps))
-    phase3_dispatcher = Phase3StepDispatcher(
-        runtime=runtime,
-        decode_optimizer=decode_optimizer,
-        expected_vocab_size=vocab_size,
-    )
-    phase1_orchestrator = PythonDecodeOrchestrator(
-        state=decode_state,
-        runtime=runtime,
-        decode_optimizer=decode_optimizer,
-        expected_vocab_size=vocab_size,
-        scheduler_enabled=scheduler_enabled,
-        core_decode=core_decode,
-        step_dispatcher=phase3_dispatcher,
-    )
-    phase1_orchestrator.prefill(token_ids)
-    native_cpp_loop = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
+    native_cpp_loop, native_cpp_loop_requested, torch_forward_enabled = _native_cpp_loop_enabled_effective()
+    if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_enabled:
+        print("[vspec-chat] native_cpp_loop= disabled (torch_forward=1; set VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=1 to force)")
 
     def _runtime_graph_signature(runtime_obj, prompt_tokens: int, decode_steps: int) -> int:
         graph_mode = os.getenv("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only").strip().lower()
@@ -1429,6 +1496,22 @@ def main() -> None:
     else:
         core_decode = CoreDecodeSession.from_runtime(runtime, max_steps)
         scheduler_enabled = core_decode.begin(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=max_steps)
+
+    phase3_dispatcher = Phase3StepDispatcher(
+        runtime=runtime,
+        decode_optimizer=decode_optimizer,
+        expected_vocab_size=vocab_size,
+    )
+    phase1_orchestrator = PythonDecodeOrchestrator(
+        state=decode_state,
+        runtime=runtime,
+        decode_optimizer=decode_optimizer,
+        expected_vocab_size=vocab_size,
+        scheduler_enabled=scheduler_enabled,
+        core_decode=core_decode,
+        step_dispatcher=phase3_dispatcher,
+    )
+    phase1_orchestrator.prefill(token_ids)
     if scheduler_enabled:
         scheduler_mode = "native-cpp-loop" if native_cpp_loop else "decode-session"
         print(f"[vspec-chat] core_scheduler= on reserve_bytes={core_decode.reserve_bytes} mode={scheduler_mode}")
@@ -1437,9 +1520,17 @@ def main() -> None:
     adaptive_quality_drift = 0.0
     native_blend_calls = 0
     native_blend_failures = 0
-    native_forward_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
-    native_forward_ctx = None
-    if native_forward_enabled and native_model_file:
+    native_logits_provider_calls = 0
+    native_logits_provider_failures = 0
+    native_logits_provider_enabled = os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        native_logits_provider_topk = int(os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER_TOPK", "64") or "64")
+    except Exception:
+        native_logits_provider_topk = 64
+    native_logits_provider_topk = max(8, min(1024, native_logits_provider_topk))
+    native_c_strict = os.getenv("VSPEC_NATIVE_C_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    native_provider_direct_sample = os.getenv("VSPEC_NATIVE_C_PROVIDER_DIRECT_SAMPLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if native_forward_ctx is None and native_forward_enabled and native_model_file:
         try:
             seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
             seed_val = int(seed_raw)
@@ -1452,8 +1543,15 @@ def main() -> None:
         except Exception:
             native_forward_ctx = None
 
-    anf_enabled = native_anf_prototype_enabled()
+    if native_c_strict and native_logits_provider_enabled:
+        if native_forward_ctx is None or not native_forward_ctx.available:
+            print("[vspec-chat] native_c_strict= True provider_unavailable=startup")
+            decode_contract_failed = True
+
+    anf_enabled = native_anf_enabled()
     for step in range(max_steps):
+        if decode_contract_failed:
+            break
         if scheduler_enabled:
             quota = core_decode.next_quota()
             if quota <= 0:
@@ -1468,16 +1566,86 @@ def main() -> None:
         reached_eos = False
         for _ in range(quota):
             token_t0 = time.perf_counter()
-            step_result = phase1_orchestrator.step(token_ids[-1])
-            if not step_result.ok:
-                print(
-                    f"[vspec-chat] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={vocab_size}"
-                )
-                decode_contract_failed = True
+            logits = None
+            used_native_provider = False
+            native_provider_sampled_id = None
+            if (
+                native_logits_provider_enabled
+                and native_forward_ctx is not None
+                and native_forward_ctx.available
+            ):
+                provider_handled = False
+                if native_provider_direct_sample:
+                    rep_window = max(1, int(args.repeat_window))
+                    sampled = native_forward_ctx.sample_topk_token(
+                        token_ids=list(token_ids),
+                        top_k=native_logits_provider_topk,
+                        temperature=float(max(0.05, args.temperature)),
+                        greedy=bool(args.greedy),
+                        random_bits=random.getrandbits(64),
+                        repetition_token_ids=list(token_ids[-rep_window:]),
+                        repetition_penalty=float(max(1.0, args.repetition_penalty)),
+                    )
+                    if sampled is not None:
+                        native_provider_sampled_id = int(sampled[0])
+                        used_native_provider = True
+                        provider_handled = True
+                        native_logits_provider_calls += 1
+
+                if not provider_handled:
+                    proposal = native_forward_ctx.propose_topk(list(token_ids), top_k=native_logits_provider_topk)
+                    if proposal is not None:
+                        cand_ids, cand_scores = proposal
+                        if cand_ids and cand_scores and len(cand_ids) == len(cand_scores):
+                            sparse_logits = [-1.0e9 for _ in range(vocab_size)]
+                            for tid, score in zip(cand_ids, cand_scores):
+                                if 0 <= int(tid) < vocab_size:
+                                    sparse_logits[int(tid)] = float(score)
+                            logits = sparse_logits
+                            used_native_provider = True
+                            native_logits_provider_calls += 1
+                        else:
+                            native_logits_provider_failures += 1
+                            if native_c_strict:
+                                print("[vspec-chat] native_c_strict= True provider_failed=invalid_topk")
+                                decode_contract_failed = True
+                                break
+                    else:
+                        native_logits_provider_failures += 1
+                        if native_c_strict:
+                            print("[vspec-chat] native_c_strict= True provider_failed=no_proposal")
+                            decode_contract_failed = True
+                            break
+
+            if decode_contract_failed:
                 break
-            logits = step_result.logits
-            if step == 0 and int(step_result.masked_tail or 0) > 0:
-                print(f"[vspec-chat] decode_contract_masked_tail= {int(step_result.masked_tail)}")
+
+            if native_provider_sampled_id is not None:
+                next_id = int(native_provider_sampled_id)
+                generated.append(next_id)
+                stream_buffer.append(next_id)
+                fast_engine.stream_token(next_id)
+                token_ids.append(next_id)
+                decode_optimizer.observe_token(token_ids)
+                adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
+                reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
+                phase1_orchestrator.commit(next_id, reached_eos)
+                if reached_eos:
+                    break
+                continue
+
+            if not used_native_provider:
+                step_result = phase1_orchestrator.step(token_ids[-1])
+                if not step_result.ok:
+                    print(
+                        f"[vspec-chat] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={vocab_size}"
+                    )
+                    decode_contract_failed = True
+                    break
+                logits = step_result.logits
+                if step == 0 and int(step_result.masked_tail or 0) > 0:
+                    print(f"[vspec-chat] decode_contract_masked_tail= {int(step_result.masked_tail)}")
+
             if decode_contract_failed:
                 break
             logits = threebit_module.denoise_logits(logits, step)
@@ -1565,6 +1733,7 @@ def main() -> None:
                             candidate_ids=[int(i) for i in cand_ids],
                             base_scores=base_scores,
                             blend=blend_alpha,
+                            token_ids=list(token_ids),
                         )
                         if blended is not None and len(blended) == len(cand_ids):
                             for idx, score in zip(cand_ids, blended):
@@ -1632,6 +1801,8 @@ def main() -> None:
             pass
     print("[vspec-chat] native_forward_blend_calls=", int(native_blend_calls))
     print("[vspec-chat] native_forward_blend_failures=", int(native_blend_failures))
+    print("[vspec-chat] native_c_logits_provider_calls=", int(native_logits_provider_calls))
+    print("[vspec-chat] native_c_logits_provider_failures=", int(native_logits_provider_failures))
     phase4_sampler_stats = fast_engine.phase4_sampler_report() if fast_engine is not None else {}
     print("[vspec-chat] phase4_sampler_calls=", int(phase4_sampler_stats.get("calls", 0)))
     print("[vspec-chat] phase4_c_sampler_calls=", int(phase4_sampler_stats.get("c_sampler_calls", 0)))
@@ -1801,6 +1972,11 @@ def main() -> None:
     prefill_tps = (prefill_tokens_total / prefill_elapsed) if prefill_elapsed > 0.0 else 0.0
     print("[vspec-chat] prefill_tokens=", int(prefill_tokens_total))
     print("[vspec-chat] prefill_tokens_per_sec=", round(prefill_tps, 4))
+    if runtime is not None:
+        if hasattr(runtime, "_graph_prefill_captures"):
+            print("[vspec-chat] prefill_graph_captures=", int(getattr(runtime, "_graph_prefill_captures", 0) or 0))
+        if hasattr(runtime, "_graph_prefill_replays"):
+            print("[vspec-chat] prefill_graph_replays=", int(getattr(runtime, "_graph_prefill_replays", 0) or 0))
 
     low_bit = False
     if runtime is not None and hasattr(runtime, "layers"):
@@ -1848,6 +2024,50 @@ def main() -> None:
     print("[vspec-chat] lowbit_exec_int4_registered_failures=", int(lowbit_stats.get("int4_registered_failures", 0)))
     print("[vspec-chat] lowbit_exec_fallback_gemm_calls=", int(lowbit_stats.get("fallback_gemm_calls", 0)))
     print("[vspec-chat] lowbit_exec_fallback_matmul_calls=", int(lowbit_stats.get("fallback_matmul_calls", 0)))
+    fallback_gemm_ratio = float(lowbit_stats.get("fallback_gemm_ratio", 0.0) or 0.0)
+    fallback_total_ratio = float(lowbit_stats.get("fallback_total_ratio", 0.0) or 0.0)
+    print("[vspec-chat] lowbit_exec_fallback_gemm_ratio=", round(fallback_gemm_ratio, 6))
+    print("[vspec-chat] lowbit_exec_fallback_gemm_ratio_pct=", round(fallback_gemm_ratio * 100.0, 3))
+    print("[vspec-chat] lowbit_exec_fallback_total_ratio=", round(fallback_total_ratio, 6))
+    print("[vspec-chat] lowbit_exec_fallback_total_ratio_pct=", round(fallback_total_ratio * 100.0, 3))
+    if isinstance(lowbit_stats, dict) and ("gemm_dispatch_ms" in lowbit_stats):
+        gemm_ms = float(lowbit_stats.get("gemm_dispatch_ms", 0.0) or 0.0)
+        gemm_calls = int(lowbit_stats.get("gemm_dispatch_calls", 0) or 0)
+        print("[vspec-chat] timing_gemm_dispatch_ms=", round(gemm_ms, 3))
+        print("[vspec-chat] timing_gemm_dispatch_ms_per_call=", round((gemm_ms / gemm_calls), 4) if gemm_calls else 0.0)
+
+    timing_stats = runtime_timing_snapshot(runtime)
+    if timing_stats:
+        forward_ms = float(timing_stats.get("forward_ms", 0.0) or 0.0)
+        forward_calls = int(timing_stats.get("forward_calls", 0) or 0)
+        attn_ms = float(timing_stats.get("attn_ms", 0.0) or 0.0)
+        attn_calls = int(timing_stats.get("attn_calls", 0) or 0)
+        kv_ms = float(timing_stats.get("kv_ms", 0.0) or 0.0)
+        kv_calls = int(timing_stats.get("kv_calls", 0) or 0)
+        print("[vspec-chat] timing_forward_ms=", round(forward_ms, 3))
+        print("[vspec-chat] timing_forward_ms_per_call=", round((forward_ms / forward_calls), 4) if forward_calls else 0.0)
+        print("[vspec-chat] timing_attn_ms=", round(attn_ms, 3))
+        print("[vspec-chat] timing_attn_ms_per_call=", round((attn_ms / attn_calls), 4) if attn_calls else 0.0)
+        print("[vspec-chat] timing_kv_ms=", round(kv_ms, 3))
+        print("[vspec-chat] timing_kv_ms_per_call=", round((kv_ms / kv_calls), 4) if kv_calls else 0.0)
+
+    sampling_stats = sampling_timing_snapshot()
+    if sampling_stats:
+        sampling_ms = float(sampling_stats.get("sampling_ms", 0.0) or 0.0)
+        sampling_calls = int(sampling_stats.get("sampling_calls", 0) or 0)
+        print("[vspec-chat] timing_sampling_ms=", round(sampling_ms, 3))
+        print("[vspec-chat] timing_sampling_ms_per_call=", round((sampling_ms / sampling_calls), 4) if sampling_calls else 0.0)
+
+    compile_status = torch_compile_system_status()
+    if compile_status:
+        print("[vspec-chat] torch_compile_enabled=", int(bool(compile_status.get("enabled", False))))
+        print("[vspec-chat] torch_compile_backend_requested=", str(compile_status.get("backend_requested", "")))
+        print("[vspec-chat] torch_compile_mode=", str(compile_status.get("mode", "")))
+        print("[vspec-chat] torch_compile_triton_available=", int(bool(compile_status.get("triton_available", False))))
+        print("[vspec-chat] torch_compile_inductor_ready=", int(bool(compile_status.get("inductor_ready", False))))
+        print("[vspec-chat] torch_compile_inductor_reason=", str(compile_status.get("inductor_reason", "")))
+        print("[vspec-chat] torch_compile_runtime_fallback_count=", int(compile_status.get("runtime_fallback_count", 0) or 0))
+        print("[vspec-chat] torch_compile_compiled_backends=", str(compile_status.get("compiled_backends", {})))
     print("[vspec-chat] kv_core_mirror_enabled=", bool(getattr(runtime, "kv_core_mirror_enabled", False)) if runtime is not None else False)
     print("[vspec-chat] kv_python_shadow_disabled=", bool(getattr(runtime, "kv_python_shadow_disabled", False)) if runtime is not None else False)
     print("[vspec-chat] cublas_cache_size_hint=", os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16"))

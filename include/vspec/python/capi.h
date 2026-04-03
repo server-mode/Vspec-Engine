@@ -203,6 +203,50 @@ VSPEC_PY_API int vspec_py_native_forward_step(
   float* out_scores
 );
 
+VSPEC_PY_API int vspec_py_native_forward_step_tokens(
+  int handle_id,
+  const int* context_token_ids,
+  size_t context_token_count,
+  const int* candidate_ids,
+  const float* base_scores,
+  size_t candidate_count,
+  float blend,
+  float* out_scores
+);
+
+VSPEC_PY_API int vspec_py_native_forward_topk_tokens(
+  int handle_id,
+  const int* context_token_ids,
+  size_t context_token_count,
+  size_t top_k,
+  int* out_token_ids,
+  float* out_scores,
+  size_t out_capacity,
+  size_t* out_count
+);
+
+VSPEC_PY_API int vspec_py_native_forward_sample_topk_tokens(
+  int handle_id,
+  const int* context_token_ids,
+  size_t context_token_count,
+  size_t top_k,
+  float temperature,
+  int greedy,
+  uint64_t random_bits,
+  const int* repetition_token_ids,
+  size_t repetition_token_count,
+  float repetition_penalty,
+  int* out_token_id,
+  float* out_token_score
+);
+
+VSPEC_PY_API int vspec_py_native_forward_prefill_tokens(
+  int handle_id,
+  const int* context_token_ids,
+  size_t context_token_count,
+  size_t* out_processed_tokens
+);
+
 VSPEC_PY_API int vspec_py_plugin_load_dynamic(const char* path, const char* symbol_name, char* out_msg, size_t out_msg_size);
 VSPEC_PY_API int vspec_py_plugin_unload_dynamic(const char* name, char* out_msg, size_t out_msg_size);
 

@@ -2,6 +2,7 @@ import heapq
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 
 from language_stability_guard import LanguageStabilityGuard
@@ -30,6 +31,28 @@ class SpeedPreset:
     repetition_penalty: float
     no_repeat_ngram: int
     repeat_window: int
+
+
+_SAMPLING_TIMING_STATS = {
+    "sampling_ms": 0.0,
+    "sampling_calls": 0,
+}
+
+
+def _timing_enabled() -> bool:
+    return os.getenv("VSPEC_RUNTIME_TIMING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sampling_timing_reset() -> None:
+    _SAMPLING_TIMING_STATS["sampling_ms"] = 0.0
+    _SAMPLING_TIMING_STATS["sampling_calls"] = 0
+
+
+def sampling_timing_snapshot() -> dict[str, float]:
+    return {
+        "sampling_ms": float(_SAMPLING_TIMING_STATS["sampling_ms"]),
+        "sampling_calls": float(_SAMPLING_TIMING_STATS["sampling_calls"]),
+    }
 
 
 def resolve_speed_preset(name: str) -> SpeedPreset:
@@ -156,22 +179,31 @@ class FastOutputEngine:
         greedy: bool,
         lang_top_n: int,
     ) -> int:
+        timing_on = _timing_enabled()
+        t0 = time.perf_counter() if timing_on else 0.0
+
+        def _finish(token_id: int) -> int:
+            if timing_on:
+                _SAMPLING_TIMING_STATS["sampling_ms"] += (time.perf_counter() - t0) * 1000.0
+                _SAMPLING_TIMING_STATS["sampling_calls"] += 1
+            return int(token_id)
+
         if logits is None:
-            return 0
+            return _finish(0)
         if np is not None and isinstance(logits, np.ndarray):
             if logits.size == 0:
-                return 0
+                return _finish(0)
         else:
             try:
                 if len(logits) == 0:
-                    return 0
+                    return _finish(0)
             except Exception:
-                return 0
+                return _finish(0)
 
         if np is not None and isinstance(logits, np.ndarray):
             arr = np.asarray(logits, dtype=np.float32)
             if arr.size == 0:
-                return 0
+                return _finish(0)
             if not np.all(np.isfinite(arr)):
                 arr = np.nan_to_num(arr, nan=-1e9, posinf=1e9, neginf=-1e9)
             logits = arr.tolist()
@@ -188,7 +220,7 @@ class FastOutputEngine:
             logits = safe_logits
 
         if len(logits) == 0:
-            return 0
+            return _finish(0)
 
         if temperature <= 0:
             temperature = 1.0
@@ -213,7 +245,7 @@ class FastOutputEngine:
             allowed_ids = allowed_ids[:top_k]
 
         if self.simple_sampling:
-            return max(allowed_ids, key=lambda tid: logits[tid])
+            return _finish(max(allowed_ids, key=lambda tid: logits[tid]))
 
         scored = []
         for tid in allowed_ids:
@@ -236,11 +268,11 @@ class FastOutputEngine:
 
         scored.sort(key=lambda x: x[1], reverse=True)
         if not scored:
-            return int(candidate_ids[0])
+            return _finish(int(candidate_ids[0]))
         if greedy:
-            return scored[0][0]
+            return _finish(scored[0][0])
         decision = self.phase4_sampler.choose(scored=scored, greedy=False, c_sampler_required=self.c_sampler_required)
-        return int(decision.token_id)
+        return _finish(int(decision.token_id))
 
     def structure_report(self) -> dict | None:
         if self.structure_guard is None:

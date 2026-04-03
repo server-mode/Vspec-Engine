@@ -30,6 +30,10 @@ def _load_lib() -> ctypes.CDLL | None:
 _lib = _load_lib()
 _HAS_GRAPH_CACHE_STATS = False
 _HAS_ANF_BRIDGE = False
+_HAS_NATIVE_FORWARD_TOKEN_STEP = False
+_HAS_NATIVE_FORWARD_TOPK_STEP = False
+_HAS_NATIVE_FORWARD_TOPK_SAMPLE = False
+_HAS_NATIVE_FORWARD_PREFILL = False
 
 if _lib is not None:
     _lib.vspec_py_weight_canonical_name.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
@@ -158,6 +162,58 @@ if _lib is not None:
     _lib.vspec_py_native_forward_destroy.restype = None
     _lib.vspec_py_native_forward_step.argtypes = [c_int, c_char_p, c_size_t, POINTER(c_int), POINTER(c_float), c_size_t, c_float, POINTER(c_float)]
     _lib.vspec_py_native_forward_step.restype = c_int
+    _HAS_NATIVE_FORWARD_TOKEN_STEP = hasattr(_lib, "vspec_py_native_forward_step_tokens")
+    if _HAS_NATIVE_FORWARD_TOKEN_STEP:
+        _lib.vspec_py_native_forward_step_tokens.argtypes = [
+            c_int,
+            POINTER(c_int),
+            c_size_t,
+            POINTER(c_int),
+            POINTER(c_float),
+            c_size_t,
+            c_float,
+            POINTER(c_float),
+        ]
+        _lib.vspec_py_native_forward_step_tokens.restype = c_int
+    _HAS_NATIVE_FORWARD_PREFILL = hasattr(_lib, "vspec_py_native_forward_prefill_tokens")
+    if _HAS_NATIVE_FORWARD_PREFILL:
+        _lib.vspec_py_native_forward_prefill_tokens.argtypes = [
+            c_int,
+            POINTER(c_int),
+            c_size_t,
+            POINTER(c_size_t),
+        ]
+        _lib.vspec_py_native_forward_prefill_tokens.restype = c_int
+    _HAS_NATIVE_FORWARD_TOPK_STEP = hasattr(_lib, "vspec_py_native_forward_topk_tokens")
+    if _HAS_NATIVE_FORWARD_TOPK_STEP:
+        _lib.vspec_py_native_forward_topk_tokens.argtypes = [
+            c_int,
+            POINTER(c_int),
+            c_size_t,
+            c_size_t,
+            POINTER(c_int),
+            POINTER(c_float),
+            c_size_t,
+            POINTER(c_size_t),
+        ]
+        _lib.vspec_py_native_forward_topk_tokens.restype = c_int
+    _HAS_NATIVE_FORWARD_TOPK_SAMPLE = hasattr(_lib, "vspec_py_native_forward_sample_topk_tokens")
+    if _HAS_NATIVE_FORWARD_TOPK_SAMPLE:
+        _lib.vspec_py_native_forward_sample_topk_tokens.argtypes = [
+            c_int,
+            POINTER(c_int),
+            c_size_t,
+            c_size_t,
+            c_float,
+            c_int,
+            c_uint64,
+            POINTER(c_int),
+            c_size_t,
+            c_float,
+            POINTER(c_int),
+            POINTER(c_float),
+        ]
+        _lib.vspec_py_native_forward_sample_topk_tokens.restype = c_int
     _lib.vspec_py_plugin_load_dynamic.argtypes = [c_char_p, c_char_p, ctypes.c_char_p, c_size_t]
     _lib.vspec_py_plugin_load_dynamic.restype = c_int
     _lib.vspec_py_plugin_unload_dynamic.argtypes = [c_char_p, ctypes.c_char_p, c_size_t]
@@ -299,9 +355,14 @@ def native_anf_available() -> bool:
 
 
 def native_anf_prototype_enabled() -> bool:
-    if os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() not in {"1", "true", "yes", "on"}:
-        return False
+    return native_anf_enabled()
+
+
+def native_anf_enabled() -> bool:
     if os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    mode = os.getenv("VSPEC_ANF_MODE", "shadow").strip().lower()
+    if mode in {"off", "disabled", "0"}:
         return False
     return native_anf_available()
 
@@ -867,6 +928,7 @@ class CoreNativeForwardContext:
         candidate_ids: list[int],
         base_scores: list[float],
         blend: float,
+        token_ids: list[int] | None = None,
     ) -> list[float] | None:
         if not self.available:
             return None
@@ -878,19 +940,190 @@ class CoreNativeForwardContext:
         ids_arr = (c_int * len(candidate_ids))(*[int(v) for v in candidate_ids])
         base_np = np.ascontiguousarray(base_scores, dtype=np.float32)
         out_np = np.empty((len(candidate_ids),), dtype=np.float32)
-        ok = _lib.vspec_py_native_forward_step(
-            int(self.handle),
-            str(prompt or "").encode("utf-8", errors="ignore"),
-            c_size_t(max(0, int(produced_tokens))),
-            ids_arr,
-            base_np.ctypes.data_as(POINTER(c_float)),
-            c_size_t(len(candidate_ids)),
-            c_float(float(blend)),
-            out_np.ctypes.data_as(POINTER(c_float)),
-        )
+        ok = 0
+        if _HAS_NATIVE_FORWARD_TOKEN_STEP and token_ids:
+            try:
+                ctx_ids = [int(v) for v in token_ids if int(v) >= 0]
+            except Exception:
+                ctx_ids = []
+            if ctx_ids:
+                ctx_arr = (c_int * len(ctx_ids))(*ctx_ids)
+                ok = _lib.vspec_py_native_forward_step_tokens(
+                    int(self.handle),
+                    ctx_arr,
+                    c_size_t(len(ctx_ids)),
+                    ids_arr,
+                    base_np.ctypes.data_as(POINTER(c_float)),
+                    c_size_t(len(candidate_ids)),
+                    c_float(float(blend)),
+                    out_np.ctypes.data_as(POINTER(c_float)),
+                )
+
+        if not ok:
+            ok = _lib.vspec_py_native_forward_step(
+                int(self.handle),
+                str(prompt or "").encode("utf-8", errors="ignore"),
+                c_size_t(max(0, int(produced_tokens))),
+                ids_arr,
+                base_np.ctypes.data_as(POINTER(c_float)),
+                c_size_t(len(candidate_ids)),
+                c_float(float(blend)),
+                out_np.ctypes.data_as(POINTER(c_float)),
+            )
         if not ok:
             return None
         return out_np.astype(float, copy=False).tolist()
+
+    def prefill_tokens(self, token_ids: list[int]) -> tuple[bool, int]:
+        if not self.available or _lib is None:
+            return False, 0
+        if not token_ids:
+            return True, 0
+
+        try:
+            ctx_ids = [int(v) for v in token_ids if int(v) >= 0]
+        except Exception:
+            return False, 0
+        if not ctx_ids:
+            return False, 0
+
+        ctx_arr = (c_int * len(ctx_ids))(*ctx_ids)
+
+        if _HAS_NATIVE_FORWARD_PREFILL:
+            out_processed = c_size_t(0)
+            ok = _lib.vspec_py_native_forward_prefill_tokens(
+                int(self.handle),
+                ctx_arr,
+                c_size_t(len(ctx_ids)),
+                ctypes.byref(out_processed),
+            )
+            return bool(ok), (int(out_processed.value) if ok else 0)
+
+        if not _HAS_NATIVE_FORWARD_TOKEN_STEP:
+            return False, 0
+
+        dummy_ids = (c_int * 1)(0)
+        base_np = np.zeros((1,), dtype=np.float32)
+        out_np = np.zeros((1,), dtype=np.float32)
+        ok = _lib.vspec_py_native_forward_step_tokens(
+            int(self.handle),
+            ctx_arr,
+            c_size_t(len(ctx_ids)),
+            dummy_ids,
+            base_np.ctypes.data_as(POINTER(c_float)),
+            c_size_t(1),
+            c_float(0.0),
+            out_np.ctypes.data_as(POINTER(c_float)),
+        )
+        return bool(ok), (len(ctx_ids) if ok else 0)
+
+    def propose_topk(self, token_ids: list[int], top_k: int) -> tuple[list[int], list[float]] | None:
+        if not self.available:
+            return None
+        if (not _HAS_NATIVE_FORWARD_TOPK_STEP) or _lib is None:
+            return None
+        if not token_ids:
+            return None
+
+        try:
+            ctx_ids = [int(v) for v in token_ids if int(v) >= 0]
+        except Exception:
+            return None
+        if not ctx_ids:
+            return None
+
+        k = max(1, min(int(top_k), 1024))
+        ctx_arr = (c_int * len(ctx_ids))(*ctx_ids)
+        out_ids = (c_int * k)()
+        out_scores = (c_float * k)()
+        out_count = c_size_t(0)
+
+        ok = _lib.vspec_py_native_forward_topk_tokens(
+            int(self.handle),
+            ctx_arr,
+            c_size_t(len(ctx_ids)),
+            c_size_t(k),
+            out_ids,
+            out_scores,
+            c_size_t(k),
+            ctypes.byref(out_count),
+        )
+        if not ok:
+            return None
+
+        n = min(int(out_count.value), k)
+        ids: list[int] = []
+        scores: list[float] = []
+        for i in range(n):
+            tid = int(out_ids[i])
+            if tid < 0:
+                continue
+            ids.append(tid)
+            scores.append(float(out_scores[i]))
+        if not ids:
+            return None
+        return ids, scores
+
+    def sample_topk_token(
+        self,
+        token_ids: list[int],
+        top_k: int,
+        temperature: float,
+        greedy: bool,
+        random_bits: int,
+        repetition_token_ids: list[int] | None = None,
+        repetition_penalty: float = 1.0,
+    ) -> tuple[int, float] | None:
+        if not self.available:
+            return None
+        if (not _HAS_NATIVE_FORWARD_TOPK_SAMPLE) or _lib is None:
+            return None
+        if not token_ids:
+            return None
+
+        try:
+            ctx_ids = [int(v) for v in token_ids if int(v) >= 0]
+        except Exception:
+            return None
+        if not ctx_ids:
+            return None
+
+        k = max(1, min(int(top_k), 1024))
+        temp = max(0.05, min(float(temperature), 8.0))
+        rep_pen = max(1.0, min(float(repetition_penalty), 3.0))
+
+        ctx_arr = (c_int * len(ctx_ids))(*ctx_ids)
+
+        rep_ids: list[int] = []
+        if repetition_token_ids:
+            try:
+                rep_ids = [int(v) for v in repetition_token_ids if int(v) >= 0]
+            except Exception:
+                rep_ids = []
+        rep_arr = (c_int * len(rep_ids))(*rep_ids) if rep_ids else None
+
+        out_token = c_int(-1)
+        out_score = c_float(-1.0e30)
+
+        ok = _lib.vspec_py_native_forward_sample_topk_tokens(
+            int(self.handle),
+            ctx_arr,
+            c_size_t(len(ctx_ids)),
+            c_size_t(k),
+            c_float(temp),
+            c_int(1 if greedy else 0),
+            c_uint64(int(random_bits) & 0xFFFFFFFFFFFFFFFF),
+            rep_arr,
+            c_size_t(len(rep_ids)),
+            c_float(rep_pen),
+            ctypes.byref(out_token),
+            ctypes.byref(out_score),
+        )
+        if not ok:
+            return None
+        if int(out_token.value) < 0:
+            return None
+        return int(out_token.value), float(out_score.value)
 
     def close(self) -> None:
         if _lib is not None and self.handle > 0:

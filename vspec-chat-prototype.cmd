@@ -28,6 +28,14 @@ if not defined VSPEC_ULTIMATE_ENABLE set "VSPEC_ULTIMATE_ENABLE=0"
 if not defined VSPEC_ULTIMATE_OUTLIER_AWARE set "VSPEC_ULTIMATE_OUTLIER_AWARE=1"
 if not defined VSPEC_ULTIMATE_QLORA set "VSPEC_ULTIMATE_QLORA=0"
 if not defined VSPEC_FORCE_TENSORCORE_4BIT set "VSPEC_FORCE_TENSORCORE_4BIT=0"
+if not defined VSPEC_TORCH_FORWARD set "VSPEC_TORCH_FORWARD=1"
+if not defined VSPEC_TORCH_COMPILE set "VSPEC_TORCH_COMPILE=1"
+if not defined VSPEC_TORCH_COMPILE_BACKEND set "VSPEC_TORCH_COMPILE_BACKEND=inductor"
+if not defined VSPEC_TORCH_COMPILE_BACKEND_FALLBACK set "VSPEC_TORCH_COMPILE_BACKEND_FALLBACK=aot_eager"
+if not defined VSPEC_TORCH_INDUCTOR_SMOKE set "VSPEC_TORCH_INDUCTOR_SMOKE=1"
+if not defined VSPEC_TORCH_COMPILE_REQUIRE_TRITON set "VSPEC_TORCH_COMPILE_REQUIRE_TRITON=0"
+if not defined VSPEC_TORCH_COMPILE_WARMUP set "VSPEC_TORCH_COMPILE_WARMUP=1"
+if not defined VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH set "VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=1"
 
 if /I "%~1"=="setting" (
     shift
@@ -73,6 +81,15 @@ if /I "%K%"=="ultimate" set "VSPEC_ULTIMATE_ENABLE=%V%"
 if /I "%K%"=="outlier" set "VSPEC_ULTIMATE_OUTLIER_AWARE=%V%"
 if /I "%K%"=="qlora" set "VSPEC_ULTIMATE_QLORA=%V%"
 if /I "%K%"=="tensorcore" set "VSPEC_FORCE_TENSORCORE_4BIT=%V%"
+if /I "%K%"=="torch_forward" set "VSPEC_TORCH_FORWARD=%V%"
+if /I "%K%"=="torch_compile" set "VSPEC_TORCH_COMPILE=%V%"
+if /I "%K%"=="torch_compile_backend" set "VSPEC_TORCH_COMPILE_BACKEND=%V%"
+if /I "%K%"=="torch_compile_backend_fallback" set "VSPEC_TORCH_COMPILE_BACKEND_FALLBACK=%V%"
+if /I "%K%"=="torch_inductor_smoke" set "VSPEC_TORCH_INDUCTOR_SMOKE=%V%"
+if /I "%K%"=="torch_require_triton" set "VSPEC_TORCH_COMPILE_REQUIRE_TRITON=%V%"
+if /I "%K%"=="torch_compile_warmup" set "VSPEC_TORCH_COMPILE_WARMUP=%V%"
+if /I "%K%"=="cpp_loop_with_torch" set "VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=%V%"
+if /I "%K%"=="native_cpp_loop_allow_with_torch" set "VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=%V%"
 exit /b 0
 
 :print_and_exit
@@ -96,6 +113,14 @@ echo     - ultimate                    = 0^|1   ^(VSPEC_ULTIMATE_ENABLE^)
 echo     - outlier                     = 0^|1   ^(VSPEC_ULTIMATE_OUTLIER_AWARE^)
 echo     - qlora                       = 0^|1   ^(VSPEC_ULTIMATE_QLORA^)
 echo     - tensorcore                  = 0^|1   ^(VSPEC_FORCE_TENSORCORE_4BIT^)
+echo     - torch_forward               = 0^|1   ^(VSPEC_TORCH_FORWARD, Phase2-4^)
+echo     - torch_compile               = 0^|1   ^(VSPEC_TORCH_COMPILE, default 1^)
+echo     - torch_compile_backend       = inductor^|aot_eager^|eager
+echo     - torch_compile_backend_fallback = aot_eager^|eager
+echo     - torch_inductor_smoke        = 0^|1   ^(probe inductor/triton runtime^)
+echo     - torch_require_triton        = 0^|1   ^(strict mode: disable compile if triton not ready^)
+echo     - torch_compile_warmup        = 0^|1   ^(pre-jit kernels on init^)
+echo     - cpp_loop_with_torch         = 0^|1   ^(VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH, default 1^)
 echo.
 echo Usage:
 echo   vspec-chat-prototype.cmd setting
@@ -119,4 +144,12 @@ echo   VSPEC_ULTIMATE_ENABLE=%VSPEC_ULTIMATE_ENABLE%
 echo   VSPEC_ULTIMATE_OUTLIER_AWARE=%VSPEC_ULTIMATE_OUTLIER_AWARE%
 echo   VSPEC_ULTIMATE_QLORA=%VSPEC_ULTIMATE_QLORA%
 echo   VSPEC_FORCE_TENSORCORE_4BIT=%VSPEC_FORCE_TENSORCORE_4BIT%
+echo   VSPEC_TORCH_FORWARD=%VSPEC_TORCH_FORWARD%
+echo   VSPEC_TORCH_COMPILE=%VSPEC_TORCH_COMPILE%
+echo   VSPEC_TORCH_COMPILE_BACKEND=%VSPEC_TORCH_COMPILE_BACKEND%
+echo   VSPEC_TORCH_COMPILE_BACKEND_FALLBACK=%VSPEC_TORCH_COMPILE_BACKEND_FALLBACK%
+echo   VSPEC_TORCH_INDUCTOR_SMOKE=%VSPEC_TORCH_INDUCTOR_SMOKE%
+echo   VSPEC_TORCH_COMPILE_REQUIRE_TRITON=%VSPEC_TORCH_COMPILE_REQUIRE_TRITON%
+echo   VSPEC_TORCH_COMPILE_WARMUP=%VSPEC_TORCH_COMPILE_WARMUP%
+echo   VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=%VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH%
 exit /b 0

@@ -25,3 +25,9 @@ tmp/
 prototype/
 build_vs2022/
 build_vs2022_anf/
+vspec-struc/
+vspec-cli/
+.tmp_native_topk_check.py
+.tmp_native_topk_check_fast.py
+.tmp_native_topk_check_fast.log
+vspec-chat/python/.tmp_native_smoke.py

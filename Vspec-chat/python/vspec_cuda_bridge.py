@@ -39,6 +39,7 @@ _INT4_BRIDGE_SIGNATURE = "unknown"
 _HAS_INT4_REGISTERED = False
 _HAS_INT4_REGISTERED_MANY = False
 _HAS_FUSED_HYBRID = False
+_HAS_GEMM_DISPATCH = False
 
 
 def _ensure_c_array(arr: np.ndarray, dtype) -> np.ndarray:
@@ -113,6 +114,25 @@ if _lib is not None:
         POINTER(c_float),
     ]
     _lib.vspec_cuda_gemm_f32_bridge.restype = None
+
+    _HAS_GEMM_DISPATCH = hasattr(_lib, "vspec_cuda_gemm_dispatch_bridge")
+    if _HAS_GEMM_DISPATCH:
+        _lib.vspec_cuda_gemm_dispatch_bridge.argtypes = [
+            POINTER(c_float),
+            POINTER(c_float),
+            ctypes.POINTER(ctypes.c_ubyte),
+            POINTER(c_float),
+            POINTER(c_float),
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            c_int,
+            POINTER(c_int),
+            POINTER(c_float),
+            POINTER(c_int),
+        ]
+        _lib.vspec_cuda_gemm_dispatch_bridge.restype = c_int
 
     _lib.vspec_cuda_attention_single_f32_bridge.argtypes = [
         POINTER(c_float),
@@ -278,6 +298,7 @@ else:
     _HAS_INT4_CACHED_STATS = False
     _HAS_INT4_REGISTERED_MANY = False
     _HAS_FUSED_HYBRID = False
+    _HAS_GEMM_DISPATCH = False
 
 
 def rmsnorm_f32_available() -> bool:
@@ -367,6 +388,73 @@ def gemm_f32(input_array: np.ndarray, weight: np.ndarray) -> np.ndarray:
     )
 
     return output
+
+
+def gemm_dispatch_available() -> bool:
+    return _lib is not None and _HAS_GEMM_DISPATCH
+
+
+def gemm_dispatch(
+    input_array: np.ndarray,
+    weight: np.ndarray,
+    packed_weight: np.ndarray | None = None,
+    scales: np.ndarray | None = None,
+    zero_points: np.ndarray | None = None,
+    bits: int = 0,
+    handle: int = 0,
+    n_blocks: int = 1,
+) -> tuple[np.ndarray, int, int]:
+    if _lib is None or not _HAS_GEMM_DISPATCH:
+        raise RuntimeError("gemm dispatch bridge not available")
+    if input_array.dtype != np.float32:
+        input_array = input_array.astype(np.float32)
+    if weight.dtype != np.float32:
+        weight = weight.astype(np.float32)
+
+    if input_array.ndim == 1:
+        input_array = input_array[None, :]
+    m, k = input_array.shape
+    n = weight.shape[0]
+
+    output = np.empty((m, n), dtype=np.float32)
+
+    packed_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+    scales_ptr = POINTER(c_float)()
+    zp_ptr = POINTER(c_float)()
+
+    if packed_weight is not None and scales is not None:
+        packed_weight = _ensure_c_array(packed_weight, np.uint8)
+        scales = _ensure_c_array(scales, np.float32)
+        if zero_points is not None:
+            zero_points = _ensure_c_array(zero_points, np.float32)
+        packed_ptr = packed_weight.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+        scales_ptr = scales.ctypes.data_as(POINTER(c_float))
+        if zero_points is not None:
+            zp_ptr = zero_points.ctypes.data_as(POINTER(c_float))
+
+        if n > 0 and scales.size >= n and (scales.size % n) == 0:
+            n_blocks = max(1, int(scales.size // n))
+
+    handle_ref = c_int(int(handle))
+    path_ref = c_int(0)
+    ok = _lib.vspec_cuda_gemm_dispatch_bridge(
+        input_array.ctypes.data_as(POINTER(c_float)),
+        weight.ctypes.data_as(POINTER(c_float)),
+        packed_ptr,
+        scales_ptr,
+        zp_ptr,
+        c_size_t(m),
+        c_size_t(k),
+        c_size_t(n),
+        c_size_t(max(1, int(n_blocks))),
+        c_int(int(bits)),
+        ctypes.byref(handle_ref),
+        output.ctypes.data_as(POINTER(c_float)),
+        ctypes.byref(path_ref),
+    )
+    if not ok:
+        raise RuntimeError("gemm dispatch failed")
+    return output, int(handle_ref.value), int(path_ref.value)
 
 
 def attention_single_f32_available() -> bool:

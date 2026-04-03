@@ -34,6 +34,14 @@ def main() -> None:
     parser.add_argument("--stream", action="store_true", help="Stream tokens for single prompt mode")
     parser.add_argument("--json", action="store_true", help="Emit JSON output for automation")
     parser.add_argument("--strict-native", action="store_true", help="Require native-real backend only (no Python compute fallback)")
+    parser.add_argument("--enable-anf", action="store_true", help="Enable ANF telemetry and routing")
+    parser.add_argument("--anf-mode", default="shadow", choices=["off", "shadow", "active"], help="ANF routing mode when enabled")
+    parser.add_argument("--native-full-transformer", action="store_true", help="Enable full transformer native-forward scoring path in C")
+    parser.add_argument("--native-full-layer-limit", type=int, default=0, help="0=all detected native layers, >0 limits native full-forward layers")
+    parser.add_argument("--native-full-context-limit", type=int, default=0, help="0=full context, >0 limits context tokens used by native full-forward")
+    parser.add_argument("--native-c-logits-provider", action="store_true", help="Use native C top-k logits provider during decode")
+    parser.add_argument("--native-c-logits-topk", type=int, default=64, help="Top-k candidate count from native C logits provider")
+    parser.add_argument("--native-c-strict", action="store_true", help="Require native C logits provider during decode and fail on fallback")
 
     args = parser.parse_args()
 
@@ -67,6 +75,14 @@ def main() -> None:
         lang=args.lang,
         stream=args.stream,
         unsafe_low_layers=bool(args.unsafe_low_layers),
+        enable_anf=bool(args.enable_anf),
+        anf_mode=str(args.anf_mode),
+        native_full_transformer=bool(args.native_full_transformer),
+        native_full_layer_limit=int(args.native_full_layer_limit),
+        native_full_context_limit=int(args.native_full_context_limit),
+        native_c_logits_provider=bool(args.native_c_logits_provider),
+        native_c_logits_topk=int(args.native_c_logits_topk),
+        native_c_strict=bool(args.native_c_strict),
     )
 
     if args.chat:

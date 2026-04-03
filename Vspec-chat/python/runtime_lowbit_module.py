@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
 try:
@@ -20,6 +21,8 @@ try:
         fused_linear_int4_register_weight,
         fused_linear_int4_registered_available,
         int4_cached_stats,
+        gemm_dispatch,
+        gemm_dispatch_available,
         gemm_f32,
         gemm_f32_available,
     )
@@ -34,6 +37,8 @@ except Exception:  # pragma: no cover
     fused_linear_int4_register_weight = lambda *args, **kwargs: 0
     fused_linear_int4_registered_available = lambda: False
     int4_cached_stats = lambda: {}
+    gemm_dispatch = None
+    gemm_dispatch_available = lambda: False
     gemm_f32 = None
     gemm_f32_available = lambda: False
 
@@ -64,7 +69,49 @@ _LOWBIT_PROJECTION_STATS = {
     "int4_registered_failures": 0,
     "fallback_gemm_calls": 0,
     "fallback_matmul_calls": 0,
+    "gemm_dispatch_calls": 0,
+    "gemm_dispatch_ms": 0.0,
 }
+
+_LOWBIT_WARN_STATE = {
+    "register_fail_logs": 0,
+}
+
+
+def _timing_enabled() -> bool:
+    return os.getenv("VSPEC_RUNTIME_TIMING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_gemm_ratio() -> float:
+    calls = int(_LOWBIT_PROJECTION_STATS.get("calls", 0) or 0)
+    if calls <= 0:
+        return 0.0
+    return float(_LOWBIT_PROJECTION_STATS.get("fallback_gemm_calls", 0) or 0) / float(calls)
+
+
+def _log_int4_register_failure(layer_idx: int, key: str, reason: str, exc: Exception | None = None) -> None:
+    try:
+        limit = max(0, int(os.getenv("VSPEC_INT4_REGISTER_LOG_LIMIT", "8") or "8"))
+    except Exception:
+        limit = 8
+
+    emitted = int(_LOWBIT_WARN_STATE.get("register_fail_logs", 0) or 0)
+    if emitted >= limit:
+        return
+
+    _LOWBIT_WARN_STATE["register_fail_logs"] = emitted + 1
+    cap_hint = os.getenv("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
+    failure_count = int(_LOWBIT_PROJECTION_STATS.get("int4_registered_failures", 0) or 0)
+    fallback_ratio_pct = _fallback_gemm_ratio() * 100.0
+
+    extra = ""
+    if exc is not None:
+        extra = f" error={type(exc).__name__}:{str(exc)}"
+
+    print(
+        f"[lowbit] int4_register_failure layer={int(layer_idx)} key={str(key)} reason={reason} "
+        f"cache_cap={cap_hint} failures={failure_count} fallback_gemm_ratio_pct={fallback_ratio_pct:.2f}{extra}"
+    )
 
 
 def lowbit_projection_stats_reset() -> None:
@@ -76,18 +123,33 @@ def lowbit_projection_stats_reset() -> None:
     _LOWBIT_PROJECTION_STATS["int4_registered_failures"] = 0
     _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] = 0
     _LOWBIT_PROJECTION_STATS["fallback_matmul_calls"] = 0
+    _LOWBIT_PROJECTION_STATS["gemm_dispatch_calls"] = 0
+    _LOWBIT_PROJECTION_STATS["gemm_dispatch_ms"] = 0.0
+    _LOWBIT_WARN_STATE["register_fail_logs"] = 0
 
 
-def lowbit_projection_stats_snapshot() -> dict[str, int]:
+def lowbit_projection_stats_snapshot() -> dict[str, object]:
+    calls = int(_LOWBIT_PROJECTION_STATS["calls"])
+    fallback_gemm_calls = int(_LOWBIT_PROJECTION_STATS["fallback_gemm_calls"])
+    fallback_matmul_calls = int(_LOWBIT_PROJECTION_STATS["fallback_matmul_calls"])
+    fallback_total_calls = fallback_gemm_calls + fallback_matmul_calls
+    fallback_gemm_ratio = (float(fallback_gemm_calls) / float(calls)) if calls > 0 else 0.0
+    fallback_total_ratio = (float(fallback_total_calls) / float(calls)) if calls > 0 else 0.0
     return {
-        "calls": int(_LOWBIT_PROJECTION_STATS["calls"]),
+        "calls": calls,
         "lowbit_calls": int(_LOWBIT_PROJECTION_STATS["lowbit_calls"]),
         "int4_registered_calls": int(_LOWBIT_PROJECTION_STATS["int4_registered_calls"]),
         "int4_registered_many_calls": int(_LOWBIT_PROJECTION_STATS["int4_registered_many_calls"]),
         "int4_registered_registers": int(_LOWBIT_PROJECTION_STATS["int4_registered_registers"]),
         "int4_registered_failures": int(_LOWBIT_PROJECTION_STATS["int4_registered_failures"]),
-        "fallback_gemm_calls": int(_LOWBIT_PROJECTION_STATS["fallback_gemm_calls"]),
-        "fallback_matmul_calls": int(_LOWBIT_PROJECTION_STATS["fallback_matmul_calls"]),
+        "fallback_gemm_calls": fallback_gemm_calls,
+        "fallback_matmul_calls": fallback_matmul_calls,
+        "fallback_total_calls": fallback_total_calls,
+        "fallback_gemm_ratio": float(fallback_gemm_ratio),
+        "fallback_total_ratio": float(fallback_total_ratio),
+        "gemm_dispatch_calls": int(_LOWBIT_PROJECTION_STATS["gemm_dispatch_calls"]),
+        "gemm_dispatch_ms": float(_LOWBIT_PROJECTION_STATS["gemm_dispatch_ms"]),
+        "int4_register_failure_logs": int(_LOWBIT_WARN_STATE.get("register_fail_logs", 0) or 0),
         "int4_cached_bridge": int4_cached_stats() if callable(int4_cached_stats) else {},
     }
 
@@ -329,13 +391,97 @@ def lowbit_linear_project(
         return []
 
     _LOWBIT_PROJECTION_STATS["calls"] += 1
+    timing_on = _timing_enabled()
 
     if lowbit_plan.profile == "baseline" and key in {"w2"} and (layer_idx % 2 == 0):
+        if use_native_cuda_norm and gemm_dispatch_available():
+            t0 = time.perf_counter() if timing_on else None
+            try:
+                out, _handle, path = gemm_dispatch(vec, w, bits=0)
+                if path == 4:
+                    _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] += 1
+                return _unwrap_single_batch(out)
+            except Exception:
+                pass
+            finally:
+                if timing_on and t0 is not None:
+                    _LOWBIT_PROJECTION_STATS["gemm_dispatch_calls"] += 1
+                    _LOWBIT_PROJECTION_STATS["gemm_dispatch_ms"] += (time.perf_counter() - t0) * 1000.0
         if use_native_cuda_norm and gemm_f32_available():
             _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] += 1
             return _unwrap_single_batch(gemm_f32(vec, w))
         _LOWBIT_PROJECTION_STATS["fallback_matmul_calls"] += 1
         return vec @ w.T
+
+    if use_native_cuda_norm and gemm_dispatch_available():
+        if lowbit_plan.enabled and lowbit_plan.bits in {3, 4} and key in packed:
+            entry = packed[key]
+            if len(entry) >= 5:
+                packed_w, scales, bits, out_n, zero_points = entry[:5]
+            else:
+                packed_w, scales, bits, out_n = entry[:4]
+                zero_points = None
+            bits = int(bits)
+            handle = 0
+            if len(entry) >= 6:
+                try:
+                    handle = int(entry[5] or 0)
+                except Exception:
+                    handle = 0
+
+            t0 = time.perf_counter() if timing_on else None
+            try:
+                out, new_handle, path = gemm_dispatch(
+                    vec,
+                    w,
+                    packed_weight=packed_w,
+                    scales=scales,
+                    zero_points=zero_points,
+                    bits=bits,
+                    handle=handle,
+                )
+            except Exception as exc:
+                _log_int4_register_failure(layer_idx, key, "gemm_dispatch_exception_baseline", exc)
+                out = None
+                new_handle = handle
+                path = 0
+            finally:
+                if timing_on and t0 is not None:
+                    _LOWBIT_PROJECTION_STATS["gemm_dispatch_calls"] += 1
+                    _LOWBIT_PROJECTION_STATS["gemm_dispatch_ms"] += (time.perf_counter() - t0) * 1000.0
+
+            if out is not None:
+                if bits == 4 and handle <= 0 and new_handle > 0:
+                    _LOWBIT_PROJECTION_STATS["int4_registered_registers"] += 1
+                    packed[key] = (packed_w, scales, bits, out_n, zero_points, new_handle)
+                if bits == 4 and handle <= 0 and new_handle <= 0 and fused_linear_int4_registered_available():
+                    _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                    _log_int4_register_failure(layer_idx, key, "gemm_dispatch_no_handle")
+
+                if path == 1:
+                    _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
+                    _LOWBIT_PROJECTION_STATS["int4_registered_calls"] += 1
+                elif path == 2:
+                    _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
+                elif path == 3:
+                    _LOWBIT_PROJECTION_STATS["lowbit_calls"] += 1
+                elif path == 4:
+                    _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] += 1
+
+                return _unwrap_single_batch(out)
+
+        t0 = time.perf_counter() if timing_on else None
+        try:
+            out, _handle, path = gemm_dispatch(vec, w, bits=0)
+            if path == 4:
+                _LOWBIT_PROJECTION_STATS["fallback_gemm_calls"] += 1
+            return _unwrap_single_batch(out)
+        except Exception:
+            pass
+        finally:
+            if timing_on and t0 is not None:
+                _LOWBIT_PROJECTION_STATS["gemm_dispatch_calls"] += 1
+                _LOWBIT_PROJECTION_STATS["gemm_dispatch_ms"] += (time.perf_counter() - t0) * 1000.0
 
     if use_native_cuda_norm and lowbit_plan.enabled and lowbit_plan.bits in {3, 4} and key in packed:
         entry = packed[key]
@@ -365,16 +511,23 @@ def lowbit_linear_project(
                     if handle > 0:
                         _LOWBIT_PROJECTION_STATS["int4_registered_registers"] += 1
                         packed[key] = (packed_w, scales, bits, out_n, zero_points, handle)
-                except Exception:
+                except Exception as exc:
+                    _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                    _log_int4_register_failure(layer_idx, key, "legacy_register_exception", exc)
                     handle = 0
+
+            if handle <= 0 and fused_linear_int4_registered_available():
+                _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                _log_int4_register_failure(layer_idx, key, "legacy_register_failed")
 
             if handle > 0 and fused_linear_int4_registered_available():
                 try:
                     out = fused_linear_int4_cached(vec, handle, int(out_n))
                     _LOWBIT_PROJECTION_STATS["int4_registered_calls"] += 1
                     return _unwrap_single_batch(out)
-                except Exception:
+                except Exception as exc:
                     _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                    _log_int4_register_failure(layer_idx, key, "legacy_cached_exception", exc)
 
             out = fused_linear_int4(vec, packed_w, scales, out_n, zero_points=zero_points)
             return _unwrap_single_batch(out)
@@ -443,6 +596,7 @@ def lowbit_linear_project_many(
             handle = int(fused_linear_int4_register_weight(packed_w, scales, int(out_n), k_in, zero_points=zero_points) or 0)
             if handle <= 0:
                 _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+                _log_int4_register_failure(layer_idx, key, "many_register_failed")
                 return None
             _LOWBIT_PROJECTION_STATS["int4_registered_registers"] += 1
             packed[key] = (packed_w, scales, bits, out_n, zero_points, handle)
@@ -452,8 +606,10 @@ def lowbit_linear_project_many(
 
     try:
         many_out = fused_linear_int4_cached_many(vec, handles, out_dims)
-    except Exception:
+    except Exception as exc:
         _LOWBIT_PROJECTION_STATS["int4_registered_failures"] += 1
+        keys_text = ",".join([str(name) for name, _ in specs])
+        _log_int4_register_failure(layer_idx, keys_text, "many_cached_exception", exc)
         return None
 
     _LOWBIT_PROJECTION_STATS["int4_registered_many_calls"] += 1

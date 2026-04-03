@@ -27,6 +27,121 @@
 extern "C" {
 #endif
 
+VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_register_weight_bridge(
+  const unsigned char* packed_weight,
+  const float* scales,
+  const float* zero_points,
+  size_t k,
+  size_t n,
+  size_t n_blocks
+);
+VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_cached_bridge(
+  const float* input,
+  size_t m,
+  size_t k,
+  int weight_handle,
+  size_t expected_n,
+  float* output
+);
+VSPEC_CUDA_API int vspec_cuda_fused_linear_int4_bridge(
+  const float* input,
+  const unsigned char* packed_weight,
+  const float* scales,
+  const float* zero_points,
+  size_t m,
+  size_t k,
+  size_t n,
+  size_t n_blocks,
+  float* output
+);
+VSPEC_CUDA_API int vspec_cuda_fused_linear_int3_bridge(
+  const float* input,
+  const unsigned char* packed_weight,
+  const float* scales,
+  size_t m,
+  size_t k,
+  size_t n,
+  float* output
+);
+
+VSPEC_CUDA_API int vspec_cuda_gemm_dispatch_bridge(
+  const float* input,
+  const float* weight_f32,
+  const unsigned char* packed_weight,
+  const float* scales,
+  const float* zero_points,
+  size_t m,
+  size_t k,
+  size_t n,
+  size_t n_blocks,
+  int bits,
+  int* inout_handle,
+  float* output,
+  int* out_path
+) {
+  int path = 0;
+  if (!input || !output || m == 0U || k == 0U || n == 0U) {
+    return 0;
+  }
+
+  if (bits == 4 && packed_weight && scales) {
+    int handle = inout_handle ? *inout_handle : 0;
+    if (n_blocks == 0U) {
+      n_blocks = 1U;
+    }
+    if (handle <= 0) {
+      handle = vspec_cuda_fused_linear_int4_register_weight_bridge(
+        packed_weight,
+        scales,
+        zero_points,
+        k,
+        n,
+        n_blocks
+      );
+      if (inout_handle) {
+        *inout_handle = handle;
+      }
+    }
+
+    if (handle > 0) {
+      if (vspec_cuda_fused_linear_int4_cached_bridge(input, m, k, handle, n, output)) {
+        path = 1;
+        if (out_path) {
+          *out_path = path;
+        }
+        return 1;
+      }
+    }
+
+    if (vspec_cuda_fused_linear_int4_bridge(input, packed_weight, scales, zero_points, m, k, n, n_blocks, output)) {
+      path = 2;
+      if (out_path) {
+        *out_path = path;
+      }
+      return 1;
+    }
+  } else if (bits == 3 && packed_weight && scales) {
+    if (vspec_cuda_fused_linear_int3_bridge(input, packed_weight, scales, m, k, n, output)) {
+      path = 3;
+      if (out_path) {
+        *out_path = path;
+      }
+      return 1;
+    }
+  }
+
+  if (!weight_f32) {
+    return 0;
+  }
+
+  vspec_cuda_gemm_f32(input, weight_f32, m, k, n, output);
+  path = 4;
+  if (out_path) {
+    *out_path = path;
+  }
+  return 1;
+}
+
 static uint64_t vspec_hash_sample_bytes(const void* ptr, size_t bytes, size_t sample_count) {
   if (!ptr || bytes == 0U) {
     return 0U;

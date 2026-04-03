@@ -4,12 +4,20 @@ import os
 import random
 import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from chat_prompt import build_prompt
-from fast_output import FastOutputEngine, postprocess_output_text, resolve_speed_preset
+from fast_output import (
+    FastOutputEngine,
+    postprocess_output_text,
+    resolve_speed_preset,
+    sampling_timing_reset,
+    sampling_timing_snapshot,
+)
 from decode_optimization_module import DecodeOptimizationModule
 from language_stability_guard import LanguageStabilityGuard
 from language_structure_guard import LanguageStructureIntegrityManager
@@ -28,8 +36,8 @@ from runtime_core_bridge import (
     adaptive_step,
     native_anf_observe_activations,
     native_anf_observe_quality,
-    native_anf_prototype_enabled,
     native_anf_report,
+    native_anf_enabled,
 )
 from model_adapters import select_adapter
 from model_loader import (
@@ -40,7 +48,13 @@ from model_loader import (
     read_config,
     read_tokenizer_config,
 )
-from runtime_inference import build_generic_runtime, runtime_matrix_bits_summary
+from runtime_inference import (
+    build_generic_runtime,
+    runtime_matrix_bits_summary,
+    runtime_timing_reset,
+    runtime_timing_snapshot,
+    torch_compile_system_status,
+)
 from vspec_cuda_bridge import cuda_device_capability, cuda_mem_info, int4_compute_mode, int4_tensorcore_available
 from lowbit_policy import build_layer_bits, effective_bits, summarize_layer_bits
 
@@ -78,6 +92,175 @@ def _progress(enabled: bool, pct: int, stage: str, detail: str = "") -> None:
     if detail:
         msg += f" | {detail}"
     print(msg, flush=True)
+
+
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _claude_style_enabled() -> bool:
+    return _env_true("VSPEC_CHAT_CLAUDE_STYLE", default=False)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _user_prompt_label(claude_style: bool) -> str:
+    return "> " if claude_style else "you> "
+
+
+def _print_chat_intro(claude_style: bool, model_dir: str, device: str, max_tokens: int, stream_enabled: bool) -> None:
+    if not claude_style:
+        print("[session] type /exit to quit")
+        return
+
+    model_name = Path(model_dir).name or str(model_dir)
+    stream_mode = "on" if stream_enabled else "off"
+    print("")
+    print("/ Vspec Chat")
+    print(f"  model: {model_name}")
+    print(f"  runtime: device={device} max_tokens={int(max_tokens)} stream={stream_mode}")
+    print("  commands: /help, /exit")
+    print("")
+
+
+def _print_chat_help(claude_style: bool) -> None:
+    if claude_style:
+        print("Commands:")
+        print("  /help  Show available chat commands")
+        print("  /exit  Exit this chat session")
+        return
+    print("[session] commands: /exit")
+
+
+def _turn_meter_enabled() -> bool:
+    return _env_true("VSPEC_CHAT_SHOW_TPS", default=True)
+
+
+def _native_cpp_loop_enabled_effective() -> tuple[bool, bool, bool]:
+    requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
+    torch_forward = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
+    enabled = bool(requested and (not torch_forward or allow_with_torch))
+    return enabled, requested, torch_forward
+
+
+def _store_turn_meter(
+    runtime_obj,
+    generated_tokens: int,
+    tps: float,
+    prefill_tokens: int = 0,
+    prefill_elapsed_sec: float = 0.0,
+    decode_elapsed_sec: float = 0.0,
+) -> None:
+    if runtime_obj is None:
+        return
+    try:
+        generated_i = int(max(0, int(generated_tokens)))
+        tps_f = float(max(0.0, float(tps)))
+        prefill_i = int(max(0, int(prefill_tokens)))
+        prefill_elapsed_f = float(max(0.0, float(prefill_elapsed_sec)))
+        decode_elapsed_f = float(max(0.0, float(decode_elapsed_sec)))
+
+        setattr(runtime_obj, "_last_turn_generated_tokens", generated_i)
+        setattr(runtime_obj, "_last_turn_tps", tps_f)
+        setattr(runtime_obj, "_last_turn_prefill_tokens", prefill_i)
+        setattr(runtime_obj, "_last_turn_prefill_elapsed_sec", prefill_elapsed_f)
+        setattr(runtime_obj, "_last_turn_decode_elapsed_sec", decode_elapsed_f)
+
+        prefill_tps = (float(prefill_i) / prefill_elapsed_f) if prefill_elapsed_f > 0.0 else 0.0
+        decode_tps = (float(generated_i) / decode_elapsed_f) if decode_elapsed_f > 0.0 else 0.0
+        setattr(runtime_obj, "_last_turn_prefill_tps", prefill_tps)
+        setattr(runtime_obj, "_last_turn_decode_tps", decode_tps)
+    except Exception:
+        pass
+
+
+def _print_turn_meter(runtime_obj, claude_style: bool) -> None:
+    if not _turn_meter_enabled() or runtime_obj is None:
+        return
+    try:
+        generated = int(getattr(runtime_obj, "_last_turn_generated_tokens", 0) or 0)
+        tps = float(getattr(runtime_obj, "_last_turn_tps", 0.0) or 0.0)
+        prefill_tokens = int(getattr(runtime_obj, "_last_turn_prefill_tokens", 0) or 0)
+        prefill_elapsed = float(getattr(runtime_obj, "_last_turn_prefill_elapsed_sec", 0.0) or 0.0)
+        prefill_tps = float(getattr(runtime_obj, "_last_turn_prefill_tps", 0.0) or 0.0)
+        decode_elapsed = float(getattr(runtime_obj, "_last_turn_decode_elapsed_sec", 0.0) or 0.0)
+        decode_tps = float(getattr(runtime_obj, "_last_turn_decode_tps", 0.0) or 0.0)
+    except Exception:
+        return
+    if generated <= 0 and tps <= 0.0 and prefill_tps <= 0.0 and decode_tps <= 0.0:
+        return
+    if claude_style:
+        parts = [f"stats tokens={generated}", f"tps={tps:.2f}"]
+        if prefill_tokens > 0 and prefill_tps > 0.0:
+            parts.append(f"prefill={prefill_tps:.2f} tok/s")
+        if decode_tps > 0.0:
+            parts.append(f"decode={decode_tps:.2f} tok/s")
+        print(" ".join(parts))
+    else:
+        print(f"[session] generated_tokens= {generated}")
+        print(f"[session] tokens_per_sec= {tps:.4f}")
+        if prefill_tokens > 0:
+            print(f"[session] prefill_tokens= {prefill_tokens}")
+            print(f"[session] prefill_timing_sec= {prefill_elapsed:.4f}")
+            print(f"[session] prefill_tokens_per_sec= {prefill_tps:.4f}")
+        if decode_elapsed > 0.0:
+            print(f"[session] decode_timing_sec= {decode_elapsed:.4f}")
+            print(f"[session] decode_tokens_per_sec= {decode_tps:.4f}")
+
+
+class _WaitingTicker:
+    _FRAMES = ("|", "/", "-", "\\")
+
+    def __init__(self, enabled: bool, label: str = "Working") -> None:
+        self.enabled = bool(enabled)
+        self.label = str(label)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_ts = 0.0
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._start_ts = time.perf_counter()
+        self._thread = threading.Thread(target=self._run, name="vspec-chat-wait-ticker", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        frame_idx = 0
+        while not self._stop_event.wait(0.12):
+            elapsed = _format_elapsed(time.perf_counter() - self._start_ts)
+            frame = self._FRAMES[frame_idx % len(self._FRAMES)]
+            frame_idx += 1
+            try:
+                sys.stdout.write(f"\r[{frame}] {self.label} ({elapsed} | Ctrl+C to interrupt)")
+                sys.stdout.flush()
+            except Exception:
+                return
+
+    def stop(self, status: str = "Done") -> None:
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        elapsed = _format_elapsed(time.perf_counter() - self._start_ts)
+        try:
+            sys.stdout.write("\r" + (" " * 112) + "\r")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        print(f"[{status}] {self.label} ({elapsed})")
 
 
 def _detect_lang(prompt: str) -> str:
@@ -251,6 +434,8 @@ def _generate(
     phase5_observer: Optional[Callable[[Phase5TurnReport], None]],
 ) -> str:
     lowbit_projection_stats_reset()
+    sampling_timing_reset()
+    runtime_timing_reset(runtime)
 
     assurance = RuntimeMeaningfulResponseAssurance(lang_mode, allow_semantic_rescue=allow_semantic_rescue)
     prompt_chars = len((prompt or "").strip())
@@ -586,11 +771,15 @@ def _generate(
                         "prefill-core",
                         f"{cur}/{tot}",
                     ),
+                    native_forward_ctx=native_forward_ctx,
                 )
                 if result.used_core_scheduler:
                     run_prefill_direct = False
                     print(f"[session] prefill_core_steps= {int(result.core_steps)}")
                     print(f"[session] prefill_core_reserved_vram= {int(result.reserved_vram)}")
+                    print(f"[session] prefill_native_compute= {bool(result.native_prefill_used)}")
+                    print(f"[session] prefill_native_calls= {int(result.native_prefill_calls)}")
+                    print(f"[session] prefill_native_failures= {int(result.native_prefill_failures)}")
                 else:
                     print(f"[session] prefill_core_fallback= {str(result.reason or 'unknown')}")
 
@@ -606,7 +795,7 @@ def _generate(
                         print(f"[session] prefill_cache_len_max= {int(max(cache_len_list))}")
                 return
 
-            print("[session] prefill_cache_integrity= failed; replaying token-by-token")
+            print("[session] prefill_cache_integrity= failed; replaying in chunks")
             if hasattr(runtime_obj, "reset_core_kv_mirrors"):
                 try:
                     runtime_obj.reset_core_kv_mirrors()
@@ -617,11 +806,25 @@ def _generate(
             if hasattr(runtime_obj, "cache_len"):
                 runtime_obj.cache_len = []
             runtime_obj.position = 0
-            for idx, tid in enumerate(prefill, start=1):
-                runtime_obj.forward_logits([tid])
-                if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
-                    pct = 10 + int((idx / total_prefill) * 35)
-                    _progress(show_progress, min(45, pct), "prefill-replay", f"{idx}/{total_prefill}")
+            try:
+                replay_chunk = max(1, int(os.getenv("VSPEC_PREFILL_REPLAY_CHUNK", "64") or "64"))
+            except Exception:
+                replay_chunk = 64
+
+            if hasattr(runtime_obj, "prefill_tokens"):
+                for start in range(0, total_prefill, replay_chunk):
+                    end = min(total_prefill, start + replay_chunk)
+                    runtime_obj.prefill_tokens(prefill[start:end])
+                    idx = end
+                    if total_prefill > 0 and (idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                        pct = 10 + int((idx / total_prefill) * 35)
+                        _progress(show_progress, min(45, pct), "prefill-replay", f"{idx}/{total_prefill}")
+            else:
+                for idx, tid in enumerate(prefill, start=1):
+                    runtime_obj.forward_logits([tid])
+                    if total_prefill > 0 and (idx == 1 or idx == total_prefill or idx % max(1, total_prefill // 4) == 0):
+                        pct = 10 + int((idx / total_prefill) * 35)
+                        _progress(show_progress, min(45, pct), "prefill-replay", f"{idx}/{total_prefill}")
             if hasattr(runtime_obj, "cache_len"):
                 cache_len_list = list(getattr(runtime_obj, "cache_len") or [])
                 if cache_len_list:
@@ -714,6 +917,16 @@ def _generate(
         contract_failed = False
         native_blend_calls = 0
         native_blend_failures = 0
+        native_logits_provider_calls = 0
+        native_logits_provider_failures = 0
+        native_logits_provider_enabled = os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            native_logits_provider_topk = int(os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER_TOPK", "64") or "64")
+        except Exception:
+            native_logits_provider_topk = 64
+        native_logits_provider_topk = max(8, min(1024, native_logits_provider_topk))
+        native_c_strict = os.getenv("VSPEC_NATIVE_C_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        native_provider_direct_sample = os.getenv("VSPEC_NATIVE_C_PROVIDER_DIRECT_SAMPLE", "1").strip().lower() in {"1", "true", "yes", "on"}
         flash_calls_before = int(getattr(runtime_obj, "phase3_flash_attn_calls", 0) or 0)
         fused_calls_before = int(getattr(runtime_obj, "phase3_fused_attn_calls", 0) or 0)
         scalar_calls_before = int(getattr(runtime_obj, "phase3_scalar_attn_calls", 0) or 0)
@@ -724,7 +937,14 @@ def _generate(
             prompt_tokens=max(0, len(local_tokens) - 1),
             max_new_tokens=int(total_steps),
         )
-        native_cpp_loop = os.getenv("VSPEC_NATIVE_CPP_LOOP", "1").strip().lower() in {"1", "true", "yes", "on"}
+        native_cpp_loop, native_cpp_loop_requested, torch_forward_enabled = _native_cpp_loop_enabled_effective()
+        if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_enabled:
+            if not bool(getattr(runtime_obj, "_native_cpp_loop_torch_warned", False)):
+                print("[session] native_cpp_loop= disabled (torch_forward=1; set VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=1 to force)")
+                try:
+                    setattr(runtime_obj, "_native_cpp_loop_torch_warned", True)
+                except Exception:
+                    pass
 
         def _runtime_graph_signature(runtime_ref, prompt_tokens: int, decode_steps: int) -> int:
             graph_mode = os.getenv("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only").strip().lower()
@@ -799,10 +1019,17 @@ def _generate(
         adaptive_entropy_prev = 0.0
         adaptive_latency_ms = 0.0
         adaptive_quality_drift = 0.0
-        anf_enabled = native_anf_prototype_enabled()
+        anf_enabled = native_anf_enabled()
+
+        if native_c_strict and native_logits_provider_enabled:
+            if native_forward_ctx is None or not native_forward_ctx.available:
+                print("[session] native_c_strict= True provider_unavailable=startup")
+                contract_failed = True
 
         try:
             for step in range(total_steps):
+                if contract_failed:
+                    break
                 if scheduler_enabled:
                     quota = core_decode.next_quota()
                     if quota <= 0:
@@ -819,16 +1046,84 @@ def _generate(
                 reached_eos = False
                 for _ in range(quota):
                     token_t0 = time.perf_counter()
-                    step_result = phase1_orchestrator.step(local_tokens[-1])
-                    if not step_result.ok:
-                        print(
-                            f"[session] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={tokenizer.get_vocab_size()}"
-                        )
-                        contract_failed = True
+                    logits = None
+                    used_native_provider = False
+                    native_provider_sampled_id = None
+                    if (
+                        native_logits_provider_enabled
+                        and native_forward_ctx is not None
+                        and native_forward_ctx.available
+                    ):
+                        provider_handled = False
+                        if native_provider_direct_sample:
+                            rep_window = max(1, int(local_repeat_window))
+                            sampled = native_forward_ctx.sample_topk_token(
+                                token_ids=list(local_tokens),
+                                top_k=native_logits_provider_topk,
+                                temperature=float(max(0.05, local_temperature)),
+                                greedy=bool(local_greedy),
+                                random_bits=random.getrandbits(64),
+                                repetition_token_ids=list(local_tokens[-rep_window:]),
+                                repetition_penalty=float(max(1.0, local_rep_penalty)),
+                            )
+                            if sampled is not None:
+                                native_provider_sampled_id = int(sampled[0])
+                                used_native_provider = True
+                                provider_handled = True
+                                native_logits_provider_calls += 1
+
+                        if not provider_handled:
+                            proposal = native_forward_ctx.propose_topk(list(local_tokens), top_k=native_logits_provider_topk)
+                            if proposal is not None:
+                                cand_ids, cand_scores = proposal
+                                if cand_ids and cand_scores and len(cand_ids) == len(cand_scores):
+                                    sparse_logits = [-1.0e9 for _ in range(tokenizer.get_vocab_size())]
+                                    for tid, score in zip(cand_ids, cand_scores):
+                                        if 0 <= int(tid) < len(sparse_logits):
+                                            sparse_logits[int(tid)] = float(score)
+                                    logits = sparse_logits
+                                    used_native_provider = True
+                                    native_logits_provider_calls += 1
+                                else:
+                                    native_logits_provider_failures += 1
+                                    if native_c_strict:
+                                        print("[session] native_c_strict= True provider_failed=invalid_topk")
+                                        contract_failed = True
+                                        break
+                            else:
+                                native_logits_provider_failures += 1
+                                if native_c_strict:
+                                    print("[session] native_c_strict= True provider_failed=no_proposal")
+                                    contract_failed = True
+                                    break
+
+                    if contract_failed:
                         break
-                    logits = step_result.logits
-                    if step == 0 and int(step_result.masked_tail or 0) > 0:
-                        print(f"[session] decode_contract_masked_tail= {int(step_result.masked_tail)}")
+
+                    if native_provider_sampled_id is not None:
+                        next_id = int(native_provider_sampled_id)
+                        generated.append(next_id)
+                        local_tokens.append(next_id)
+                        decode_optimizer.observe_token(local_tokens)
+                        engine.stream_token(next_id)
+                        adaptive_latency_ms = (time.perf_counter() - token_t0) * 1000.0
+                        reached_eos = adapter.eos_token_id is not None and next_id == adapter.eos_token_id
+                        phase1_orchestrator.commit(next_id, reached_eos)
+                        if reached_eos:
+                            break
+                        continue
+
+                    if not used_native_provider:
+                        step_result = phase1_orchestrator.step(local_tokens[-1])
+                        if not step_result.ok:
+                            print(
+                                f"[session] decode_contract_ok= False reason={step_result.reason} logits_len=0 expected_vocab={tokenizer.get_vocab_size()}"
+                            )
+                            contract_failed = True
+                            break
+                        logits = step_result.logits
+                        if step == 0 and int(step_result.masked_tail or 0) > 0:
+                            print(f"[session] decode_contract_masked_tail= {int(step_result.masked_tail)}")
                     if step == 0:
                         _logits_health(logits, step)
 
@@ -917,6 +1212,7 @@ def _generate(
                                     candidate_ids=[int(i) for i in cand_ids],
                                     base_scores=base_scores,
                                     blend=blend_alpha,
+                                    token_ids=list(local_tokens),
                                 )
                                 if blended is not None and len(blended) == len(cand_ids):
                                     for idx, score in zip(cand_ids, blended):
@@ -1018,14 +1314,57 @@ def _generate(
         decode_report["phase3_parity_fallbacks"] = int(phase3_stats.get("parity_fallbacks", 0) or 0)
         decode_report["native_forward_blend_calls"] = int(native_blend_calls)
         decode_report["native_forward_blend_failures"] = int(native_blend_failures)
+        decode_report["native_c_logits_provider_calls"] = int(native_logits_provider_calls)
+        decode_report["native_c_logits_provider_failures"] = int(native_logits_provider_failures)
         decode_report["flash_attn_calls"] = int((int(getattr(runtime_obj, "phase3_flash_attn_calls", 0) or 0) - flash_calls_before))
         decode_report["fused_attn_calls"] = int((int(getattr(runtime_obj, "phase3_fused_attn_calls", 0) or 0) - fused_calls_before))
         decode_report["scalar_attn_calls"] = int((int(getattr(runtime_obj, "phase3_scalar_attn_calls", 0) or 0) - scalar_calls_before))
         decode_report["cpu_attn_calls"] = int((int(getattr(runtime_obj, "phase3_cpu_attn_calls", 0) or 0) - cpu_calls_before))
+
+        timing_stats = runtime_timing_snapshot(runtime_obj)
+        if timing_stats:
+            forward_ms = float(timing_stats.get("forward_ms", 0.0) or 0.0)
+            forward_calls = int(timing_stats.get("forward_calls", 0) or 0)
+            attn_ms = float(timing_stats.get("attn_ms", 0.0) or 0.0)
+            attn_calls = int(timing_stats.get("attn_calls", 0) or 0)
+            kv_ms = float(timing_stats.get("kv_ms", 0.0) or 0.0)
+            kv_calls = int(timing_stats.get("kv_calls", 0) or 0)
+            decode_report["timing_forward_ms"] = round(forward_ms, 3)
+            decode_report["timing_forward_calls"] = forward_calls
+            decode_report["timing_forward_ms_per_call"] = round((forward_ms / forward_calls), 4) if forward_calls else 0.0
+            decode_report["timing_attn_ms"] = round(attn_ms, 3)
+            decode_report["timing_attn_calls"] = attn_calls
+            decode_report["timing_attn_ms_per_call"] = round((attn_ms / attn_calls), 4) if attn_calls else 0.0
+            decode_report["timing_kv_ms"] = round(kv_ms, 3)
+            decode_report["timing_kv_calls"] = kv_calls
+            decode_report["timing_kv_ms_per_call"] = round((kv_ms / kv_calls), 4) if kv_calls else 0.0
+
+        sampling_stats = sampling_timing_snapshot()
+        if sampling_stats:
+            sampling_ms = float(sampling_stats.get("sampling_ms", 0.0) or 0.0)
+            sampling_calls = int(sampling_stats.get("sampling_calls", 0) or 0)
+            decode_report["timing_sampling_ms"] = round(sampling_ms, 3)
+            decode_report["timing_sampling_calls"] = sampling_calls
+            decode_report["timing_sampling_ms_per_call"] = round((sampling_ms / sampling_calls), 4) if sampling_calls else 0.0
+
+        lowbit_stats = lowbit_projection_stats_snapshot()
+        decode_report["lowbit_fallback_gemm_calls"] = int(lowbit_stats.get("fallback_gemm_calls", 0) or 0)
+        decode_report["lowbit_fallback_matmul_calls"] = int(lowbit_stats.get("fallback_matmul_calls", 0) or 0)
+        decode_report["lowbit_fallback_gemm_ratio"] = round(float(lowbit_stats.get("fallback_gemm_ratio", 0.0) or 0.0), 6)
+        decode_report["lowbit_fallback_total_ratio"] = round(float(lowbit_stats.get("fallback_total_ratio", 0.0) or 0.0), 6)
+        if isinstance(lowbit_stats, dict) and ("gemm_dispatch_ms" in lowbit_stats):
+            gemm_ms = float(lowbit_stats.get("gemm_dispatch_ms", 0.0) or 0.0)
+            gemm_calls = int(lowbit_stats.get("gemm_dispatch_calls", 0) or 0)
+            decode_report["timing_gemm_dispatch_ms"] = round(gemm_ms, 3)
+            decode_report["timing_gemm_dispatch_calls"] = gemm_calls
+            decode_report["timing_gemm_dispatch_ms_per_call"] = round((gemm_ms / gemm_calls), 4) if gemm_calls else 0.0
         return text, len(generated), tps, decode_report, timed_out, contract_failed
 
     base_tokens = list(token_ids)
+    prefill_tokens_total = max(0, len(base_tokens) - 1)
+    prefill_start_ts = time.perf_counter()
     _prefill_runtime(runtime, base_tokens)
+    prefill_elapsed_sec = max(0.0, time.perf_counter() - prefill_start_ts)
     layer_count = len(getattr(runtime, "layers", []) or [])
     prefill_tokens = max(0, len(base_tokens) - 1)
     decode_budget = _resolve_decode_budget_seconds(prefill_tokens, layer_count)
@@ -1134,6 +1473,7 @@ def _generate(
             native_loop_override=None,
         )
 
+    decode_start_ts = time.perf_counter()
     text, gen_count, tps, report, timed_out_first, contract_failed_first = _decode_once(
         runtime_obj=runtime,
         local_tokens=list(base_tokens),
@@ -1366,17 +1706,23 @@ def _generate(
     _progress(show_progress, 100, "done", f"{gen_count} tok | {tps:.2f} tok/s")
     native_blend_calls_report = 0
     native_blend_failures_report = 0
+    native_logits_provider_calls_report = 0
+    native_logits_provider_failures_report = 0
     if report is not None:
         print("[session] structure_integrity_pass=", report.get("integrity_pass"))
         print("[session] structure_section_coverage=", round(float(report.get("section_coverage", 0.0)), 4))
         native_blend_calls_report = int(report.get("native_forward_blend_calls", 0) or 0)
         native_blend_failures_report = int(report.get("native_forward_blend_failures", 0) or 0)
+        native_logits_provider_calls_report = int(report.get("native_c_logits_provider_calls", 0) or 0)
+        native_logits_provider_failures_report = int(report.get("native_c_logits_provider_failures", 0) or 0)
         print("[session] flash_attn_calls=", int(report.get("flash_attn_calls", 0) or 0))
         print("[session] fused_attn_calls=", int(report.get("fused_attn_calls", 0) or 0))
         print("[session] scalar_attn_calls=", int(report.get("scalar_attn_calls", 0) or 0))
         print("[session] cpu_attn_calls=", int(report.get("cpu_attn_calls", 0) or 0))
     print("[session] native_forward_blend_calls=", native_blend_calls_report)
     print("[session] native_forward_blend_failures=", native_blend_failures_report)
+    print("[session] native_c_logits_provider_calls=", native_logits_provider_calls_report)
+    print("[session] native_c_logits_provider_failures=", native_logits_provider_failures_report)
     lowbit_stats = lowbit_projection_stats_snapshot()
     print("[session] lowbit_exec_calls=", int(lowbit_stats.get("calls", 0)))
     print("[session] lowbit_exec_lowbit_calls=", int(lowbit_stats.get("lowbit_calls", 0)))
@@ -1386,6 +1732,12 @@ def _generate(
     print("[session] lowbit_exec_int4_registered_failures=", int(lowbit_stats.get("int4_registered_failures", 0)))
     print("[session] lowbit_exec_fallback_gemm_calls=", int(lowbit_stats.get("fallback_gemm_calls", 0)))
     print("[session] lowbit_exec_fallback_matmul_calls=", int(lowbit_stats.get("fallback_matmul_calls", 0)))
+    fallback_gemm_ratio = float(lowbit_stats.get("fallback_gemm_ratio", 0.0) or 0.0)
+    fallback_total_ratio = float(lowbit_stats.get("fallback_total_ratio", 0.0) or 0.0)
+    print("[session] lowbit_exec_fallback_gemm_ratio=", round(fallback_gemm_ratio, 6))
+    print("[session] lowbit_exec_fallback_gemm_ratio_pct=", round(fallback_gemm_ratio * 100.0, 3))
+    print("[session] lowbit_exec_fallback_total_ratio=", round(fallback_total_ratio, 6))
+    print("[session] lowbit_exec_fallback_total_ratio_pct=", round(fallback_total_ratio * 100.0, 3))
     int4_cached_stats = lowbit_stats.get("int4_cached_bridge", {}) if isinstance(lowbit_stats, dict) else {}
     if isinstance(int4_cached_stats, dict) and int4_cached_stats:
         print("[session] int4_cached_dispatch_calls=", int(int4_cached_stats.get("dispatch_calls", 0)))
@@ -1394,6 +1746,45 @@ def _generate(
         print("[session] int4_cached_register_calls=", int(int4_cached_stats.get("register_calls", 0)))
         print("[session] int4_cached_register_reuse=", int(int4_cached_stats.get("register_reuse", 0)))
         print("[session] int4_cached_register_evictions=", int(int4_cached_stats.get("register_evictions", 0)))
+
+    timing_stats = runtime_timing_snapshot(runtime)
+    if timing_stats:
+        forward_ms = float(timing_stats.get("forward_ms", 0.0) or 0.0)
+        forward_calls = int(timing_stats.get("forward_calls", 0) or 0)
+        attn_ms = float(timing_stats.get("attn_ms", 0.0) or 0.0)
+        attn_calls = int(timing_stats.get("attn_calls", 0) or 0)
+        kv_ms = float(timing_stats.get("kv_ms", 0.0) or 0.0)
+        kv_calls = int(timing_stats.get("kv_calls", 0) or 0)
+        print("[session] timing_forward_ms=", round(forward_ms, 3))
+        print("[session] timing_forward_ms_per_call=", round((forward_ms / forward_calls), 4) if forward_calls else 0.0)
+        print("[session] timing_attn_ms=", round(attn_ms, 3))
+        print("[session] timing_attn_ms_per_call=", round((attn_ms / attn_calls), 4) if attn_calls else 0.0)
+        print("[session] timing_kv_ms=", round(kv_ms, 3))
+        print("[session] timing_kv_ms_per_call=", round((kv_ms / kv_calls), 4) if kv_calls else 0.0)
+
+    sampling_stats = sampling_timing_snapshot()
+    if sampling_stats:
+        sampling_ms = float(sampling_stats.get("sampling_ms", 0.0) or 0.0)
+        sampling_calls = int(sampling_stats.get("sampling_calls", 0) or 0)
+        print("[session] timing_sampling_ms=", round(sampling_ms, 3))
+        print("[session] timing_sampling_ms_per_call=", round((sampling_ms / sampling_calls), 4) if sampling_calls else 0.0)
+
+    compile_status = torch_compile_system_status()
+    if compile_status:
+        print("[session] torch_compile_enabled=", int(bool(compile_status.get("enabled", False))))
+        print("[session] torch_compile_backend_requested=", str(compile_status.get("backend_requested", "")))
+        print("[session] torch_compile_mode=", str(compile_status.get("mode", "")))
+        print("[session] torch_compile_triton_available=", int(bool(compile_status.get("triton_available", False))))
+        print("[session] torch_compile_inductor_ready=", int(bool(compile_status.get("inductor_ready", False))))
+        print("[session] torch_compile_inductor_reason=", str(compile_status.get("inductor_reason", "")))
+        print("[session] torch_compile_runtime_fallback_count=", int(compile_status.get("runtime_fallback_count", 0) or 0))
+        print("[session] torch_compile_compiled_backends=", str(compile_status.get("compiled_backends", {})))
+
+    if isinstance(lowbit_stats, dict) and ("gemm_dispatch_ms" in lowbit_stats):
+        gemm_ms = float(lowbit_stats.get("gemm_dispatch_ms", 0.0) or 0.0)
+        gemm_calls = int(lowbit_stats.get("gemm_dispatch_calls", 0) or 0)
+        print("[session] timing_gemm_dispatch_ms=", round(gemm_ms, 3))
+        print("[session] timing_gemm_dispatch_ms_per_call=", round((gemm_ms / gemm_calls), 4) if gemm_calls else 0.0)
 
     if phase5_observer is not None:
         try:
@@ -1406,6 +1797,15 @@ def _generate(
             )
         except Exception:
             pass
+    decode_elapsed_sec = max(0.0, time.perf_counter() - decode_start_ts)
+    _store_turn_meter(
+        runtime,
+        int(gen_count),
+        float(tps),
+        prefill_tokens=int(prefill_tokens_total),
+        prefill_elapsed_sec=float(prefill_elapsed_sec),
+        decode_elapsed_sec=float(decode_elapsed_sec),
+    )
     return text
 
 
@@ -1438,6 +1838,14 @@ def main() -> None:
     parser.add_argument("--structure-guard-strictness", type=float, default=0.72)
     parser.add_argument("--decode-opt-mode", default="optimized", choices=["stable", "optimized"])
     parser.add_argument("--enable-3bit-runtime-module", action="store_true")
+    parser.add_argument("--native-full-transformer", action="store_true", help="Enable full transformer native-forward scoring path in C")
+    parser.add_argument("--native-full-layer-limit", type=int, default=0, help="0=all detected native layers, >0 limits native full-forward layers")
+    parser.add_argument("--native-full-context-limit", type=int, default=0, help="0=full context, >0 limits context tokens used by native full-forward")
+    parser.add_argument("--native-c-logits-provider", action="store_true", help="Use native C top-k logits provider during decode")
+    parser.add_argument("--native-c-logits-topk", type=int, default=64, help="Top-k candidate count from native C logits provider")
+    parser.add_argument("--native-c-strict", action="store_true", help="Require native C logits provider during decode; fail instead of Python fallback")
+    parser.add_argument("--enable-anf", action="store_true", help="Enable ANF telemetry and routing")
+    parser.add_argument("--anf-mode", default="shadow", choices=["off", "shadow", "active"], help="ANF routing mode when enabled")
     parser.add_argument(
         "--allow-semantic-rescue",
         action="store_true",
@@ -1476,6 +1884,15 @@ def main() -> None:
         os.getenv("VSPEC_CHAT_PROTOTYPE", "0").strip().lower() in {"1", "true", "yes", "on"}
         and os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
     )
+    anf_enabled_env = os.getenv("VSPEC_ENABLE_ANF", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if args.enable_anf:
+        os.environ["VSPEC_ENABLE_ANF"] = "1"
+        anf_enabled_env = True
+    if anf_enabled_env:
+        os.environ.setdefault("VSPEC_ANF_MODE", str(args.anf_mode))
+        os.environ.setdefault("VSPEC_ANF_TCC_ENABLE", "1")
+        os.environ.setdefault("VSPEC_ANF_MAX_HOT_RATIO", "0.12")
+        os.environ.setdefault("VSPEC_ANF_ACTIVATION_THRESHOLD", "1.05")
     os.environ.setdefault("VSPEC_CUBLAS_CACHE_SIZE", "0" if prototype_anf_mode else "16")
     os.environ.setdefault("VSPEC_INT4_BRIDGE_CACHE_CAP", "256")
     os.environ.setdefault("VSPEC_DISABLE_PY_KV_SHADOW", "1")
@@ -1486,7 +1903,22 @@ def main() -> None:
     os.environ.setdefault("VSPEC_C_SAMPLER_REQUIRED", "1")
     os.environ.setdefault("VSPEC_USE_C_SAMPLER", "1")
     os.environ.setdefault("VSPEC_PREFILL_CORE_SCHED", "1")
+    os.environ.setdefault("VSPEC_NATIVE_PREFILL_COMPUTE", "1")
+    os.environ.setdefault("VSPEC_NATIVE_PREFILL_COMPUTE_MODE", "mirror")
+    os.environ.setdefault("VSPEC_PREFILL_FULL_GRAPH", "1")
     os.environ.setdefault("VSPEC_ENABLE_PHASE5_DAEMON", "1")
+    if args.native_full_transformer:
+        os.environ["VSPEC_NATIVE_FULL_TRANSFORMER"] = "1"
+    if int(args.native_full_layer_limit) > 0:
+        os.environ["VSPEC_NATIVE_FULL_LAYER_LIMIT"] = str(int(args.native_full_layer_limit))
+    if int(args.native_full_context_limit) > 0:
+        os.environ["VSPEC_NATIVE_FULL_CONTEXT_LIMIT"] = str(int(args.native_full_context_limit))
+    if args.native_c_logits_provider:
+        os.environ["VSPEC_NATIVE_LOGITS_PROVIDER"] = "1"
+    if int(args.native_c_logits_topk) > 0:
+        os.environ["VSPEC_NATIVE_LOGITS_PROVIDER_TOPK"] = str(int(args.native_c_logits_topk))
+    if args.native_c_strict:
+        os.environ["VSPEC_NATIVE_C_STRICT"] = "1"
     if os.getenv("VSPEC_CUBLAS_CACHE_SIZE", "16").strip() in {"0", "off", "OFF"}:
         os.environ.setdefault("VSPEC_INT4_COMPUTE_MODE", "native")
     if (
@@ -1498,6 +1930,7 @@ def main() -> None:
 
     random.seed(args.seed)
     show_progress = not args.no_progress
+    claude_style = _claude_style_enabled()
 
     _progress(show_progress, 5, "snapshot", "finding snapshot")
     snapshot = find_snapshot_dir(Path(args.model_dir))
@@ -1568,23 +2001,50 @@ def main() -> None:
     if native_full_enabled and native_bypass_runtime and native_model_file and native_exe is not None:
         _progress(show_progress, 100, "ready", "full-native-c session")
         print("[session] full_native_c_session= on (runtime bootstrap skipped)")
-        print("[session] type /exit to quit")
+        _print_chat_intro(
+            claude_style=claude_style,
+            model_dir=str(args.model_dir),
+            device=str(args.device),
+            max_tokens=int(args.max_tokens),
+            stream_enabled=(not args.no_stream),
+        )
         while True:
             try:
-                prompt = input("you> ").strip()
+                prompt = input(_user_prompt_label(claude_style)).strip()
             except (KeyboardInterrupt, EOFError):
                 print("\n[session] bye")
                 break
             if not prompt:
                 continue
+            if prompt.lower() in {"/help", "help"}:
+                _print_chat_help(claude_style)
+                continue
             if prompt.lower() in {"/exit", "exit", "quit"}:
                 print("[session] bye")
                 break
             timeout_s = float(args.max_decode_seconds) if float(args.max_decode_seconds) > 0.0 else 90.0
-            out = _run_native_turn(native_exe, native_model_file, prompt, int(args.max_tokens), timeout_s)
+            wait_ticker = _WaitingTicker(
+                enabled=(claude_style and args.no_stream and (not show_progress)),
+                label="Thinking",
+            )
+            wait_ticker.start()
+            try:
+                out = _run_native_turn(native_exe, native_model_file, prompt, int(args.max_tokens), timeout_s)
+            except KeyboardInterrupt:
+                wait_ticker.stop(status="Interrupted")
+                print("[session] turn interrupted")
+                continue
+            except Exception:
+                wait_ticker.stop(status="Failed")
+                raise
+            wait_ticker.stop(status="Done")
             if not out:
                 out = "[vspec-decode-error] Generation failed on this turn; native full-C path returned no output."
-            print("assistant>", out)
+            if claude_style:
+                print("assistant")
+                print(out)
+            else:
+                print("assistant>", out)
         return
     _progress(show_progress, 15, "config", "loading config/tokenizer")
     config = read_config(snapshot)
@@ -1739,7 +2199,13 @@ def main() -> None:
         print("[session] fused_ops_mul=", False)
 
     _progress(show_progress, 100, "ready", "model loaded; enter prompt")
-    print("[session] type /exit to quit")
+    _print_chat_intro(
+        claude_style=claude_style,
+        model_dir=str(args.model_dir),
+        device=str(args.device),
+        max_tokens=int(args.max_tokens),
+        stream_enabled=(not args.no_stream),
+    )
 
     torch_runtime_cache = {"value": None, "attempted": False}
     native_safe_runtime_cache = {"value": None, "attempted": False}
@@ -1790,6 +2256,8 @@ def main() -> None:
     phase5_status = phase5_daemon.status()
     print("[session] phase5_daemon_enabled=", int(bool(phase5_status.get("enabled", False))))
     print("[session] phase5_daemon_loop_available=", int(bool(phase5_status.get("loop_available", False))))
+    print("[session] phase5_daemon_loop_requested=", int(bool(phase5_status.get("native_cpp_loop_requested", False))))
+    print("[session] phase5_daemon_loop_enabled=", int(bool(phase5_status.get("native_cpp_loop_enabled", False))))
     print("[session] phase5_daemon_forward_ctx_available=", int(bool(phase5_status.get("forward_ctx_available", False))))
 
     def _observe_phase5_turn(turn_report: Phase5TurnReport) -> None:
@@ -1803,11 +2271,14 @@ def main() -> None:
     try:
         while True:
             try:
-                prompt = input("you> ").strip()
+                prompt = input(_user_prompt_label(claude_style)).strip()
             except (KeyboardInterrupt, EOFError):
                 print("\n[session] bye")
                 break
             if not prompt:
+                continue
+            if prompt.lower() in {"/help", "help"}:
+                _print_chat_help(claude_style)
                 continue
             if prompt.lower() in {"/exit", "exit", "quit"}:
                 print("[session] bye")
@@ -1815,43 +2286,62 @@ def main() -> None:
 
             lang_mode = args.lang if args.lang != "auto" else _detect_lang(prompt)
             _progress(show_progress, 1, "request", f"lang={lang_mode}")
-            out = _generate(
-                prompt=prompt,
-                tokenizer=tokenizer,
-                adapter=adapter,
-                runtime=runtime,
-                tok_cfg=tok_cfg,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_k=top_k,
-                greedy=args.greedy,
-                lang_mode=lang_mode,
-                lang_top_n=lang_top_n,
-                repetition_penalty=repetition_penalty,
-                repeat_window=repeat_window,
-                no_repeat_ngram=no_repeat_ngram,
-                chat_format=args.chat_format,
-                stream=(not args.no_stream),
-                show_progress=show_progress,
-                disable_language_guard=args.disable_language_guard,
-                language_guard_strictness=args.language_guard_strictness,
-                prioritize_english=(not args.no_prioritize_english),
-                structure_guard_strictness=args.structure_guard_strictness,
-                disable_structure_guard=args.disable_structure_guard,
-                decode_opt_mode=args.decode_opt_mode,
-                threebit_module=threebit_module,
-                allow_semantic_rescue=args.allow_semantic_rescue,
-                max_decode_seconds=args.max_decode_seconds,
-                max_retry_seconds=args.max_retry_seconds,
-                native_safe_fallback_builder=_native_safe_fallback_builder,
-                torch_timeout_fallback_builder=_torch_timeout_fallback_builder,
-                native_loop_handle=phase5_daemon.loop_handle,
-                native_forward_ctx=phase5_daemon.forward_ctx,
-                native_model_file=native_model_file,
-                phase5_observer=_observe_phase5_turn,
+            wait_ticker = _WaitingTicker(
+                enabled=(claude_style and args.no_stream and (not show_progress)),
+                label="Thinking",
             )
+            wait_ticker.start()
+            try:
+                out = _generate(
+                    prompt=prompt,
+                    tokenizer=tokenizer,
+                    adapter=adapter,
+                    runtime=runtime,
+                    tok_cfg=tok_cfg,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_k=top_k,
+                    greedy=args.greedy,
+                    lang_mode=lang_mode,
+                    lang_top_n=lang_top_n,
+                    repetition_penalty=repetition_penalty,
+                    repeat_window=repeat_window,
+                    no_repeat_ngram=no_repeat_ngram,
+                    chat_format=args.chat_format,
+                    stream=(not args.no_stream),
+                    show_progress=show_progress,
+                    disable_language_guard=args.disable_language_guard,
+                    language_guard_strictness=args.language_guard_strictness,
+                    prioritize_english=(not args.no_prioritize_english),
+                    structure_guard_strictness=args.structure_guard_strictness,
+                    disable_structure_guard=args.disable_structure_guard,
+                    decode_opt_mode=args.decode_opt_mode,
+                    threebit_module=threebit_module,
+                    allow_semantic_rescue=args.allow_semantic_rescue,
+                    max_decode_seconds=args.max_decode_seconds,
+                    max_retry_seconds=args.max_retry_seconds,
+                    native_safe_fallback_builder=_native_safe_fallback_builder,
+                    torch_timeout_fallback_builder=_torch_timeout_fallback_builder,
+                    native_loop_handle=phase5_daemon.loop_handle,
+                    native_forward_ctx=phase5_daemon.forward_ctx,
+                    native_model_file=native_model_file,
+                    phase5_observer=_observe_phase5_turn,
+                )
+            except KeyboardInterrupt:
+                wait_ticker.stop(status="Interrupted")
+                print("[session] turn interrupted")
+                continue
+            except Exception:
+                wait_ticker.stop(status="Failed")
+                raise
+            wait_ticker.stop(status="Done")
             if args.no_stream:
-                print("assistant>", out)
+                if claude_style:
+                    print("assistant")
+                    print(out)
+                else:
+                    print("assistant>", out)
+            _print_turn_meter(runtime, claude_style)
     finally:
         phase5_daemon.close()
 

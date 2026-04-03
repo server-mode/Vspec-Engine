@@ -14,6 +14,13 @@ class Phase5TurnReport:
     generated_tokens: int
 
 
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
 class SessionCoreDaemonSupervisor:
     """Phase 5: persistent C-handle supervisor for session runtime.
 
@@ -26,10 +33,16 @@ class SessionCoreDaemonSupervisor:
         self.native_model_file = str(native_model_file) if native_model_file else None
         self.seed = int(seed)
 
-        self.enabled = str(os.getenv("VSPEC_ENABLE_PHASE5_DAEMON", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        self.native_cpp_loop_enabled = str(os.getenv("VSPEC_NATIVE_CPP_LOOP", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        self.native_forward_enabled = str(os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        self.forward_ctx_enabled = str(os.getenv("VSPEC_PHASE5_DAEMON_FORWARD_CTX", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        self.enabled = _env_true("VSPEC_ENABLE_PHASE5_DAEMON", default=True)
+        self.native_cpp_loop_requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
+        self.torch_forward_enabled = _env_true("VSPEC_TORCH_FORWARD", default=False)
+        self.native_cpp_loop_allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
+        self.native_cpp_loop_enabled = bool(
+            self.native_cpp_loop_requested
+            and (not self.torch_forward_enabled or self.native_cpp_loop_allow_with_torch)
+        )
+        self.native_forward_enabled = _env_true("VSPEC_NATIVE_FORWARD_BLEND", default=True)
+        self.forward_ctx_enabled = _env_true("VSPEC_PHASE5_DAEMON_FORWARD_CTX", default=True)
 
         try:
             self.max_consecutive_failures = max(1, int(os.getenv("VSPEC_PHASE5_DAEMON_MAX_CONSEC_FAIL", "3") or "3"))
@@ -108,6 +121,9 @@ class SessionCoreDaemonSupervisor:
         return {
             "enabled": bool(self.enabled),
             "loop_available": bool(self.loop_handle is not None and self.loop_handle.available),
+            "native_cpp_loop_requested": bool(self.native_cpp_loop_requested),
+            "native_cpp_loop_enabled": bool(self.native_cpp_loop_enabled),
+            "torch_forward_enabled": bool(self.torch_forward_enabled),
             "forward_ctx_available": bool(self.forward_ctx is not None and self.forward_ctx.available),
             "turns_total": int(self.turns_total),
             "turns_timeout": int(self.turns_timeout),

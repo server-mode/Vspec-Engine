@@ -142,6 +142,14 @@ class VspecRunArgs:
     lang: str = "auto"
     stream: bool = False
     unsafe_low_layers: bool = False
+    enable_anf: bool = False
+    anf_mode: str = "shadow"
+    native_full_transformer: bool = False
+    native_full_layer_limit: int = 0
+    native_full_context_limit: int = 0
+    native_c_logits_provider: bool = False
+    native_c_logits_topk: int = 64
+    native_c_strict: bool = False
 
 
 def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
@@ -195,8 +203,28 @@ def _build_chat_cmd(args: VspecRunArgs, interactive: bool) -> list[str]:
     if args.unsafe_low_layers:
         cmd.append("--unsafe-low-layers")
 
+    if args.enable_anf:
+        cmd.append("--enable-anf")
+        cmd.extend(["--anf-mode", str(args.anf_mode)])
+
+    if args.native_full_transformer:
+        cmd.append("--native-full-transformer")
+    if int(args.native_full_layer_limit) > 0:
+        cmd.extend(["--native-full-layer-limit", str(int(args.native_full_layer_limit))])
+    if int(args.native_full_context_limit) > 0:
+        cmd.extend(["--native-full-context-limit", str(int(args.native_full_context_limit))])
+
+    if args.native_c_logits_provider:
+        cmd.append("--native-c-logits-provider")
+        if int(args.native_c_logits_topk) > 0:
+            cmd.extend(["--native-c-logits-topk", str(int(args.native_c_logits_topk))])
+    if args.native_c_strict:
+        cmd.append("--native-c-strict")
+
     if interactive:
         cmd.append("--no-stream")
+        if _is_true_env("VSPEC_CHAT_CLAUDE_STYLE", default=False) and (not _is_true_env("VSPEC_CHAT_SHOW_PROGRESS", default=False)):
+            cmd.append("--no-progress")
     else:
         if str(args.prompts_file or "").strip():
             cmd.extend(["--prompts-file", str(args.prompts_file)])
