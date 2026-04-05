@@ -261,6 +261,21 @@ def _torch_env_true(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _torch_forward_force_on_native_device() -> bool:
+    return _torch_env_true("VSPEC_TORCH_FORWARD_FORCE_ON_CUDA_NATIVE", default=False)
+
+
+def _qwen35_torch_forward_enabled(runtime_obj=None) -> bool:
+    if torch is None or not torch.cuda.is_available():
+        return False
+    if not _torch_env_true("VSPEC_TORCH_FORWARD", default=True):
+        return False
+    if runtime_obj is not None and bool(getattr(runtime_obj, "use_native_cuda_norm", False)):
+        if not _torch_forward_force_on_native_device():
+            return False
+    return True
+
+
 def _torch_compile_enabled() -> bool:
     global _TORCH_COMPILE_ENABLED
     if _TORCH_COMPILE_ENABLED is None:
@@ -1300,6 +1315,14 @@ class GenericTransformerRuntime:
             kv_t0 = time.perf_counter() if timing_on else 0.0
             mirror_layer = _mirrors[idx] if (_mirrors is not None and idx < len(_mirrors)) else None
 
+            # Keep Python-side cache metadata aligned even in mirror-only mode.
+            if len(self.cache_k) <= idx:
+                self.cache_k.extend([None] * (idx + 1 - len(self.cache_k)))
+            if len(self.cache_v) <= idx:
+                self.cache_v.extend([None] * (idx + 1 - len(self.cache_v)))
+            if len(self.cache_len) <= idx:
+                self.cache_len.extend([0] * (idx + 1 - len(self.cache_len)))
+
             mirror_only = _mirror_only_mode and (mirror_layer is not None)
             keys = None
             values = None
@@ -1318,6 +1341,7 @@ class GenericTransformerRuntime:
                         if mirror_keys is not None and mirror_values is not None and int(mirror_keys.shape[0]) == used_len:
                             keys = mirror_keys
                             values = mirror_values
+                            self.cache_len[idx] = int(max(0, used_len))
                         else:
                             mirror_only = False
                     except Exception:
@@ -1326,13 +1350,6 @@ class GenericTransformerRuntime:
                     mirror_only = False
 
             if not mirror_only:
-                if len(self.cache_k) <= idx:
-                    self.cache_k.extend([None] * (idx + 1 - len(self.cache_k)))
-                if len(self.cache_v) <= idx:
-                    self.cache_v.extend([None] * (idx + 1 - len(self.cache_v)))
-                if len(self.cache_len) <= idx:
-                    self.cache_len.extend([0] * (idx + 1 - len(self.cache_len)))
-
                 if self.cache_k[idx] is None or self.cache_v[idx] is None:
                     init_cap = 16
                     k_buf = np.empty((init_cap, self.num_kv_heads, self.head_dim), dtype=np.float32)
@@ -1381,6 +1398,8 @@ class GenericTransformerRuntime:
                 keys = np.ascontiguousarray(k[None, :, :], dtype=np.float32)
                 values = np.ascontiguousarray(v[None, :, :], dtype=np.float32)
                 used_len = int(keys.shape[0])
+
+            self.cache_len[idx] = int(max(0, used_len))
 
             if timing_on:
                 timing_stats["kv_ms"] += (time.perf_counter() - kv_t0) * 1000.0
@@ -2028,7 +2047,6 @@ class Qwen35Runtime:
             # Embed
             x = self._torch_embed[int(token_id)]  # [hidden_dim], float16
 
-            kv_attn_idx = 0  # index into KV cache (only for full_attention layers)
             ssm_idx = 0  # index into SSM state arrays
             linear_scale = 1.0 / max(1.0, float(self.linear_key_head_dim) ** 0.5)
             qkv_kernel = self._torch_qkv_kernel_fn or _torch_kernel_qkv
@@ -2070,20 +2088,26 @@ class Qwen35Runtime:
                     q, k = self._torch_apply_partial_rotary(q, k, self.position)
 
                     # Write to pre-allocated KV cache
+                    layer_k_cache = self._torch_kv_k[idx]
+                    layer_v_cache = self._torch_kv_v[idx]
+                    if layer_k_cache is None or layer_v_cache is None:
+                        raise RuntimeError(f"qwen35 torch kv cache missing for attention layer idx={idx}")
+
                     used = self._torch_kv_used[idx]
                     if used >= self._torch_kv_max_len:
                         # Shift cache left by 1 (rolling window)
-                        self._torch_kv_k[kv_attn_idx][:-1] = self._torch_kv_k[kv_attn_idx][1:].clone()
-                        self._torch_kv_v[kv_attn_idx][:-1] = self._torch_kv_v[kv_attn_idx][1:].clone()
+                        layer_k_cache[:-1] = layer_k_cache[1:].clone()
+                        layer_v_cache[:-1] = layer_v_cache[1:].clone()
                         used = self._torch_kv_max_len - 1
-                    self._torch_kv_k[kv_attn_idx][used] = k
-                    self._torch_kv_v[kv_attn_idx][used] = v
+                    layer_k_cache[used] = k
+                    layer_v_cache[used] = v
                     self._torch_kv_used[idx] = used + 1
                     used_len = self._torch_kv_used[idx]
+                    self.cache_len[idx] = int(max(0, used_len))
 
                     # Batched SDPA attention (replaces per-head loop)
-                    keys_slice = self._torch_kv_k[kv_attn_idx][:used_len]   # [T, nkv, hd]
-                    vals_slice = self._torch_kv_v[kv_attn_idx][:used_len]    # [T, nkv, hd]
+                    keys_slice = layer_k_cache[:used_len]   # [T, nkv, hd]
+                    vals_slice = layer_v_cache[:used_len]    # [T, nkv, hd]
 
                     # GQA expansion: [nkv, T, hd] → [nh, T, hd]
                     group = max(1, self.num_heads // self.num_kv_heads)
@@ -2105,7 +2129,6 @@ class Qwen35Runtime:
 
                     # Output projection
                     attn_out_vec = torch.nn.functional.linear(attn.reshape(-1), ld["wo"])
-                    kv_attn_idx += 1
 
                 else:
                     # ──── SSM/Mamba Layer (torch) ────
@@ -2172,6 +2195,8 @@ class Qwen35Runtime:
                         warmup_scale = min(1.0, float(self.position + 1) / float(max(1, self.ssm_warmup_tokens)))
                         attn_out_vec = attn_out_vec * warmup_scale
 
+                    self.cache_len[idx] = int(max(0, min(self.position + 1, self._torch_kv_max_len)))
+
                     ssm_idx += 1
 
                 # Residual connection (clean — no _dynamic_clamp_std_vec)
@@ -2191,7 +2216,16 @@ class Qwen35Runtime:
 
             # Final norm + LM head
             x_last = self._torch_rms_norm(x, self._torch_final_norm, self.rms_eps)
-            logits = torch.nn.functional.linear(x_last.float(), self._torch_lm_head.float())
+            lm = self._torch_lm_head.float()
+            x_last_f32 = x_last.float()
+            if lm.dim() == 2 and lm.shape[1] == x_last_f32.shape[-1]:
+                logits = torch.nn.functional.linear(x_last_f32, lm)
+            elif lm.dim() == 2 and lm.shape[0] == x_last_f32.shape[-1]:
+                logits = x_last_f32 @ lm
+            else:
+                raise RuntimeError(
+                    f"qwen35 torch lm_head shape mismatch: x_last={tuple(x_last_f32.shape)} lm_head={tuple(lm.shape)}"
+                )
 
             # Clean logits — NO _stabilize_logits (which was corrupting output)
             return logits.cpu().numpy().astype(np.float32)
@@ -2337,12 +2371,9 @@ class Qwen35Runtime:
                     timing_stats["attn_ms"] += (time.perf_counter() - attn_t0) * 1000.0
                     timing_stats["attn_calls"] += 1
 
-            if timing_on:
-                timing_stats["attn_ms"] += (time.perf_counter() - attn_t0) * 1000.0
-                timing_stats["attn_calls"] += 1
-
                 attn = attn * (1.0 / (1.0 + np.exp(-gate.astype(np.float32, copy=False))))
                 attn_out = _linear(attn.reshape(-1), layer.wo, "wo")
+
             else:
                 assert layer.wqkv is not None and layer.wgate is not None and layer.ssm_alpha is not None and layer.ssm_beta is not None
                 assert layer.ssm_a is not None and layer.ssm_conv1d is not None and layer.ssm_dt is not None and layer.ssm_norm is not None and layer.ssm_out is not None
@@ -2464,11 +2495,7 @@ class Qwen35Runtime:
             chunk_size = max(1, int(os.getenv("VSPEC_PREFILL_CHUNK_TOKENS", "64") or "64"))
         except Exception:
             chunk_size = 64
-        use_torch_forward = (
-            torch is not None
-            and torch.cuda.is_available()
-            and str(os.getenv("VSPEC_TORCH_FORWARD", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        )
+        use_torch_forward = _qwen35_torch_forward_enabled(self)
         forward = self._forward_token_torch if use_torch_forward else self._forward_token
         try:
             ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
@@ -2489,11 +2516,7 @@ class Qwen35Runtime:
     def forward_logits(self, token_ids: list[int]) -> list[float]:
         if np is None or not token_ids:
             return []
-        _use_torch = (
-            torch is not None
-            and torch.cuda.is_available()
-            and str(os.getenv("VSPEC_TORCH_FORWARD", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        )
+        _use_torch = _qwen35_torch_forward_enabled(self)
         if _use_torch:
             logits = self._forward_token_torch(int(token_ids[-1]), return_logits=True)
         else:
@@ -2508,11 +2531,7 @@ class Qwen35Runtime:
     def forward_logits_np(self, token_ids: list[int]) -> "np.ndarray":
         if np is None or not token_ids:
             return np.array([], dtype=np.float32)
-        _use_torch = (
-            torch is not None
-            and torch.cuda.is_available()
-            and str(os.getenv("VSPEC_TORCH_FORWARD", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        )
+        _use_torch = _qwen35_torch_forward_enabled(self)
         if _use_torch:
             if not getattr(self, '_forward_path_logged', False):
                 print(f"[vspec-torch] forward_logits_np → torch path (VSPEC_TORCH_FORWARD=1, _torch_ready={self._torch_ready})")
@@ -4581,10 +4600,26 @@ def build_generic_runtime(
     has_gguf = getattr(any_weight, "source_format", "safetensors") == "gguf"
 
     # Phase 3: VSPEC_TORCH_FORWARD=1 → redirect cuda to optimized torch runtime
-    _torch_forward_enabled = str(os.getenv("VSPEC_TORCH_FORWARD", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    _torch_device_match = device in {"torch-cuda", "cuda", "cuda-native"} if _torch_forward_enabled else device == "torch-cuda"
+    _torch_forward_enabled = _torch_env_true("VSPEC_TORCH_FORWARD", default=False)
+    _torch_forward_force_native = _torch_forward_force_on_native_device()
+    if device == "torch-cuda":
+        _torch_device_match = True
+    elif device in {"cuda", "cuda-native"}:
+        _torch_device_match = bool(_torch_forward_enabled and _torch_forward_force_native)
+    else:
+        _torch_device_match = False
 
-    if _torch_device_match and (not has_gguf) and torch is not None and torch.cuda.is_available():
+    if _torch_forward_enabled and device in {"cuda", "cuda-native"} and (not _torch_forward_force_native):
+        print("[vspec-runtime] torch-forward on cuda/cuda-native is disabled by default; set VSPEC_TORCH_FORWARD_FORCE_ON_CUDA_NATIVE=1 to enable")
+
+    _disable_generic_torch_runtime = bool(
+        _torch_device_match and _torch_env_true("VSPEC_DISABLE_GENERIC_TORCH_RUNTIME", default=False)
+    )
+
+    if _torch_device_match and _disable_generic_torch_runtime:
+        print("[vspec-runtime] generic torch runtime disabled by VSPEC_DISABLE_GENERIC_TORCH_RUNTIME=1")
+
+    if _torch_device_match and (not _disable_generic_torch_runtime) and (not has_gguf) and torch is not None and torch.cuda.is_available():
         print(f"[vspec-runtime] Phase 2-4 torch forward enabled (VSPEC_TORCH_FORWARD={_torch_forward_enabled}, device={device})")
         runtime = _load_generic_transformer_torch(runtime_config, weight_index, max_layers, "cuda", progress_cb)
         if runtime is not None:

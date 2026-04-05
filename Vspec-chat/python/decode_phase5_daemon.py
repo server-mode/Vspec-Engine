@@ -21,6 +21,21 @@ def _env_true(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _runtime_uses_torch_forward(runtime_obj: Any) -> bool:
+    if runtime_obj is None:
+        return False
+    cls_name = type(runtime_obj).__name__
+    if cls_name == "GenericTransformerRuntimeTorch":
+        return True
+    if cls_name == "Qwen35Runtime":
+        if not _env_true("VSPEC_TORCH_FORWARD", default=True):
+            return False
+        if bool(getattr(runtime_obj, "use_native_cuda_norm", False)) and (not _env_true("VSPEC_TORCH_FORWARD_FORCE_ON_CUDA_NATIVE", default=False)):
+            return False
+        return True
+    return False
+
+
 class SessionCoreDaemonSupervisor:
     """Phase 5: persistent C-handle supervisor for session runtime.
 
@@ -35,13 +50,21 @@ class SessionCoreDaemonSupervisor:
 
         self.enabled = _env_true("VSPEC_ENABLE_PHASE5_DAEMON", default=True)
         self.native_cpp_loop_requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
-        self.torch_forward_enabled = _env_true("VSPEC_TORCH_FORWARD", default=False)
+        self.torch_forward_requested = _env_true("VSPEC_TORCH_FORWARD", default=False)
+        self.torch_forward_enabled = bool(_runtime_uses_torch_forward(self.runtime))
         self.native_cpp_loop_allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
         self.native_cpp_loop_enabled = bool(
             self.native_cpp_loop_requested
             and (not self.torch_forward_enabled or self.native_cpp_loop_allow_with_torch)
         )
         self.native_forward_enabled = _env_true("VSPEC_NATIVE_FORWARD_BLEND", default=True)
+        self.native_logits_provider_enabled = _env_true("VSPEC_NATIVE_LOGITS_PROVIDER", default=False)
+        self.native_prefill_compute_enabled = _env_true("VSPEC_NATIVE_PREFILL_COMPUTE", default=True)
+        self.native_forward_ctx_needed = bool(
+            self.native_forward_enabled
+            or self.native_logits_provider_enabled
+            or self.native_prefill_compute_enabled
+        )
         self.forward_ctx_enabled = _env_true("VSPEC_PHASE5_DAEMON_FORWARD_CTX", default=True)
 
         try:
@@ -71,7 +94,7 @@ class SessionCoreDaemonSupervisor:
             except Exception:
                 self.loop_handle = None
 
-        if self.forward_ctx_enabled and self.native_forward_enabled and self.native_model_file:
+        if self.forward_ctx_enabled and self.native_forward_ctx_needed and self.native_model_file:
             try:
                 seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(self.seed))
                 seed_val = int(seed_raw)
@@ -123,6 +146,7 @@ class SessionCoreDaemonSupervisor:
             "loop_available": bool(self.loop_handle is not None and self.loop_handle.available),
             "native_cpp_loop_requested": bool(self.native_cpp_loop_requested),
             "native_cpp_loop_enabled": bool(self.native_cpp_loop_enabled),
+            "torch_forward_requested": bool(self.torch_forward_requested),
             "torch_forward_enabled": bool(self.torch_forward_enabled),
             "forward_ctx_available": bool(self.forward_ctx is not None and self.forward_ctx.available),
             "turns_total": int(self.turns_total),

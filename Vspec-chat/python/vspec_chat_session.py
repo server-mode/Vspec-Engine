@@ -146,12 +146,28 @@ def _turn_meter_enabled() -> bool:
     return _env_true("VSPEC_CHAT_SHOW_TPS", default=True)
 
 
-def _native_cpp_loop_enabled_effective() -> tuple[bool, bool, bool]:
+def _runtime_uses_torch_forward(runtime_obj) -> bool:
+    if runtime_obj is None:
+        return False
+    cls_name = type(runtime_obj).__name__
+    if cls_name == "GenericTransformerRuntimeTorch":
+        return True
+    if cls_name == "Qwen35Runtime":
+        if not _env_true("VSPEC_TORCH_FORWARD", default=True):
+            return False
+        if bool(getattr(runtime_obj, "use_native_cuda_norm", False)) and (not _env_true("VSPEC_TORCH_FORWARD_FORCE_ON_CUDA_NATIVE", default=False)):
+            return False
+        return True
+    return False
+
+
+def _native_cpp_loop_enabled_effective(runtime_obj=None) -> tuple[bool, bool, bool, bool]:
     requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
-    torch_forward = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    torch_forward_requested = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    torch_forward_effective = _runtime_uses_torch_forward(runtime_obj) if runtime_obj is not None else torch_forward_requested
     allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
-    enabled = bool(requested and (not torch_forward or allow_with_torch))
-    return enabled, requested, torch_forward
+    enabled = bool(requested and (not torch_forward_effective or allow_with_torch))
+    return enabled, requested, torch_forward_requested, torch_forward_effective
 
 
 def _store_turn_meter(
@@ -919,6 +935,17 @@ def _generate(
         native_blend_failures = 0
         native_logits_provider_calls = 0
         native_logits_provider_failures = 0
+        native_blend_enabled = _env_true("VSPEC_NATIVE_FORWARD_BLEND", default=True)
+        try:
+            blend_alpha = float(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_ALPHA", "0.18") or "0.18")
+        except Exception:
+            blend_alpha = 0.18
+        blend_alpha = max(0.0, min(1.0, blend_alpha))
+        try:
+            blend_topk = int(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_TOPK", "24") or "24")
+        except Exception:
+            blend_topk = 24
+        blend_topk = max(4, min(128, blend_topk))
         native_logits_provider_enabled = os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER", "0").strip().lower() in {"1", "true", "yes", "on"}
         try:
             native_logits_provider_topk = int(os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER_TOPK", "64") or "64")
@@ -937,14 +964,29 @@ def _generate(
             prompt_tokens=max(0, len(local_tokens) - 1),
             max_new_tokens=int(total_steps),
         )
-        native_cpp_loop, native_cpp_loop_requested, torch_forward_enabled = _native_cpp_loop_enabled_effective()
-        if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_enabled:
+        native_cpp_loop, native_cpp_loop_requested, torch_forward_requested, torch_forward_effective = _native_cpp_loop_enabled_effective(runtime_obj)
+        if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_requested:
             if not bool(getattr(runtime_obj, "_native_cpp_loop_torch_warned", False)):
                 print("[session] native_cpp_loop= disabled (torch_forward=1; set VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=1 to force)")
                 try:
                     setattr(runtime_obj, "_native_cpp_loop_torch_warned", True)
                 except Exception:
                     pass
+        elif native_cpp_loop_requested and torch_forward_requested and (not torch_forward_effective):
+            if not bool(getattr(runtime_obj, "_native_cpp_loop_torch_fallback_warned", False)):
+                print("[session] native_cpp_loop= auto-enabled (torch_forward requested but runtime fallback active)")
+                try:
+                    setattr(runtime_obj, "_native_cpp_loop_torch_fallback_warned", True)
+                except Exception:
+                    pass
+
+        if torch_forward_requested and (not torch_forward_effective):
+            if _env_true("VSPEC_DISABLE_BLEND_ON_TORCH_FALLBACK", default=True) and native_blend_enabled:
+                native_blend_enabled = False
+                print("[session] native_forward_blend= auto-disabled (torch fallback runtime active)")
+            if _env_true("VSPEC_DISABLE_PROVIDER_ON_TORCH_FALLBACK", default=True) and native_logits_provider_enabled:
+                native_logits_provider_enabled = False
+                print("[session] native_c_logits_provider= auto-disabled (torch fallback runtime active)")
 
         def _runtime_graph_signature(runtime_ref, prompt_tokens: int, decode_steps: int) -> int:
             graph_mode = os.getenv("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only").strip().lower()
@@ -1058,7 +1100,7 @@ def _generate(
                         if native_provider_direct_sample:
                             rep_window = max(1, int(local_repeat_window))
                             sampled = native_forward_ctx.sample_topk_token(
-                                token_ids=list(local_tokens),
+                                token_ids=local_tokens,
                                 top_k=native_logits_provider_topk,
                                 temperature=float(max(0.05, local_temperature)),
                                 greedy=bool(local_greedy),
@@ -1073,7 +1115,7 @@ def _generate(
                                 native_logits_provider_calls += 1
 
                         if not provider_handled:
-                            proposal = native_forward_ctx.propose_topk(list(local_tokens), top_k=native_logits_provider_topk)
+                            proposal = native_forward_ctx.propose_topk(local_tokens, top_k=native_logits_provider_topk)
                             if proposal is not None:
                                 cand_ids, cand_scores = proposal
                                 if cand_ids and cand_scores and len(cand_ids) == len(cand_scores):
@@ -1181,20 +1223,8 @@ def _generate(
                             temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
                             sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
 
-                    native_blend_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
                     if native_blend_enabled and native_forward_ctx is not None and native_forward_ctx.available:
-                        try:
-                            blend_alpha = float(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_ALPHA", "0.18") or "0.18")
-                        except Exception:
-                            blend_alpha = 0.18
-                        blend_alpha = max(0.0, min(1.0, blend_alpha))
                         if blend_alpha > 0.0:
-                            try:
-                                blend_topk = int(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_TOPK", "24") or "24")
-                            except Exception:
-                                blend_topk = 24
-                            blend_topk = max(4, min(128, blend_topk))
-
                             try:
                                 vocab_vals = logits.tolist() if hasattr(logits, "tolist") else list(logits)
                             except Exception:
@@ -1212,7 +1242,7 @@ def _generate(
                                     candidate_ids=[int(i) for i in cand_ids],
                                     base_scores=base_scores,
                                     blend=blend_alpha,
-                                    token_ids=list(local_tokens),
+                                    token_ids=local_tokens,
                                 )
                                 if blended is not None and len(blended) == len(cand_ids):
                                     for idx, score in zip(cand_ids, blended):

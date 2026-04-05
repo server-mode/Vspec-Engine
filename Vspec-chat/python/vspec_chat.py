@@ -110,12 +110,28 @@ def _env_true(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _native_cpp_loop_enabled_effective() -> tuple[bool, bool, bool]:
+def _runtime_uses_torch_forward(runtime_obj) -> bool:
+    if runtime_obj is None:
+        return False
+    cls_name = type(runtime_obj).__name__
+    if cls_name == "GenericTransformerRuntimeTorch":
+        return True
+    if cls_name == "Qwen35Runtime":
+        if not _env_true("VSPEC_TORCH_FORWARD", default=True):
+            return False
+        if bool(getattr(runtime_obj, "use_native_cuda_norm", False)) and (not _env_true("VSPEC_TORCH_FORWARD_FORCE_ON_CUDA_NATIVE", default=False)):
+            return False
+        return True
+    return False
+
+
+def _native_cpp_loop_enabled_effective(runtime_obj=None) -> tuple[bool, bool, bool, bool]:
     requested = _env_true("VSPEC_NATIVE_CPP_LOOP", default=True)
-    torch_forward = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    torch_forward_requested = _env_true("VSPEC_TORCH_FORWARD", default=False)
+    torch_forward_effective = _runtime_uses_torch_forward(runtime_obj) if runtime_obj is not None else torch_forward_requested
     allow_with_torch = _env_true("VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH", default=False)
-    enabled = bool(requested and (not torch_forward or allow_with_torch))
-    return enabled, requested, torch_forward
+    enabled = bool(requested and (not torch_forward_effective or allow_with_torch))
+    return enabled, requested, torch_forward_requested, torch_forward_effective
 
 
 def _entropy_from_logits(logits_obj) -> float:
@@ -1006,9 +1022,12 @@ def main() -> None:
         return None
 
     native_model_file = _resolve_native_model_file(snapshot_dir)
-    native_forward_enabled = os.getenv("VSPEC_NATIVE_FORWARD_BLEND", "1").strip().lower() in {"1", "true", "yes", "on"}
+    native_forward_enabled = _env_true("VSPEC_NATIVE_FORWARD_BLEND", default=True)
+    native_prefill_compute_requested = _env_true("VSPEC_NATIVE_PREFILL_COMPUTE", default=True)
+    native_logits_provider_requested = _env_true("VSPEC_NATIVE_LOGITS_PROVIDER", default=False)
+    native_forward_ctx_needed = bool(native_forward_enabled or native_prefill_compute_requested or native_logits_provider_requested)
     native_forward_ctx = None
-    if native_forward_ctx is None and native_forward_enabled and native_model_file:
+    if native_forward_ctx is None and native_forward_ctx_needed and native_model_file:
         try:
             seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
             seed_val = int(seed_raw)
@@ -1229,10 +1248,10 @@ def main() -> None:
     else:
         print("[vspec-chat] runtime_device=", args.device)
         runtime.eos_token_id = adapter.eos_token_id
-        if args.device in {"cuda", "cuda-native"}:
-            runtime_mode = "vspec-native-cuda"
-        elif args.device == "torch-cuda":
+        if _runtime_uses_torch_forward(runtime):
             runtime_mode = "vspec-torch-cuda"
+        elif args.device in {"cuda", "cuda-native", "torch-cuda"}:
+            runtime_mode = "vspec-native-cuda"
         else:
             runtime_mode = "vspec-cpu"
 
@@ -1441,9 +1460,11 @@ def main() -> None:
         print(f"[vspec-chat] decode_step_cap= {decode_step_cap} (requested={int(max_steps)})")
     max_steps = decode_step_cap
     decode_state = DecodeState(prompt_tokens=max(0, len(token_ids) - 1), max_new_tokens=int(max_steps))
-    native_cpp_loop, native_cpp_loop_requested, torch_forward_enabled = _native_cpp_loop_enabled_effective()
-    if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_enabled:
+    native_cpp_loop, native_cpp_loop_requested, torch_forward_requested, torch_forward_effective = _native_cpp_loop_enabled_effective(runtime)
+    if native_cpp_loop_requested and (not native_cpp_loop) and torch_forward_requested:
         print("[vspec-chat] native_cpp_loop= disabled (torch_forward=1; set VSPEC_NATIVE_CPP_LOOP_ALLOW_WITH_TORCH=1 to force)")
+    elif native_cpp_loop_requested and torch_forward_requested and (not torch_forward_effective):
+        print("[vspec-chat] native_cpp_loop= auto-enabled (torch_forward requested but runtime fallback active)")
 
     def _runtime_graph_signature(runtime_obj, prompt_tokens: int, decode_steps: int) -> int:
         graph_mode = os.getenv("VSPEC_NATIVE_GRAPH_SIG_MODE", "shape-only").strip().lower()
@@ -1522,6 +1543,7 @@ def main() -> None:
     native_blend_failures = 0
     native_logits_provider_calls = 0
     native_logits_provider_failures = 0
+    native_blend_enabled = bool(native_forward_enabled)
     native_logits_provider_enabled = os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER", "0").strip().lower() in {"1", "true", "yes", "on"}
     try:
         native_logits_provider_topk = int(os.getenv("VSPEC_NATIVE_LOGITS_PROVIDER_TOPK", "64") or "64")
@@ -1530,7 +1552,7 @@ def main() -> None:
     native_logits_provider_topk = max(8, min(1024, native_logits_provider_topk))
     native_c_strict = os.getenv("VSPEC_NATIVE_C_STRICT", "0").strip().lower() in {"1", "true", "yes", "on"}
     native_provider_direct_sample = os.getenv("VSPEC_NATIVE_C_PROVIDER_DIRECT_SAMPLE", "1").strip().lower() in {"1", "true", "yes", "on"}
-    if native_forward_ctx is None and native_forward_enabled and native_model_file:
+    if native_forward_ctx is None and (native_blend_enabled or native_logits_provider_enabled or native_prefill_compute_requested) and native_model_file:
         try:
             seed_raw = os.getenv("VSPEC_NATIVE_FORWARD_SEED", str(int(args.seed)))
             seed_val = int(seed_raw)
@@ -1542,6 +1564,14 @@ def main() -> None:
                 native_forward_ctx = None
         except Exception:
             native_forward_ctx = None
+
+    if torch_forward_requested and (not torch_forward_effective):
+        if _env_true("VSPEC_DISABLE_BLEND_ON_TORCH_FALLBACK", default=True) and native_blend_enabled:
+            native_blend_enabled = False
+            print("[vspec-chat] native_forward_blend= auto-disabled (torch fallback runtime active)")
+        if _env_true("VSPEC_DISABLE_PROVIDER_ON_TORCH_FALLBACK", default=True) and native_logits_provider_enabled:
+            native_logits_provider_enabled = False
+            print("[vspec-chat] native_c_logits_provider= auto-disabled (torch fallback runtime active)")
 
     if native_c_strict and native_logits_provider_enabled:
         if native_forward_ctx is None or not native_forward_ctx.available:
@@ -1578,7 +1608,7 @@ def main() -> None:
                 if native_provider_direct_sample:
                     rep_window = max(1, int(args.repeat_window))
                     sampled = native_forward_ctx.sample_topk_token(
-                        token_ids=list(token_ids),
+                        token_ids=token_ids,
                         top_k=native_logits_provider_topk,
                         temperature=float(max(0.05, args.temperature)),
                         greedy=bool(args.greedy),
@@ -1593,7 +1623,7 @@ def main() -> None:
                         native_logits_provider_calls += 1
 
                 if not provider_handled:
-                    proposal = native_forward_ctx.propose_topk(list(token_ids), top_k=native_logits_provider_topk)
+                    proposal = native_forward_ctx.propose_topk(token_ids, top_k=native_logits_provider_topk)
                     if proposal is not None:
                         cand_ids, cand_scores = proposal
                         if cand_ids and cand_scores and len(cand_ids) == len(cand_scores):
@@ -1703,7 +1733,7 @@ def main() -> None:
                     temp_scale = max(0.65, min(1.0, bit_hint / 8.0))
                     sample_temperature = max(0.05, float(sample_temperature) * temp_scale)
 
-            if native_forward_ctx is not None and native_forward_ctx.available:
+            if native_blend_enabled and native_forward_ctx is not None and native_forward_ctx.available:
                 try:
                     blend_alpha = float(os.getenv("VSPEC_NATIVE_FORWARD_BLEND_ALPHA", "0.18") or "0.18")
                 except Exception:
@@ -1733,7 +1763,7 @@ def main() -> None:
                             candidate_ids=[int(i) for i in cand_ids],
                             base_scores=base_scores,
                             blend=blend_alpha,
-                            token_ids=list(token_ids),
+                            token_ids=token_ids,
                         )
                         if blended is not None and len(blended) == len(cand_ids):
                             for idx, score in zip(cand_ids, blended):
